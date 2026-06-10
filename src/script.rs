@@ -35,6 +35,7 @@ use crate::{
 };
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
+const SCRIPT_TLS_ENTRYPOINT: &str = "zeroserve.tls";
 /// Prefix for the per-function code sections that expose a script to inter-script
 /// calls. A callee exports `zeroserve.call.<name>` sections; `zs_call` resolves
 /// `<name>` against this prefix.
@@ -196,6 +197,7 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
         "zs_req_tls_handshake_complete",
         helpers::h_req_tls_handshake_complete,
     ),
+    ("zs_caddy_tls_client_auth", helpers::h_caddy_tls_client_auth),
     ("zs_req_remote_ip_matches", helpers::h_req_remote_ip_matches),
     (
         "zs_caddy_remote_ip_matches",
@@ -370,6 +372,10 @@ pub struct ConnectionInfo {
     /// JA4 TLS client fingerprint computed from the ClientHello. `None` for
     /// plaintext connections or if the ClientHello could not be parsed.
     pub tls_client_ja4: Option<String>,
+    /// DER-encoded leaf client certificate, if the TLS peer presented one.
+    pub tls_client_cert_der: Option<Vec<u8>>,
+    /// DER-encoded peer certificate chain as sent by the client.
+    pub tls_client_chain_der: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1616,135 +1622,138 @@ async fn run_request_scripts_with_state(
     let mut encode: Option<crate::helpers::compress::EncodeConfig> = None;
     let preemption = PreemptionEnabled::new(t);
 
-    for (name, program) in scripts.iter() {
-        if !program.has_section(SCRIPT_ENTRYPOINT) {
-            continue;
-        }
+    'sections: for section in [SCRIPT_TLS_ENTRYPOINT, SCRIPT_ENTRYPOINT] {
+        for (name, program) in scripts.iter() {
+            if !program.has_section(section) {
+                continue;
+            }
 
-        let mut ctx = ScriptExecutionContext {
-            request: request.clone(),
-            body_source: body_source.clone(),
-            metadata: metadata.clone(),
-            caddy_maps: caddy_maps.clone(),
-            early_response_headers: early_response_headers.clone(),
-            response_hooks: response_hooks.clone(),
-            response_context: None,
-            abort: false,
-            response: None,
-            request_body_limit: request_body_limit.clone(),
-            reverse_proxy: None,
-            file_server: None,
-            encode: None,
-            script_name: name.clone(),
-            log_buffer: vec![],
-            external_objects: ObjectRegistry {
-                next_idx: 1,
-                objects: HashMap::new(),
-            },
-            error: String::new(),
-            memory_footprint_bytes: 0,
-            max_memory_footprint,
-            expose_filesystem,
-            site: site.clone(),
-            scripts: scripts.clone(),
-            t,
-            call_depth: 0,
-        };
-        let mut resources: [&mut dyn Any; 1] = [&mut ctx];
-        let run = program
-            .run(
-                timeslice,
-                timeslicer,
-                SCRIPT_ENTRYPOINT,
-                &mut resources,
-                &[],
-                &preemption,
-            )
-            .await;
-
-        if let Err(err) = run {
-            async_log(
-                format!(
-                    "[script_runtime] script '{}' failed: {:?} ({})\n",
-                    name,
-                    err,
-                    if ctx.error.is_empty() {
-                        "no details"
-                    } else {
-                        ctx.error.as_str()
-                    }
-                )
-                .into_bytes(),
-            )
-            .await;
-            return ScriptOutcome {
-                request: request.borrow().clone(),
-                request_shared: request.clone(),
-                metadata: metadata.borrow().clone(),
-                metadata_shared: metadata.clone(),
-                caddy_maps_shared: caddy_maps.clone(),
-                early_response_headers: early_response_headers.borrow().clone(),
-                response_hooks: response_hooks.borrow().clone(),
+            let mut ctx = ScriptExecutionContext {
+                request: request.clone(),
+                body_source: body_source.clone(),
+                metadata: metadata.clone(),
+                caddy_maps: caddy_maps.clone(),
+                early_response_headers: early_response_headers.clone(),
+                response_hooks: response_hooks.clone(),
+                response_context: None,
                 abort: false,
-                response: Some(ScriptResponse {
-                    status: 500,
-                    body: vec![],
-                    content_type: Some("text/plain; charset=utf-8".to_string()),
-                    force_close: false,
-                    headers: Vec::new(),
-                }),
-                request_body_limit: request_body_limit.get(),
+                response: None,
+                request_body_limit: request_body_limit.clone(),
                 reverse_proxy: None,
                 file_server: None,
                 encode: None,
+                script_name: name.clone(),
+                log_buffer: vec![],
+                external_objects: ObjectRegistry {
+                    next_idx: 1,
+                    objects: HashMap::new(),
+                },
+                error: String::new(),
+                memory_footprint_bytes: 0,
+                max_memory_footprint,
+                expose_filesystem,
+                site: site.clone(),
+                scripts: scripts.clone(),
+                t,
+                call_depth: 0,
             };
-        }
-        if ctx.abort {
-            return ScriptOutcome {
-                request: request.borrow().clone(),
-                request_shared: request.clone(),
-                metadata: metadata.borrow().clone(),
-                metadata_shared: metadata.clone(),
-                caddy_maps_shared: caddy_maps.clone(),
-                early_response_headers: early_response_headers.borrow().clone(),
-                response_hooks: response_hooks.borrow().clone(),
-                abort: true,
-                response,
-                request_body_limit: request_body_limit.get(),
-                reverse_proxy,
-                file_server: None,
-                encode: None,
-            };
-        }
-        // An `encode` handler runs before the response producer in the same
-        // route entry; carry its config forward to whichever producer wins.
-        if let Some(ctx_encode) = ctx.encode.take() {
-            encode = Some(ctx_encode);
-        }
-        if let Some(script_response) = ctx.response {
-            response = Some(script_response);
-            break;
-        }
-        if let Some(proxy_url) = ctx.reverse_proxy {
-            reverse_proxy = Some(proxy_url);
-            break;
-        }
-        if let Some(file_server) = ctx.file_server {
-            return ScriptOutcome {
-                request: request.borrow().clone(),
-                request_shared: request.clone(),
-                metadata: metadata.borrow().clone(),
-                metadata_shared: metadata.clone(),
-                caddy_maps_shared: caddy_maps.clone(),
-                early_response_headers: early_response_headers.borrow().clone(),
-                response_hooks: response_hooks.borrow().clone(),
-                abort: false,
-                response,
-                request_body_limit: request_body_limit.get(),
-                reverse_proxy,
-                file_server: Some(file_server),
-                encode,
-            };
+            let mut resources: [&mut dyn Any; 1] = [&mut ctx];
+            let run = program
+                .run(
+                    timeslice,
+                    timeslicer,
+                    section,
+                    &mut resources,
+                    &[],
+                    &preemption,
+                )
+                .await;
+
+            if let Err(err) = run {
+                async_log(
+                    format!(
+                        "[script_runtime] script '{}' section '{}' failed: {:?} ({})\n",
+                        name,
+                        section,
+                        err,
+                        if ctx.error.is_empty() {
+                            "no details"
+                        } else {
+                            ctx.error.as_str()
+                        }
+                    )
+                    .into_bytes(),
+                )
+                .await;
+                return ScriptOutcome {
+                    request: request.borrow().clone(),
+                    request_shared: request.clone(),
+                    metadata: metadata.borrow().clone(),
+                    metadata_shared: metadata.clone(),
+                    caddy_maps_shared: caddy_maps.clone(),
+                    early_response_headers: early_response_headers.borrow().clone(),
+                    response_hooks: response_hooks.borrow().clone(),
+                    abort: false,
+                    response: Some(ScriptResponse {
+                        status: 500,
+                        body: vec![],
+                        content_type: Some("text/plain; charset=utf-8".to_string()),
+                        force_close: false,
+                        headers: Vec::new(),
+                    }),
+                    request_body_limit: request_body_limit.get(),
+                    reverse_proxy: None,
+                    file_server: None,
+                    encode: None,
+                };
+            }
+            if ctx.abort {
+                return ScriptOutcome {
+                    request: request.borrow().clone(),
+                    request_shared: request.clone(),
+                    metadata: metadata.borrow().clone(),
+                    metadata_shared: metadata.clone(),
+                    caddy_maps_shared: caddy_maps.clone(),
+                    early_response_headers: early_response_headers.borrow().clone(),
+                    response_hooks: response_hooks.borrow().clone(),
+                    abort: true,
+                    response,
+                    request_body_limit: request_body_limit.get(),
+                    reverse_proxy,
+                    file_server: None,
+                    encode: None,
+                };
+            }
+            // An `encode` handler runs before the response producer in the same
+            // route entry; carry its config forward to whichever producer wins.
+            if let Some(ctx_encode) = ctx.encode.take() {
+                encode = Some(ctx_encode);
+            }
+            if let Some(script_response) = ctx.response {
+                response = Some(script_response);
+                break 'sections;
+            }
+            if let Some(proxy_url) = ctx.reverse_proxy {
+                reverse_proxy = Some(proxy_url);
+                break 'sections;
+            }
+            if let Some(file_server) = ctx.file_server {
+                return ScriptOutcome {
+                    request: request.borrow().clone(),
+                    request_shared: request.clone(),
+                    metadata: metadata.borrow().clone(),
+                    metadata_shared: metadata.clone(),
+                    caddy_maps_shared: caddy_maps.clone(),
+                    early_response_headers: early_response_headers.borrow().clone(),
+                    response_hooks: response_hooks.borrow().clone(),
+                    abort: false,
+                    response,
+                    request_body_limit: request_body_limit.get(),
+                    reverse_proxy,
+                    file_server: Some(file_server),
+                    encode,
+                };
+            }
         }
     }
 

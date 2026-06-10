@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
+use base64ct::Encoding;
 use serde_json::{Map, Value, json};
 
 use super::matchers;
@@ -591,6 +592,7 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     let mut has_block = false;
     let mut dns_provider_set = h.options.tls_dns_provider_configured;
     let mut dns_options_set = Vec::<String>::new();
+    let mut policies = Vec::<Value>::new();
     while h.d.next_block(0) {
         has_block = true;
         let subdirective = h.d.val();
@@ -610,7 +612,11 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 parse_one_or_more_args(&mut h.d)?;
                 dns_options_set.push("resolvers".to_string());
             }
-            "client_auth" => parse_tls_client_auth(h.d.new_from_next_segment())?,
+            "client_auth" => {
+                if let Some(policy) = parse_tls_client_auth(h.d.new_from_next_segment())? {
+                    policies.push(policy);
+                }
+            }
             "ca"
             | "ca_root"
             | "key_type"
@@ -706,31 +712,69 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if first_line.is_empty() && !has_block {
         return Err(h.d.arg_err());
     }
-    h.warn(
-        "site tls directive is accepted but configured outside zeroserve's eBPF request-processing surface",
-    );
-    Ok(Vec::new())
+    if policies.is_empty() {
+        h.warn(
+            "site tls directive is accepted but configured outside zeroserve's eBPF request-processing surface",
+        );
+        Ok(Vec::new())
+    } else {
+        h.warn(
+            "site tls directive has client_auth; generated middleware enforces supported client-auth policy in the zeroserve TLS eBPF section",
+        );
+        Ok(policies
+            .into_iter()
+            .map(|policy| ConfigValue {
+                class: "tls_connection_policy".into(),
+                directive: "tls".into(),
+                value: RouteOrSub::Json(policy),
+            })
+            .collect())
+    }
 }
 
-fn parse_tls_client_auth(mut d: Dispenser) -> Result<()> {
+fn parse_tls_client_auth(mut d: Dispenser) -> Result<Option<Value>> {
     d.next();
     d.remaining_args();
     let nesting = d.nesting();
     let mut has_trusted_ca = false;
     let mut has_trust_pool = false;
+    let mut auth = Map::new();
+    let mut ca_certs = Vec::<Value>::new();
     while d.next_block(nesting) {
         let subdirective = d.val();
         match subdirective.as_str() {
             "mode" => {
-                parse_exact_args(&mut d, 1)?;
+                let args = parse_exact_args(&mut d, 1)?;
+                auth.insert("mode".into(), json!(args[0]));
             }
-            "trusted_ca_cert" | "trusted_ca_cert_file" => {
+            "trusted_ca_cert" => {
                 if has_trust_pool {
                     bail!(
                         "cannot specify both 'trust_pool' and 'trusted_ca_cert' or 'trusted_ca_cert_file'"
                     );
                 }
-                parse_exact_args(&mut d, 1)?;
+                let args = parse_exact_args(&mut d, 1)?;
+                ca_certs.push(json!(args[0]));
+                has_trusted_ca = true;
+            }
+            "trusted_ca_cert_file" => {
+                if has_trust_pool {
+                    bail!(
+                        "cannot specify both 'trust_pool' and 'trusted_ca_cert' or 'trusted_ca_cert_file'"
+                    );
+                }
+                let args = parse_exact_args(&mut d, 1)?;
+                let pem = std::fs::read(&args[0])
+                    .map_err(|e| d.errf(format!("open {}: {e}", args[0])))?;
+                let certs = boring::x509::X509::stack_from_pem(&pem).map_err(|e| {
+                    d.errf(format!("parsing trusted CA certificate {}: {e}", args[0]))
+                })?;
+                for cert in certs {
+                    let der = cert.to_der().map_err(|e| {
+                        d.errf(format!("encoding trusted CA certificate {}: {e}", args[0]))
+                    })?;
+                    ca_certs.push(json!(base64ct::Base64::encode_string(&der)));
+                }
                 has_trusted_ca = true;
             }
             "trusted_leaf_cert" | "trusted_leaf_cert_file" => {
@@ -751,7 +795,13 @@ fn parse_tls_client_auth(mut d: Dispenser) -> Result<()> {
                         "getting module named 'tls.ca_pool.source.{provider}': module not registered: tls.ca_pool.source.{provider}"
                     );
                 }
-                d.remaining_args();
+                if provider == "inline" {
+                    for cert in d.remaining_args() {
+                        ca_certs.push(json!(cert));
+                    }
+                } else {
+                    d.remaining_args();
+                }
                 has_trust_pool = true;
             }
             "verifier" => {
@@ -769,7 +819,19 @@ fn parse_tls_client_auth(mut d: Dispenser) -> Result<()> {
             other => bail!("unknown subdirective for client_auth: {other}"),
         }
     }
-    Ok(())
+    if !ca_certs.is_empty() {
+        auth.insert(
+            "ca".into(),
+            json!({ "provider": "inline", "trusted_ca_certs": ca_certs }),
+        );
+    }
+    if auth.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            json!({ "client_authentication": Value::Object(auth) }),
+        ))
+    }
 }
 
 fn parse_tls_protocols(d: &mut Dispenser) -> Result<()> {
@@ -4940,6 +5002,12 @@ pub fn build_subroute(
                     route.group = g.clone();
                 }
                 sub.routes.push(route);
+            }
+            RouteOrSub::Json(_) => {
+                bail!(
+                    "non-route config value '{}' cannot be used in an HTTP subroute",
+                    r.directive
+                );
             }
         }
     }

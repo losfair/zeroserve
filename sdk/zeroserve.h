@@ -17,6 +17,7 @@ typedef long ssize_t;
 
 #define ZS_SECTION(name) __attribute__((section(name)))
 #define ZS_ENTRY ZS_SECTION("zeroserve.request")
+#define ZS_TLS_ENTRY ZS_SECTION("zeroserve.tls")
 #define ZS_INLINE __attribute__((always_inline))
 /* Marks a definition that a given generated script may legitimately not
  * reference, suppressing clang's -Wunused-function. */
@@ -158,6 +159,8 @@ extern zs_s64 zs_req_proto_minor(void);
 extern zs_s64 zs_req_peer(char *out, zs_u64 out_len);
 extern zs_s64 zs_req_is_tls(void);
 extern zs_s64 zs_req_tls_handshake_complete(void);
+extern zs_s64 zs_caddy_tls_client_auth(const char *config_json,
+                                       zs_u64 config_json_len);
 extern zs_s64 zs_req_remote_ip_matches(const char *ranges_json,
                                        zs_u64 ranges_json_len);
 extern zs_s64 zs_caddy_remote_ip_matches(const char *ranges_json,

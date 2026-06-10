@@ -585,6 +585,8 @@ pub(super) fn tls_connection_info<IO>(
         tls_cipher_suite: tls_stream.caddy_tls_cipher_suite(),
         tls_resumed: Some(tls_stream.tls_session_reused()),
         tls_client_ja4: tls_stream.ja4_fingerprint(),
+        tls_client_cert_der: tls_stream.peer_certificate_der(),
+        tls_client_chain_der: tls_stream.peer_certificate_chain_der(),
     }
 }
 

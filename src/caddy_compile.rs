@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64ct::{Base64, Encoding};
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Debug, Deserialize)]
 struct CaddyConfig {
@@ -54,6 +54,30 @@ struct HttpServer {
     trusted_proxies_strict: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_present_value")]
     trusted_proxies_unix: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    tls_connection_policies: Vec<TlsConnectionPolicy>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TlsConnectionPolicy {
+    #[serde(
+        default,
+        rename = "match",
+        deserialize_with = "deserialize_null_default"
+    )]
+    match_: Option<TlsConnectionMatch>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    client_authentication: Option<Value>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TlsConnectionMatch {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    sni: Vec<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -232,11 +256,19 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         );
     }
     let mut routes = Vec::new();
+    let mut tls_connection_policies = Vec::new();
     let mut access_log_config = AccessLogConfig::default();
     for (server_name, server) in http.servers {
         let server_access_log_config = access_log_config_for_server(logging_config, &server.extra)?;
         access_log_config.merge(server_access_log_config);
         validate_http_server_fields(&server, &server_name, &mut warnings)?;
+        for (idx, policy) in server.tls_connection_policies.iter().enumerate() {
+            validate_tls_connection_policy(
+                policy,
+                &format!("server {server_name} tls policy {idx}"),
+            )?;
+        }
+        tls_connection_policies.extend(server.tls_connection_policies.clone());
         if let Some(errors) = &server.errors {
             validate_http_error_fields(errors, &server_name)?;
             validate_error_routes(&errors.routes, &format!("server {server_name} error route"))?;
@@ -265,6 +297,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     }
     let mut generator = Generator::default();
     generator.access_log_config = access_log_config;
+    generator.tls_connection_policies = tls_connection_policies;
     generator.emit_preamble();
 
     let mut groups = BTreeMap::<String, usize>::new();
@@ -281,6 +314,8 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         bail!("Caddy route groups exceed generated eBPF middleware limit of 32");
     }
     generator.route_groups = groups;
+
+    generator.emit_tls_entrypoint()?;
 
     generator.line("ZS_ENTRY");
     generator.line("zs_u64 entry(void) {");
@@ -375,6 +410,7 @@ struct Generator {
     response_hooks: Vec<Vec<String>>,
     current_response_hook: Option<usize>,
     access_log_config: AccessLogConfig,
+    tls_connection_policies: Vec<TlsConnectionPolicy>,
     client_ip_config: Option<ClientIpConfig>,
     named_routes: BTreeMap<String, Route>,
     error_routes: Vec<Route>,
@@ -420,6 +456,55 @@ impl Generator {
             c_str(file),
             file.len()
         ));
+    }
+
+    fn emit_tls_entrypoint(&mut self) -> Result<()> {
+        let policies = self
+            .tls_connection_policies
+            .iter()
+            .filter(|policy| policy.client_authentication.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if policies.is_empty() {
+            return Ok(());
+        }
+
+        self.line("ZS_TLS_ENTRY");
+        self.line("zs_u64 caddy_tls(void) {");
+        self.indent += 1;
+        self.line("char caddy_tls_sni[256];");
+        self.line(&format!(
+            "zs_s64 caddy_tls_sni_len = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
+            c_str("{http.request.tls.server_name}"),
+            "{http.request.tls.server_name}".len()
+        ));
+        self.line("if (caddy_tls_sni_len < 0) caddy_tls_sni_len = 0;");
+
+        for policy in policies {
+            let auth = normalize_tls_client_auth(policy.client_authentication.as_ref().unwrap())?;
+            let auth = serde_json::to_string(&auth)?;
+            let condition = tls_policy_sni_condition(&policy);
+            self.line(&format!("if ({condition}) {{"));
+            self.indent += 1;
+            self.line(&format!(
+                "if (zs_caddy_tls_client_auth({}, {}) == 0) {{",
+                c_str(&auth),
+                auth.len()
+            ));
+            self.indent += 1;
+            self.line("zs_abort();");
+            self.line("return 0;");
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+        }
+
+        self.line("return 0;");
+        self.indent -= 1;
+        self.line("}");
+        self.blank();
+        Ok(())
     }
 
     fn emit_terminal_empty_handler(&mut self, label: &str) {
@@ -5511,6 +5596,101 @@ fn validate_http_server_fields(
     Ok(())
 }
 
+fn validate_tls_connection_policy(policy: &TlsConnectionPolicy, label: &str) -> Result<()> {
+    for key in policy.extra.keys() {
+        if !matches!(
+            key.as_str(),
+            "certificate_selection" | "alpn" | "protocol_min" | "protocol_max"
+        ) {
+            bail!("unsupported {label} field {key:?}");
+        }
+    }
+    if let Some(match_) = &policy.match_
+        && let Some((key, _)) = match_.extra.iter().next()
+    {
+        bail!("unsupported {label}.match field {key:?}");
+    }
+    if let Some(auth) = &policy.client_authentication {
+        normalize_tls_client_auth(auth)
+            .with_context(|| format!("unsupported {label}.client_authentication"))?;
+    }
+    Ok(())
+}
+
+fn normalize_tls_client_auth(auth: &Value) -> Result<Value> {
+    let obj = auth
+        .as_object()
+        .ok_or_else(|| anyhow!("client_authentication must be an object"))?;
+    let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("require");
+    if !matches!(
+        mode,
+        "request" | "require" | "verify_if_given" | "require_and_verify"
+    ) {
+        bail!("unsupported client_authentication.mode {mode:?}");
+    }
+    if obj.get("verifier").is_some_and(|value| !value.is_null()) {
+        bail!("custom client_authentication.verifier is not supported");
+    }
+    if obj
+        .get("trusted_leaf_certs")
+        .is_some_and(|value| !value.is_null())
+    {
+        bail!("client_authentication.trusted_leaf_certs is not supported");
+    }
+    if matches!(mode, "verify_if_given" | "require_and_verify") {
+        let ca = obj
+            .get("ca")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("verified client authentication requires ca"))?;
+        let provider = ca
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("inline");
+        if provider != "inline" {
+            bail!("unsupported client_authentication.ca provider {provider:?}");
+        }
+        let certs = ca
+            .get("trusted_ca_certs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("verified client authentication requires trusted_ca_certs"))?;
+        if certs.is_empty() {
+            bail!("verified client authentication requires at least one trusted_ca_cert");
+        }
+        for cert in certs {
+            if !cert.is_string() {
+                bail!("trusted_ca_certs entries must be base64 DER strings");
+            }
+        }
+        Ok(json!({
+            "mode": mode,
+            "trusted_ca_certs": certs,
+        }))
+    } else {
+        Ok(json!({ "mode": mode }))
+    }
+}
+
+fn tls_policy_sni_condition(policy: &TlsConnectionPolicy) -> String {
+    let Some(match_) = &policy.match_ else {
+        return "1".to_string();
+    };
+    if match_.sni.is_empty() {
+        return "1".to_string();
+    }
+    match_
+        .sni
+        .iter()
+        .map(|sni| {
+            format!(
+                "(zs_caddy_eq_fold(caddy_tls_sni, zs_caddy_clamp_len(caddy_tls_sni_len, sizeof(caddy_tls_sni)), {}, {}) != 0)",
+                c_str(sni),
+                sni.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
 fn validate_http_error_fields(errors: &HttpErrorConfig, server_name: &str) -> Result<()> {
     if let Some((key, _)) = errors.extra.iter().next() {
         bail!("unsupported apps.http.servers.{server_name}.errors field {key:?}");
@@ -8528,6 +8708,49 @@ mod tests {
         assert!(c.contains("zs_req_proto_major() >= 2"));
         assert!(c.contains("zs_req_is_tls() != 0"));
         assert!(c.contains("zs_req_tls_handshake_complete() != 0"));
+    }
+
+    #[test]
+    fn compiles_tls_client_auth_policy_to_tls_section() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {
+            "tls_connection_policies": [{
+              "match": {"sni": ["example.com"]},
+              "client_authentication": {
+                "mode": "require_and_verify",
+                "ca": {
+                  "provider": "inline",
+                  "trusted_ca_certs": ["AA=="]
+                }
+              }
+            }],
+            "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+          }}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        assert!(c.contains("ZS_TLS_ENTRY"), "{c}");
+        assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
+        assert!(c.contains("zs_abort();"), "{c}");
+        assert!(c.contains("example.com"), "{c}");
+    }
+
+    #[test]
+    fn rejects_unsupported_tls_client_auth_shapes() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {
+            "tls_connection_policies": [{
+              "client_authentication": {
+                "mode": "require_and_verify",
+                "verifier": {"module": "leaf"}
+              }
+            }],
+            "routes": [{"handle": [{"handler": "static_response", "body": "ok"}]}]
+          }}}}
+        }"#;
+
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(err.contains("client_authentication"), "{err}");
     }
 
     #[test]
@@ -12328,7 +12551,6 @@ example.com {
             ("listen", r#"["127.0.0.1:8080"]"#),
             ("listener_wrappers", r#"[]"#),
             ("packet_conn_wrappers", r#"[]"#),
-            ("tls_connection_policies", r#"[{}]"#),
             ("automatic_https", r#"{"disable": true}"#),
             ("protocols", r#"["h1"]"#),
             ("listen_protocols", r#"[["127.0.0.1:8080", "h1"]]"#),

@@ -21,7 +21,7 @@ use boring::ex_data::Index;
 use boring::ssl::{
     AlpnError, ClientHello, ErrorCode, HandshakeError, NameType, SelectCertError, Ssl,
     SslConnector, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslStream,
-    SslStreamBuilder, SslVersion, select_next_proto,
+    SslStreamBuilder, SslVerifyMode, SslVersion, select_next_proto,
 };
 use boring::x509::{X509, X509Ref};
 use monoio::{
@@ -340,6 +340,7 @@ fn configure_server_context(
     builder.set_alpn_select_callback(|_ssl, client| {
         select_next_proto(ALPN_WIRE, client).ok_or(AlpnError::NOACK)
     });
+    builder.set_verify_callback(SslVerifyMode::PEER, |_, _| true);
     Ok(())
 }
 
@@ -668,6 +669,28 @@ impl<IO> BoringStream<IO> {
     /// JA4 TLS client fingerprint computed from the ClientHello, if available.
     pub fn ja4_fingerprint(&self) -> Option<String> {
         self.ssl.ssl().ex_data(ja4_ex_index()).cloned()
+    }
+
+    /// DER-encoded leaf client certificate, if the peer presented one.
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        self.ssl
+            .ssl()
+            .peer_certificate()
+            .and_then(|cert| cert.to_der().ok())
+    }
+
+    /// DER-encoded peer certificate chain as sent by the client.
+    pub fn peer_certificate_chain_der(&self) -> Vec<Vec<u8>> {
+        self.ssl
+            .ssl()
+            .peer_cert_chain()
+            .map(|chain| {
+                chain
+                    .iter()
+                    .filter_map(|cert| cert.to_der().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     }
 }
 

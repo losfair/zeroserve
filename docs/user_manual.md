@@ -143,6 +143,12 @@ Server `errors.routes`, including grouped error routes, and
 `error` handler, including
 `http.error.status_code`, `http.error.status_text`, and `http.error.message`
 placeholders.
+Supported Caddy `tls.client_auth` policies are emitted into a separate
+`zeroserve.tls` eBPF section which runs before normal HTTP request routing.
+The supported modes are `require`, `verify_if_given`, and
+`require_and_verify` with inline trusted CA certificates produced by Caddy JSON
+or Caddyfile adaptation. Custom client-auth verifier modules and
+trusted-leaf-only verification are rejected.
 The Caddy `expression` matcher is supported for the request-matcher subset that
 can be represented directly in generated middleware: boolean `&&`/`||`/`!`,
 parentheses, string equality/inequality and string-list `in`, string

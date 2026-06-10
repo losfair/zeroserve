@@ -140,6 +140,11 @@ Current generated middleware support includes:
   outputs, and multiple destinations
 - basic auth with bcrypt and argon2id hashes, challenge responses, credential
   checks, and `{http.auth.user.id}`
+- Caddy `tls.client_auth` policies for supported modes (`require`,
+  `verify_if_given`, and `require_and_verify`) using inline trusted CA
+  certificates from Caddy JSON/Caddyfile adaptation. Generated middleware emits
+  a `zeroserve.tls` eBPF section which enforces the policy before normal HTTP
+  request routing.
 - file serving from packed tarball content and from configured filesystem roots
   only when zeroserve is started with `--expose-filesystem`
 - Caddyfile/Caddy JSON access logging to `output file ...` targets, written by
@@ -196,6 +201,8 @@ body rewriting/copying or Caddy's full server runtime. In particular:
   `zs_res_delete_header` APIs
 - no TLS automation, listener management, certificate management, ACME server
   runtime, ECH, or PKI runtime behavior
+- no custom Caddy `tls.client_auth` verifier modules or trusted-leaf-only
+  client-auth behavior
 - no Prometheus metrics serving
 - no HTTP/2 server push; Caddy `push` handlers are validated and ignored with
   warnings because server push is outside the generated request middleware

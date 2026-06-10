@@ -10,6 +10,13 @@ use std::{
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use async_ebpf::program::HelperScope;
 use base64ct::{Base64, Encoding};
+use boring::{
+    stack::Stack,
+    x509::{
+        X509, X509StoreContext,
+        store::{X509Store, X509StoreBuilder},
+    },
+};
 use regex::Regex;
 
 use crate::caddy_file::{
@@ -21,6 +28,13 @@ use crate::script::{
     CaddyFileServer, ScriptResponse, deref_and_write_cstr, header_pattern_matches, read_utf8,
     split_relative_request_target, with_ectx,
 };
+
+#[derive(Default, serde::Deserialize)]
+struct CaddyTlsClientAuthConfig {
+    mode: String,
+    #[serde(default)]
+    trusted_ca_certs: Vec<String>,
+}
 
 pub fn h_caddy_rewrite_method(
     scope: &HelperScope,
@@ -36,6 +50,77 @@ pub fn h_caddy_rewrite_method(
         ctx.request.borrow_mut().set_method(&method)?;
         Ok(0)
     })
+}
+
+pub fn h_caddy_tls_client_auth(
+    scope: &HelperScope,
+    config_ptr: u64,
+    config_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let config = read_utf8(scope, config_ptr, config_len)?;
+    let config: CaddyTlsClientAuthConfig = serde_json::from_str(config).map_err(|_| ())?;
+    with_ectx(scope, |ctx| {
+        let request = ctx.request.borrow();
+        let conn = &request.connection;
+        if !conn.tls || !conn.tls_handshake_complete {
+            return Ok(0);
+        }
+        let Some(leaf_der) = conn.tls_client_cert_der.as_ref() else {
+            return Ok(if config.mode == "verify_if_given" {
+                1
+            } else {
+                0
+            });
+        };
+        match config.mode.as_str() {
+            "request" | "require" => Ok(1),
+            "verify_if_given" | "require_and_verify" => {
+                let verified = verify_caddy_client_cert(
+                    leaf_der,
+                    &conn.tls_client_chain_der,
+                    &config.trusted_ca_certs,
+                )?;
+                Ok(verified as u64)
+            }
+            _ => Err(()),
+        }
+    })
+}
+
+fn verify_caddy_client_cert(
+    leaf_der: &[u8],
+    chain_der: &[Vec<u8>],
+    trusted_ca_certs: &[String],
+) -> Result<bool, ()> {
+    let store = caddy_client_auth_store(trusted_ca_certs)?;
+    let leaf = X509::from_der(leaf_der).map_err(|_| ())?;
+    let mut chain = Stack::new().map_err(|_| ())?;
+    for cert_der in chain_der {
+        let cert = X509::from_der(cert_der).map_err(|_| ())?;
+        if cert.to_der().map_err(|_| ())? != leaf_der {
+            chain.push(cert).map_err(|_| ())?;
+        }
+    }
+    X509StoreContext::new()
+        .map_err(|_| ())?
+        .init(&store, &leaf, &chain, |store_ctx| {
+            Ok(store_ctx.verify_cert().unwrap_or(false))
+        })
+        .map_err(|_| ())
+}
+
+fn caddy_client_auth_store(trusted_ca_certs: &[String]) -> Result<X509Store, ()> {
+    let mut builder = X509StoreBuilder::new().map_err(|_| ())?;
+    for cert in trusted_ca_certs {
+        let der = Base64::decode_vec(cert).map_err(|_| ())?;
+        builder
+            .add_cert(X509::from_der(&der).map_err(|_| ())?)
+            .map_err(|_| ())?;
+    }
+    Ok(builder.build())
 }
 
 pub fn h_caddy_path_regexp_subject(

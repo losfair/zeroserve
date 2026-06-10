@@ -112,6 +112,7 @@ pub struct ConfigValue {
 pub enum RouteOrSub {
     Route(Route),
     Sub(Subroute),
+    Json(Value),
 }
 
 /// Shared adaptation context, threaded through directive handlers. Cheap to
@@ -272,7 +273,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             .iter()
             .map(|k| Address::parse(&k.text))
             .collect::<Result<Vec<_>>>()?;
-        let (routes, error_routes) =
+        let (routes, error_routes, tls_policies) =
             compile_block_routes(&block, &options, &counter, &warnings, &extra_apps)?;
 
         compiled.push(CompiledBlock {
@@ -281,6 +282,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             parsed_keys,
             routes,
             error_routes,
+            tls_policies,
         });
     }
 
@@ -329,7 +331,7 @@ fn compile_block_routes(
     counter: &Rc<RefCell<Counter>>,
     warnings: &Rc<RefCell<Vec<String>>>,
     extra_apps: &Rc<RefCell<Map<String, Value>>>,
-) -> Result<(Vec<ConfigValue>, Vec<Subroute>)> {
+) -> Result<(Vec<ConfigValue>, Vec<Subroute>, Vec<Value>)> {
     let segments: Vec<Vec<Token>> = block
         .segments
         .iter()
@@ -359,6 +361,7 @@ fn compile_block_routes(
         .collect::<Vec<_>>();
     let mut routes: Vec<ConfigValue> = Vec::new();
     let mut error_routes: Vec<Subroute> = Vec::new();
+    let mut tls_policies: Vec<Value> = Vec::new();
     for seg in &segments {
         let dir = seg.first().map(|t| t.text.clone()).unwrap_or_default();
         if dir.starts_with(MATCHER_PREFIX) {
@@ -401,12 +404,17 @@ fn compile_block_routes(
                         error_routes.push(s);
                     }
                 }
+                "tls_connection_policy" => {
+                    if let RouteOrSub::Json(v) = result.value {
+                        tls_policies.push(v);
+                    }
+                }
                 _ => routes.push(result),
             }
         }
     }
 
-    Ok((routes, error_routes))
+    Ok((routes, error_routes, tls_policies))
 }
 
 fn apply_segment_shorthands(seg: &[Token]) -> Vec<Token> {
@@ -435,7 +443,7 @@ fn build_named_routes(
             bail!("cannot have duplicate named_routes: {name}");
         }
 
-        let (routes, error_routes) =
+        let (routes, error_routes, _) =
             compile_block_routes(&block, options, counter, warnings, extra_apps)?;
         let mut subroute =
             handlers::build_subroute(routes, counter, true, &options.directive_order)?;
@@ -462,6 +470,7 @@ struct CompiledBlock {
     parsed_keys: Vec<Address>,
     routes: Vec<ConfigValue>,
     error_routes: Vec<Subroute>,
+    tls_policies: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,12 +516,15 @@ fn build_servers(
         let listen = placements[*placement_idxs.first().unwrap()].listen.clone();
         let mut routes: Vec<Value> = Vec::new();
         let mut error_routes: Vec<Value> = Vec::new();
+        let mut tls_connection_policies: Vec<Value> = Vec::new();
 
         for &placement_idx in &placement_idxs {
             let placement = &placements[placement_idx];
             let block = blocks[placement.block_idx].routes.clone();
             let err_subs = blocks[placement.block_idx].error_routes.clone();
+            let tls_policies = blocks[placement.block_idx].tls_policies.clone();
             let matcher_sets = compile_encoded_matcher_sets(&placement.matcher_keys)?;
+            let sni = tls_policy_sni_hosts(&placement.matcher_keys);
 
             let site_subroute =
                 handlers::build_subroute(block, counter, true, &options.directive_order)?;
@@ -531,6 +543,9 @@ fn build_servers(
                 }
                 append_subroute_to_route_list(&mut error_routes, &merged, &matcher_sets, true);
             }
+            for policy in tls_policies {
+                tls_connection_policies.push(scope_tls_policy_to_sni(policy, &sni));
+            }
         }
 
         let mut srv = Map::new();
@@ -542,6 +557,12 @@ fn build_servers(
         }
         if !error_routes.is_empty() {
             srv.insert("errors".into(), json!({ "routes": error_routes }));
+        }
+        if !tls_connection_policies.is_empty() {
+            srv.insert(
+                "tls_connection_policies".into(),
+                Value::Array(tls_connection_policies),
+            );
         }
         if !named_routes.is_empty() {
             srv.insert("named_routes".into(), Value::Object(named_routes.clone()));
@@ -788,6 +809,30 @@ fn compile_encoded_matcher_sets(keys: &[Address]) -> Result<Vec<Value>> {
         }
     }
     Ok(sets)
+}
+
+fn tls_policy_sni_hosts(keys: &[Address]) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for addr in keys {
+        if addr.host.is_empty() {
+            return Vec::new();
+        }
+        if !hosts.contains(&addr.host) {
+            hosts.push(addr.host.clone());
+        }
+    }
+    hosts
+}
+
+fn scope_tls_policy_to_sni(mut policy: Value, sni: &[String]) -> Value {
+    if sni.is_empty() {
+        return policy;
+    }
+    let Some(obj) = policy.as_object_mut() else {
+        return policy;
+    };
+    obj.insert("match".into(), json!({ "sni": sni }));
+    policy
 }
 
 /// Appends a site's subroute to a server's route list, wrapping in a terminal
@@ -4737,6 +4782,15 @@ example.com {
 }"#,
         );
         assert!(warnings.iter().any(|w| w.contains("site tls directive")));
+        assert_eq!(
+            v["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0]["client_authentication"]
+                ["ca"]["trusted_ca_certs"],
+            json!(["certdata"])
+        );
+        assert_eq!(
+            v["apps"]["http"]["servers"]["srv0"]["tls_connection_policies"][0]["match"]["sni"],
+            json!(["example.com"])
+        );
         let h = &v["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]["handle"]
             [0];
         assert_eq!(h["handler"], "static_response");
