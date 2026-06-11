@@ -197,6 +197,7 @@ function h2cPostWithStreamingBody(
         const headers: http2.OutgoingHttpHeaders = {
             ":path": path,
             ":method": "POST",
+            "accept-encoding": "identity",
             "content-type": "application/octet-stream",
         };
         if (includeContentLength) {

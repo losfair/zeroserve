@@ -432,6 +432,7 @@ async function sendRawHttpRequest(
             `Host: ${hostname}:${port}`,
             "User-Agent: deno-test",
             "Accept: */*",
+            "Accept-Encoding: identity",
             "Content-Type: text/plain",
         ];
         if (chunked) {
