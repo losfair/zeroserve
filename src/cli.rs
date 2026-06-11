@@ -50,6 +50,12 @@ pub fn must_be_positive(value: &str) -> Result<usize, String> {
     }
 }
 
+pub fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
@@ -167,9 +173,10 @@ pub struct Cli {
     #[arg(long, conflicts_with = "disable_ns_isolation")]
     pub enable_netns_isolation: bool,
 
-    /// Number of worker threads, each running its own isolated event loop
+    /// Number of worker threads, each running its own isolated event loop.
+    /// Defaults to the number of available CPU cores.
     /// (independently compiled eBPF programs, listeners via SO_REUSEPORT).
-    #[arg(long, default_value_t = 1, value_parser = must_be_positive)]
+    #[arg(long, default_value_t = default_worker_threads(), value_parser = must_be_positive)]
     pub threads: usize,
 
     /// eBPF async preemption timer interval.
@@ -199,4 +206,31 @@ pub struct Cli {
     /// Comma-separated list of allowed hostnames. Requests with non-matching hostnames receive a 421 error.
     #[arg(long, value_delimiter = ',')]
     pub validate_hostnames: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn threads_defaults_to_available_parallelism() {
+        let cli = Cli::try_parse_from(["zeroserve", "site.tar"]).unwrap();
+
+        assert_eq!(cli.threads, default_worker_threads());
+        assert!(cli.threads > 0);
+    }
+
+    #[test]
+    fn threads_can_be_overridden() {
+        let cli = Cli::try_parse_from(["zeroserve", "--threads", "3", "site.tar"]).unwrap();
+
+        assert_eq!(cli.threads, 3);
+    }
+
+    #[test]
+    fn threads_rejects_zero() {
+        let err = Cli::try_parse_from(["zeroserve", "--threads", "0", "site.tar"]).unwrap_err();
+
+        assert!(err.to_string().contains("value must be greater than zero"));
+    }
 }
