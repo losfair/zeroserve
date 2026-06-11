@@ -1,4 +1,8 @@
 use async_ebpf::program::HelperScope;
+use boring::{
+    hash::MessageDigest,
+    x509::{X509, X509NameRef},
+};
 
 use crate::{
     json::JsonRef,
@@ -113,6 +117,8 @@ pub fn h_load_file_metadata(
 ///   accepted on this connection (client offered a stale/absent config and is
 ///   being served against the public-name certificate).
 /// - `fingerprint` — TLS client fingerprints; currently `{ "ja4": string|null }`.
+/// - `tls_client` — compact TLS peer certificate metadata:
+///   `{ "certificate": object|null, "chain_fingerprints_sha256": string[] }`.
 pub fn h_connection_info(
     scope: &async_ebpf::program::HelperScope,
     _: u64,
@@ -129,6 +135,15 @@ pub fn h_connection_info(
                 Some(accepted) => serde_json::json!({ "accepted": accepted }),
                 None => serde_json::Value::Null,
             };
+            let tls_client_cert = conn
+                .tls_client_cert_der
+                .as_ref()
+                .and_then(|der| tls_client_cert_info(der));
+            let tls_client_chain_fingerprints = conn
+                .tls_client_chain_der
+                .iter()
+                .filter_map(|der| tls_cert_fingerprint_sha256(der))
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "tls": conn.tls,
                 "tls_handshake_complete": conn.tls_handshake_complete,
@@ -141,12 +156,63 @@ pub fn h_connection_info(
                 "fingerprint": {
                     "ja4": conn.tls_client_ja4,
                 },
+                "tls_client": {
+                    "certificate": tls_client_cert,
+                    "chain_fingerprints_sha256": tls_client_chain_fingerprints,
+                },
             })
         };
         ctx.alloc_memory_footprint(estimate_json_memory_usage(&json) as u64)?;
         let r = JsonRef::new(json);
         ctx.alloc_extobj(r)
     })
+}
+
+fn tls_client_cert_info(der: &[u8]) -> Option<serde_json::Value> {
+    let cert = X509::from_der(der).ok()?;
+    Some(serde_json::json!({
+        "fingerprint_sha256": tls_cert_fingerprint_sha256(der)?,
+        "subject": x509_name_to_string(cert.subject_name()),
+        "issuer": x509_name_to_string(cert.issuer_name()),
+        "serial": cert
+            .serial_number()
+            .to_bn()
+            .ok()?
+            .to_hex_str()
+            .ok()?
+            .to_string(),
+    }))
+}
+
+fn tls_cert_fingerprint_sha256(der: &[u8]) -> Option<String> {
+    let cert = X509::from_der(der).ok()?;
+    let digest = cert.digest(MessageDigest::sha256()).ok()?;
+    Some(hex_lower(digest.as_ref()))
+}
+
+fn x509_name_to_string(name: &X509NameRef) -> String {
+    name.entries()
+        .map(|entry| {
+            let key = entry.object().nid().short_name().unwrap_or("unknown");
+            let value = entry
+                .data()
+                .as_utf8()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| hex_lower(entry.data().as_slice()));
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub fn h_json_reset(

@@ -30,6 +30,22 @@ function bytesToBase64Url(bytes: Uint8Array): string {
     return base64ToBase64Url(bytesToBase64(bytes));
 }
 
+function pemToDerBytes(pem: string): Uint8Array {
+    const base64 = pem
+        .split(/\r?\n/)
+        .filter((line) => !line.startsWith("-----") && line.length > 0)
+        .join("");
+    return Uint8Array.from(atob(base64), (ch) => ch.charCodeAt(0));
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const input = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(input).set(bytes);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+    return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+}
+
 async function startBackend(
     handler: (req: Request) => Response | Promise<Response>,
 ): Promise<{ url: string; close: () => Promise<void> }> {
@@ -569,6 +585,10 @@ Deno.test({
                     sni: { inner: string | null; outer: string | null };
                     ech: unknown;
                     fingerprint: { ja4: string | null };
+                    tls_client: {
+                        certificate: unknown;
+                        chain_fingerprints_sha256: string[];
+                    };
                 };
                 assertEquals(body.tls, false);
                 assertEquals(body.alpn, null);
@@ -576,6 +596,8 @@ Deno.test({
                 assertEquals(body.sni.outer, null);
                 assertEquals(body.ech, null);
                 assertEquals(body.fingerprint.ja4, null);
+                assertEquals(body.tls_client.certificate, null);
+                assertEquals(body.tls_client.chain_fingerprints_sha256, []);
             });
 
             const cert = await generateSelfSignedCert();
@@ -594,6 +616,10 @@ Deno.test({
                                 tls: boolean;
                                 ech: unknown;
                                 fingerprint: { ja4: string | null };
+                                tls_client: {
+                                    certificate: unknown;
+                                    chain_fingerprints_sha256: string[];
+                                };
                             };
                             assertEquals(body.tls, true);
                             assertEquals(body.ech, null);
@@ -601,6 +627,49 @@ Deno.test({
                             assert(
                                 /^t[0-9sd]{2}[di][0-9]{4}[A-Za-z0-9]{2}_[0-9a-f]{12}_[0-9a-f]{12}$/
                                     .test(body.fingerprint.ja4),
+                            );
+                            assertEquals(body.tls_client.certificate, null);
+                        } finally {
+                            client.close();
+                        }
+                    },
+                );
+                await withZeroserveTls(
+                    tarPath,
+                    cert.certPath,
+                    cert.keyPath,
+                    async (_httpUrl, httpsUrl) => {
+                        const caCert = await Deno.readTextFile(cert.certPath);
+                        const key = await Deno.readTextFile(cert.keyPath);
+                        const expectedFingerprint = await sha256Hex(pemToDerBytes(caCert));
+                        const client = Deno.createHttpClient({
+                            caCerts: [caCert],
+                            cert: caCert,
+                            key,
+                        });
+                        try {
+                            const res = await fetch(`${httpsUrl}/conn`, { client });
+                            assertEquals(res.status, 200);
+                            const body = (await res.json()) as {
+                                tls_client: {
+                                    certificate: {
+                                        fingerprint_sha256: string;
+                                        subject: string;
+                                        issuer: string;
+                                        serial: string;
+                                    } | null;
+                                    chain_fingerprints_sha256: string[];
+                                };
+                            };
+                            assertEquals(body.tls_client.certificate?.subject, "CN=localhost");
+                            assertEquals(body.tls_client.certificate?.issuer, "CN=localhost");
+                            assertEquals(
+                                body.tls_client.certificate?.fingerprint_sha256,
+                                expectedFingerprint,
+                            );
+                            assertEquals(
+                                body.tls_client.chain_fingerprints_sha256,
+                                [],
                             );
                         } finally {
                             client.close();
