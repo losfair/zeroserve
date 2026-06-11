@@ -149,10 +149,27 @@ jobs:
           fi
           wait "$dpid"; rc=$?
           echo "=== deno test exit rc=$rc ==="
-          echo "----- placeholder-regex / forward_proxy_body ptrace lines -----"
-          grep -nE 'placeholder-regex|forward_proxy_body|REUSED pooled|FRESH backend|response status=' /tmp/e2e.log | tail -60 || true
-          echo "----- last 80 lines of e2e output -----"
-          tail -80 /tmp/e2e.log
+          echo "----- all placeholder-regex lines ([request] + ptrace) -----"
+          grep -nE 'placeholder-regex' /tmp/e2e.log || echo "(none)"
+          echo "----- ptrace lines whose request-id has START but no DONE (stuck script) -----"
+          # Pull request ids that started but never finished script/proxy.
+          grep -aoE '\[ptrace\] [0-9A-Z]+ script START' /tmp/e2e.log | awk '{print $2}' | sort -u > /tmp/started.ids || true
+          grep -aoE '\[ptrace\] [0-9A-Z]+ script DONE' /tmp/e2e.log | awk '{print $2}' | sort -u > /tmp/done.ids || true
+          comm -23 /tmp/started.ids /tmp/done.ids > /tmp/stuck.ids || true
+          echo "stuck-in-script request ids:"; cat /tmp/stuck.ids || true
+          while read -r id; do
+            [ -z "$id" ] && continue
+            echo "--- all log lines for stuck id $id ---"
+            grep -aE "$id" /tmp/e2e.log || true
+          done < /tmp/stuck.ids
+          echo "----- PROXY START without matching response (stuck in proxy) -----"
+          grep -aoE '\[ptrace\] [0-9A-Z]+ PROXY START' /tmp/e2e.log | awk '{print $2}' | sort -u > /tmp/pstart.ids || true
+          # a proxied req that returned has a 'response status=' soon after; correlate by id is hard,
+          # so just show the last 25 ptrace lines for manual read too.
+          echo "----- last 30 ptrace lines -----"
+          grep -aE '\[ptrace\]' /tmp/e2e.log | tail -30
+          echo "----- last 40 lines of e2e output -----"
+          tail -40 /tmp/e2e.log
           if [ "$captured" -eq 1 ]; then exit 1; fi
           exit $rc
 

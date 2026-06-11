@@ -777,6 +777,9 @@ async fn handle_request<R: AsyncReadRent + 'static>(
         connection.clone(),
     );
     let script_request_fallback = script_request.clone();
+    if proxy_trace_enabled() {
+        eprintln!("[ptrace] {} script START {}", request_id, head.uri);
+    }
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request, body_source.clone()) => x,
         _ = &mut *interrupt => {
@@ -785,6 +788,9 @@ async fn handle_request<R: AsyncReadRent + 'static>(
           return (false, reader);
         }
     };
+    if proxy_trace_enabled() {
+        eprintln!("[ptrace] {} script DONE {}", request_id, head.uri);
+    }
     let script_outcome = match script_outcome {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -838,6 +844,12 @@ async fn handle_request<R: AsyncReadRent + 'static>(
             inner: w,
             started: &response_started,
         };
+        if proxy_trace_enabled() {
+            eprintln!(
+                "[ptrace] {} PROXY START {} -> {}",
+                request_id, head.uri, proxy_url
+            );
+        }
         let res = monoio::select! {
             x = reverse_proxy_request(
                 proxy_url,
