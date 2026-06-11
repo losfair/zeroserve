@@ -21,7 +21,9 @@ jobs:
   test:
     name: Unit + e2e tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    # ci-debug: raised from 10 so the e2e step's own 420s timeout + gdb dump can
+    # complete instead of the whole job being killed at the 10-minute mark.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -96,23 +98,34 @@ jobs:
         working-directory: testing
         run: |
           set +e
-          timeout -v 420 deno test -A --parallel
+          # Shorter than the 25-minute job budget so this fires (and dumps) with
+          # room to spare. The hanging test wedges on its own well under this.
+          timeout -v 360 deno test -A --parallel
           rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "=== deno test rc=$rc; dumping diagnostics ==="
             ps auxww | grep -E 'zeroserve|deno' | grep -v grep || true
-            echo "--- sockets ---"
-            sudo ss -tnpa 2>/dev/null | grep -E 'zeroserve|deno|State' | head -200 || true
+            echo "--- all zeroserve/deno sockets (with timers) ---"
+            sudo ss -tinoepa 2>/dev/null | grep -E 'zeroserve|deno|State|timer' | head -300 || true
             for pid in $(pgrep -x zeroserve); do
-              echo "--- listener probe for zeroserve pid $pid ---"
+              echo "===================== zeroserve pid $pid ====================="
+              echo "--- this server's sockets ---"
+              sudo ss -tinoepa 2>/dev/null | grep "pid=$pid" || true
+              echo "--- listener liveness probe ---"
               for port in $(sudo ss -tnlp 2>/dev/null | grep "pid=$pid" | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u); do
-                echo "curl 127.0.0.1:$port =>"
-                curl -m 5 -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$port/" || true
+                echo "curl 127.0.0.1:$port => $(curl -m 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>&1 || echo FAIL)"
               done
-              echo "--- gdb stacks for zeroserve pid $pid ---"
+              echo "--- per-thread kernel state (comm / wchan / kernel stack) ---"
+              for tid in $(ls /proc/$pid/task); do
+                comm=$(cat /proc/$pid/task/$tid/comm 2>/dev/null)
+                wchan=$(cat /proc/$pid/task/$tid/wchan 2>/dev/null)
+                echo "  [tid $tid] $comm  wchan=$wchan"
+                sudo cat /proc/$pid/task/$tid/stack 2>/dev/null | sed 's/^/      /' || true
+              done
+              echo "--- gdb userspace stacks ---"
               sudo timeout 120 gdb -p "$pid" -batch \
                 -ex 'set pagination off' \
-                -ex 'thread apply all bt' 2>&1 | tail -250 || true
+                -ex 'thread apply all bt' 2>&1 | tail -300 || true
             done
           fi
           exit $rc
