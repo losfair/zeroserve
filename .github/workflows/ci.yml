@@ -98,36 +98,58 @@ jobs:
         working-directory: testing
         run: |
           set +e
-          # Shorter than the 25-minute job budget so this fires (and dumps) with
-          # room to spare. The hanging test wedges on its own well under this.
-          timeout -v 360 deno test -A --parallel
-          rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "=== deno test rc=$rc; dumping diagnostics ==="
-            ps auxww | grep -E 'zeroserve|deno' | grep -v grep || true
-            echo "--- all zeroserve/deno sockets (with timers) ---"
-            sudo ss -tinoepa 2>/dev/null | grep -E 'zeroserve|deno|State|timer' | head -300 || true
-            for pid in $(pgrep -x zeroserve); do
+
+          dump_servers() {
+            echo "=== capturing zeroserve state at $(date +%T) ==="
+            pgrep -x zeroserve > /tmp/zs.pids
+            echo "live zeroserve pids: $(tr '\n' ' ' < /tmp/zs.pids)"
+            sudo ss -tinoepa 2>/dev/null | grep -E 'State|zeroserve' | head -200 || true
+            while read -r pid; do
+              [ -z "$pid" ] && continue
               echo "===================== zeroserve pid $pid ====================="
-              echo "--- this server's sockets ---"
               sudo ss -tinoepa 2>/dev/null | grep "pid=$pid" || true
-              echo "--- listener liveness probe ---"
-              for port in $(sudo ss -tnlp 2>/dev/null | grep "pid=$pid" | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u); do
-                echo "curl 127.0.0.1:$port => $(curl -m 5 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" 2>&1 || echo FAIL)"
-              done
-              echo "--- per-thread kernel state (comm / wchan / kernel stack) ---"
-              for tid in $(ls /proc/$pid/task); do
-                comm=$(cat /proc/$pid/task/$tid/comm 2>/dev/null)
-                wchan=$(cat /proc/$pid/task/$tid/wchan 2>/dev/null)
-                echo "  [tid $tid] $comm  wchan=$wchan"
+              echo "--- per-thread: comm / wchan / syscall / kernel stack ---"
+              for tid in $(ls /proc/$pid/task 2>/dev/null); do
+                echo "  [tid $tid] $(cat /proc/$pid/task/$tid/comm 2>/dev/null) wchan=$(cat /proc/$pid/task/$tid/wchan 2>/dev/null) syscall=$(sudo cat /proc/$pid/task/$tid/syscall 2>/dev/null)"
                 sudo cat /proc/$pid/task/$tid/stack 2>/dev/null | sed 's/^/      /' || true
               done
               echo "--- gdb userspace stacks ---"
-              sudo timeout 120 gdb -p "$pid" -batch \
-                -ex 'set pagination off' \
-                -ex 'thread apply all bt' 2>&1 | tail -300 || true
-            done
+              sudo timeout 90 gdb -p "$pid" -batch -ex 'set pagination off' \
+                -ex 'thread apply all bt' 2>&1 | grep -vE '^\[New|^Reading symbols|^Downloading' | tail -250 || true
+            done < /tmp/zs.pids
+          }
+
+          # Run the suite in the background and watch its output. Capture the
+          # wedged server's stacks WHILE it is still alive — the previous attempt
+          # dumped after `timeout` killed deno, by which point deno had already
+          # reaped its zeroserve children, leaving nothing to inspect. By ~120s
+          # into the hang every other test's server has exited, so only the stuck
+          # one remains.
+          deno test -A --parallel > /tmp/e2e.log 2>&1 &
+          dpid=$!
+          captured=0
+          for _ in $(seq 1 72); do          # up to ~360s at 5s steps
+            if ! kill -0 "$dpid" 2>/dev/null; then break; fi
+            if grep -q 'has been running for over .2m' /tmp/e2e.log; then
+              echo "=== HANG MARKER SEEN; dumping then terminating deno ==="
+              dump_servers
+              captured=1
+              kill -TERM "$dpid" 2>/dev/null
+              break
+            fi
+            sleep 5
+          done
+          if [ "$captured" -eq 0 ] && kill -0 "$dpid" 2>/dev/null; then
+            # Safety net: no marker within budget — dump whatever is alive.
+            echo "=== budget elapsed without hang marker; dumping survivors ==="
+            dump_servers
+            kill -TERM "$dpid" 2>/dev/null
           fi
+          wait "$dpid"; rc=$?
+          echo "=== deno test exit rc=$rc ==="
+          echo "----- last 60 lines of e2e output -----"
+          tail -60 /tmp/e2e.log
+          if [ "$captured" -eq 1 ]; then exit 1; fi
           exit $rc
 
   # ---------------------------------------------------------------------------
