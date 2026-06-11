@@ -4982,7 +4982,9 @@ where
                     continue;
                 }
                 if trace {
-                    eprintln!("[ptrace] forward_proxy_body NeedRead -> fill (BLOCKING on backend read)");
+                    eprintln!(
+                        "[ptrace] forward_proxy_body NeedRead -> fill (BLOCKING on backend read)"
+                    );
                 }
                 body.fill(conn, PROXY_WRITE_BATCH_SIZE)
                     .await
