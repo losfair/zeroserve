@@ -4943,13 +4943,23 @@ Deno.test({
   },
 });
 
+// ci-debug: live progress markers that bypass deno test's output capture so
+// the CI log shows exactly where this test wedges.
+function rewriteTestMark(step: string) {
+  Deno.stderr.writeSync(
+    new TextEncoder().encode(`[rewrite-uri-test] ${step}\n`),
+  );
+}
+
 Deno.test({
   name: "compiled Caddy rewrite URI operations mutate path and query",
   ignore: !canRunScripts,
   sanitizeResources: false,
   sanitizeOps: false,
   async fn() {
+    rewriteTestMark("starting backend");
     const backend = await startBackend();
+    rewriteTestMark(`backend up at ${backend.dial}`);
     const siteDir = await Deno.makeTempDir();
     let tarPath: string | null = null;
     try {
@@ -5093,41 +5103,59 @@ Deno.test({
         compiled.stdout,
       );
 
+      rewriteTestMark("packing site");
       tarPath = await packSite(siteDir);
+      rewriteTestMark("spawning zeroserve");
       await withZeroserve(tarPath, async (baseUrl) => {
+        rewriteTestMark(`server up at ${baseUrl}; fetch /api`);
         const res = await fetch(`${baseUrl}/api//raw-file.json?x=raw&y=raw`);
+        rewriteTestMark(`/api status ${res.status}; reading body`);
         assertEquals(res.status, 200);
         const body = await res.json();
         assertEquals(body.path, "/cooked-file");
         assertEquals(body.query, "?x=cooked&y=raw");
 
+        rewriteTestMark("fetch /template");
         const templatedRes = await fetch(
           `${baseUrl}/template?x=1&y=two`,
           { headers: { "X-Raw": "a b&c=d" } },
         );
+        rewriteTestMark(`/template status ${templatedRes.status}; reading body`);
         assertEquals(templatedRes.status, 200);
         const templatedBody = await templatedRes.json();
         assertEquals(templatedBody.path, "/templated");
         assertEquals(templatedBody.query, "?p=a+b%26c%3Dd&x=1&y=two");
 
+        rewriteTestMark("fetch /literal-query");
         const literalQueryRes = await fetch(`${baseUrl}/literal-query`);
+        rewriteTestMark(
+          `/literal-query status ${literalQueryRes.status}; reading body`,
+        );
         assertEquals(literalQueryRes.status, 200);
         const literalQueryBody = await literalQueryRes.json();
         assertEquals(literalQueryBody.path, "/literal-query-upstream");
         assertEquals(literalQueryBody.query, "?a=b&c=d");
 
+        rewriteTestMark("rawHttpGet /placeholder-regex");
         const placeholderRegexRes = await rawHttpGet(
           baseUrl,
           "/placeholder-regex/{http.vars.re}?x=1",
           "localhost",
+        );
+        rewriteTestMark(
+          `/placeholder-regex status ${placeholderRegexRes.status}`,
         );
         assertEquals(placeholderRegexRes.status, 200);
         const placeholderRegexBody = JSON.parse(placeholderRegexRes.body);
         assertEquals(placeholderRegexBody.path, "/placeholder-regex/literal");
         assertEquals(placeholderRegexBody.query, "?x=1");
 
+        rewriteTestMark("fetch /query-placeholder-key");
         const queryPlaceholderKeyRes = await fetch(
           `${baseUrl}/query-placeholder-key?a=b&c=d`,
+        );
+        rewriteTestMark(
+          `/query-placeholder-key status ${queryPlaceholderKeyRes.status}; reading body`,
         );
         assertEquals(queryPlaceholderKeyRes.status, 200);
         const queryPlaceholderKeyBody = await queryPlaceholderKeyRes.json();
@@ -5140,11 +5168,15 @@ Deno.test({
           "?prefixa=b&c=d=v",
         );
 
+        rewriteTestMark("fetch /serve/start");
         const injectedQueryRes = await fetch(`${baseUrl}/serve/start`, {
           headers: {
             "X-Fwd": "foo?{env.CADDY_REWRITE_TEST_SECRET}=leak",
           },
         });
+        rewriteTestMark(
+          `/serve/start status ${injectedQueryRes.status}; reading body`,
+        );
         assertEquals(injectedQueryRes.status, 200);
         const injectedQueryBody = await injectedQueryRes.json();
         assertEquals(injectedQueryBody.path, "/serve/foo");
@@ -5153,15 +5185,19 @@ Deno.test({
           "?%7Benv.CADDY_REWRITE_TEST_SECRET%7D=leak",
         );
 
+        rewriteTestMark("fetch unicode png");
         const unicodeRes = await fetch(
           `${baseUrl}/%C2%B7%E2%88%B5.png?a=b`,
         );
+        rewriteTestMark(`unicode status ${unicodeRes.status}; reading body`);
         assertEquals(unicodeRes.status, 200);
         const unicodeBody = await unicodeRes.json();
         assertEquals(unicodeBody.path, "/i/%C2%B7%E2%88%B5.png");
         assertEquals(unicodeBody.query, "?a=b");
+        rewriteTestMark("all fetches done");
       });
     } finally {
+      rewriteTestMark("cleanup");
       await backend.close();
       await Deno.remove(siteDir, { recursive: true }).catch(() => {});
       if (tarPath) {

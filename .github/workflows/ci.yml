@@ -94,7 +94,28 @@ jobs:
 
       - name: End-to-end tests
         working-directory: testing
-        run: deno test -A --parallel
+        run: |
+          set +e
+          timeout -v 420 deno test -A --parallel
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "=== deno test rc=$rc; dumping diagnostics ==="
+            ps auxww | grep -E 'zeroserve|deno' | grep -v grep || true
+            echo "--- sockets ---"
+            sudo ss -tnpa 2>/dev/null | grep -E 'zeroserve|deno|State' | head -200 || true
+            for pid in $(pgrep -x zeroserve); do
+              echo "--- listener probe for zeroserve pid $pid ---"
+              for port in $(sudo ss -tnlp 2>/dev/null | grep "pid=$pid" | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u); do
+                echo "curl 127.0.0.1:$port =>"
+                curl -m 5 -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$port/" || true
+              done
+              echo "--- gdb stacks for zeroserve pid $pid ---"
+              sudo timeout 120 gdb -p "$pid" -batch \
+                -ex 'set pagination off' \
+                -ex 'thread apply all bt' 2>&1 | tail -250 || true
+            done
+          fi
+          exit $rc
 
   # ---------------------------------------------------------------------------
   # Release binaries for linux/amd64 and linux/arm64, linked against glibc 2.31

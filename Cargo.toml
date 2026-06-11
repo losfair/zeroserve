@@ -5,6 +5,8 @@ edition = "2024"
 
 [profile.release]
 panic = "abort"
+# ci-debug: keep symbols so gdb stack dumps of a wedged server are readable.
+debug = 1
 
 [build-dependencies]
 lalrpop = "0.23"
