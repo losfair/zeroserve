@@ -104,18 +104,11 @@ pub enum Body {
     Chunked {
         remaining: usize,
         need_crlf: bool,
-        reading_trailers: bool,
         done: bool,
     },
     Eof {
         done: bool,
     },
-}
-
-pub enum TryBodyData {
-    Copied,
-    NeedRead,
-    Done,
 }
 
 impl Body {
@@ -133,128 +126,6 @@ impl Body {
 
     pub fn is_eof(&self) -> bool {
         matches!(self, Body::Eof { .. })
-    }
-
-    /// Drain body data already buffered on `conn` into `out` without
-    /// performing IO. Appends at most `max_take` bytes of body data per call
-    /// (plus chunk framing when `rechunk` is set). `NeedRead` means progress
-    /// requires more bytes from the connection — see [`Body::fill`].
-    pub fn try_drain_into<IO>(
-        &mut self,
-        conn: &mut H1Connection<IO>,
-        out: &mut Vec<u8>,
-        max_take: usize,
-        rechunk: bool,
-    ) -> Result<TryBodyData, HttpError> {
-        let max_take = max_take.max(1);
-        loop {
-            match self {
-                Body::None => return Ok(TryBodyData::Done),
-                Body::Fixed { remaining } => {
-                    if *remaining == 0 {
-                        return Ok(TryBodyData::Done);
-                    }
-                    let available = conn.buffered_len();
-                    if available == 0 {
-                        return Ok(TryBodyData::NeedRead);
-                    }
-                    let to_copy = cmp::min(
-                        cmp::min(available, max_take),
-                        cmp::min(*remaining, usize::MAX as u64) as usize,
-                    );
-                    conn.drain_buffered_into(out, to_copy, rechunk);
-                    *remaining -= to_copy as u64;
-                    return Ok(TryBodyData::Copied);
-                }
-                Body::Chunked {
-                    remaining,
-                    need_crlf,
-                    reading_trailers,
-                    done,
-                } => {
-                    if *done {
-                        return Ok(TryBodyData::Done);
-                    }
-                    if *reading_trailers {
-                        let Some(empty) = conn.try_skip_line()? else {
-                            return Ok(TryBodyData::NeedRead);
-                        };
-                        if empty {
-                            *done = true;
-                            return Ok(TryBodyData::Done);
-                        }
-                        continue;
-                    }
-                    if *remaining == 0 {
-                        if *need_crlf {
-                            if !conn.try_consume_crlf()? {
-                                return Ok(TryBodyData::NeedRead);
-                            }
-                            *need_crlf = false;
-                        }
-                        let Some(size) = conn.try_read_chunk_size()? else {
-                            return Ok(TryBodyData::NeedRead);
-                        };
-                        if size == 0 {
-                            *reading_trailers = true;
-                            continue;
-                        }
-                        *remaining = size;
-                    }
-                    let available = conn.buffered_len();
-                    if available == 0 {
-                        return Ok(TryBodyData::NeedRead);
-                    }
-                    let to_copy = cmp::min(cmp::min(available, max_take), *remaining);
-                    conn.drain_buffered_into(out, to_copy, rechunk);
-                    *remaining -= to_copy;
-                    if *remaining == 0 {
-                        *need_crlf = true;
-                    }
-                    return Ok(TryBodyData::Copied);
-                }
-                Body::Eof { done } => {
-                    if *done {
-                        return Ok(TryBodyData::Done);
-                    }
-                    let available = conn.buffered_len();
-                    if available == 0 {
-                        return Ok(TryBodyData::NeedRead);
-                    }
-                    conn.drain_buffered_into(out, cmp::min(available, max_take), rechunk);
-                    return Ok(TryBodyData::Copied);
-                }
-            }
-        }
-    }
-
-    /// Read more data for this body with a single read of at most
-    /// `max_read_size` bytes, returning as soon as any bytes arrive. On EOF,
-    /// EOF-delimited bodies are marked done; length-delimited bodies that are
-    /// not complete yet yield `UnexpectedEof`.
-    pub async fn fill<IO: AsyncReadRent>(
-        &mut self,
-        conn: &mut H1Connection<IO>,
-        max_read_size: usize,
-    ) -> Result<(), HttpError> {
-        let n = conn.fill_buf(max_read_size).await?;
-        if n == 0 {
-            match self {
-                Body::None => {}
-                Body::Eof { done } => *done = true,
-                Body::Fixed { remaining } => {
-                    if *remaining > 0 {
-                        return Err(HttpError::UnexpectedEof);
-                    }
-                }
-                Body::Chunked { done, .. } => {
-                    if !*done {
-                        return Err(HttpError::UnexpectedEof);
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub async fn next_data<IO: AsyncReadRent>(
@@ -279,17 +150,9 @@ impl Body {
             Body::Chunked {
                 remaining,
                 need_crlf,
-                reading_trailers,
                 done,
             } => {
                 if *done {
-                    return None;
-                }
-                if *reading_trailers {
-                    if let Err(err) = conn.read_chunk_trailers().await {
-                        return Some(Err(err));
-                    }
-                    *done = true;
                     return None;
                 }
                 if *remaining == 0 {
@@ -302,7 +165,6 @@ impl Body {
                     match conn.read_chunk_size().await {
                         Ok(Some(size)) => {
                             if size == 0 {
-                                *reading_trailers = true;
                                 if let Err(err) = conn.read_chunk_trailers().await {
                                     return Some(Err(err));
                                 }
@@ -348,7 +210,6 @@ pub struct H1Connection<IO> {
     io: Option<IO>,
     buf: Vec<u8>,
     pos: usize,
-    scratch: Option<Vec<u8>>,
 }
 
 impl<IO> H1Connection<IO> {
@@ -357,7 +218,6 @@ impl<IO> H1Connection<IO> {
             io: Some(io),
             buf: Vec::new(),
             pos: 0,
-            scratch: None,
         }
     }
 
@@ -394,83 +254,11 @@ impl<IO> H1Connection<IO> {
         self.buf[self.pos..].windows(2).position(|x| x == b"\r\n")
     }
 
-    fn buffered_len(&self) -> usize {
-        self.buf.len().saturating_sub(self.pos)
-    }
-
-    /// Move `len` buffered bytes into `out`, framing them as a single HTTP
-    /// chunk when `rechunk` is set.
-    fn drain_buffered_into(&mut self, out: &mut Vec<u8>, len: usize, rechunk: bool) {
-        use std::io::Write as _;
-        if rechunk {
-            let _ = write!(out, "{len:X}\r\n");
-        }
-        out.extend_from_slice(&self.buf[self.pos..self.pos + len]);
-        if rechunk {
-            out.extend_from_slice(b"\r\n");
-        }
-        self.consume(len);
-    }
-
-    /// Consume a buffered CRLF. Returns Ok(false) when fewer than two bytes
-    /// are buffered.
-    fn try_consume_crlf(&mut self) -> Result<bool, HttpError> {
-        if self.buffered_len() < 2 {
-            return Ok(false);
-        }
-        if &self.buf[self.pos..self.pos + 2] != b"\r\n" {
-            return Err(HttpError::InvalidChunked);
-        }
-        self.consume(2);
-        Ok(true)
-    }
-
-    /// Consume one buffered line. Returns Some(line_was_empty), or None when
-    /// no complete line is buffered.
-    fn try_skip_line(&mut self) -> Result<Option<bool>, HttpError> {
-        let Some(idx) = self.try_find_line()? else {
-            return Ok(None);
-        };
-        self.consume(idx + 2);
-        Ok(Some(idx == 0))
-    }
-
-    fn try_read_chunk_size(&mut self) -> Result<Option<usize>, HttpError> {
-        let Some(idx) = self.try_find_line()? else {
-            return Ok(None);
-        };
-        let size = parse_chunk_size_line(&self.buf[self.pos..self.pos + idx])?;
-        self.consume(idx + 2);
-        Ok(Some(size))
-    }
-
-    fn try_find_line(&self) -> Result<Option<usize>, HttpError> {
-        let Some(idx) = self.find_crlf() else {
-            if self.buffered_len() > MAX_LINE_SIZE {
-                return Err(HttpError::LineTooLong);
-            }
-            return Ok(None);
-        };
-        if idx > MAX_LINE_SIZE {
-            return Err(HttpError::LineTooLong);
-        }
-        Ok(Some(idx))
-    }
-
     fn find_double_crlf(&self) -> Option<usize> {
         self.buf[self.pos..]
             .windows(4)
             .position(|x| x == b"\r\n\r\n")
     }
-}
-
-fn parse_chunk_size_line(line: &[u8]) -> Result<usize, HttpError> {
-    let line = std::str::from_utf8(line).map_err(|_| HttpError::InvalidChunked)?;
-    let size_part = line.split(';').next().unwrap_or("").trim();
-    if size_part.is_empty() {
-        return Err(HttpError::InvalidChunked);
-    }
-    usize::from_str_radix(size_part, 16).map_err(|_| HttpError::InvalidChunked)
 }
 
 impl<IO: AsyncReadRent> H1Connection<IO> {
@@ -572,31 +360,19 @@ impl<IO: AsyncReadRent> H1Connection<IO> {
         Ok(Some(Bytes::copy_from_slice(&buf[..n])))
     }
 
-    /// Perform a single read of at most `max_read_size` bytes into the
-    /// connection buffer, returning the byte count (0 on EOF). The read
-    /// buffer is retained on the connection and reused across calls.
-    async fn fill_buf(&mut self, max_read_size: usize) -> Result<usize, HttpError> {
-        let io = self.io.as_mut().ok_or(HttpError::MissingIo)?;
-        let mut buf = self.scratch.take().unwrap_or_default();
-        buf.resize(max_read_size.max(1), 0);
-        let (res, buf) = io.read(buf).await;
-        let restored = match &res {
-            Ok(n) => {
-                self.buf.extend_from_slice(&buf[..*n]);
-                buf
-            }
-            Err(_) => buf,
-        };
-        self.scratch = Some(restored);
-        res.map_err(HttpError::from)
-    }
-
     async fn read_chunk_size(&mut self) -> Result<Option<usize>, HttpError> {
         let line = match self.read_line().await? {
             Some(line) => line,
             None => return Ok(None),
         };
-        parse_chunk_size_line(&line).map(Some)
+        let line = std::str::from_utf8(&line).map_err(|_| HttpError::InvalidChunked)?;
+        let size_part = line.split(';').next().unwrap_or("").trim();
+        if size_part.is_empty() {
+            return Err(HttpError::InvalidChunked);
+        }
+        usize::from_str_radix(size_part, 16)
+            .map(Some)
+            .map_err(|_| HttpError::InvalidChunked)
     }
 
     async fn read_chunk_crlf(&mut self) -> Result<(), HttpError> {
@@ -646,7 +422,6 @@ pub fn request_body_from_headers(head: &RequestHead) -> Body {
         return Body::Chunked {
             remaining: 0,
             need_crlf: false,
-            reading_trailers: false,
             done: false,
         };
     }
@@ -672,7 +447,6 @@ pub fn response_body_from_headers(head: &ResponseHead) -> Body {
         return Body::Chunked {
             remaining: 0,
             need_crlf: false,
-            reading_trailers: false,
             done: false,
         };
     }
@@ -968,105 +742,5 @@ mod tests {
 
         assert!(encoded.contains("\r\naccept: text/plain\r\n"));
         assert!(encoded.contains("\r\naccept: application/json\r\n"));
-    }
-
-    #[test]
-    fn try_drain_into_remembers_partial_chunked_trailers() {
-        let mut body = Body::Chunked {
-            remaining: 0,
-            need_crlf: false,
-            reading_trailers: false,
-            done: false,
-        };
-        let mut conn = H1Connection::new(());
-        conn.buf.extend_from_slice(b"0\r\nX-Trailer: value\r\n");
-        let mut out = Vec::new();
-
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, true)
-                .unwrap(),
-            TryBodyData::NeedRead
-        ));
-        assert!(matches!(
-            body,
-            Body::Chunked {
-                reading_trailers: true,
-                done: false,
-                ..
-            }
-        ));
-
-        conn.buf.extend_from_slice(b"\r\n");
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, true)
-                .unwrap(),
-            TryBodyData::Done
-        ));
-        assert!(matches!(body, Body::Chunked { done: true, .. }));
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn try_drain_into_rechunks_buffered_data() {
-        let mut body = Body::Chunked {
-            remaining: 0,
-            need_crlf: false,
-            reading_trailers: false,
-            done: false,
-        };
-        let mut conn = H1Connection::new(());
-        conn.buf.extend_from_slice(b"5\r\nhello\r\n3\r\nwor");
-        let mut out = Vec::new();
-
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, true)
-                .unwrap(),
-            TryBodyData::Copied
-        ));
-        assert_eq!(out.as_slice(), b"5\r\nhello\r\n");
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, true)
-                .unwrap(),
-            TryBodyData::Copied
-        ));
-        assert_eq!(out.as_slice(), b"5\r\nhello\r\n3\r\nwor\r\n");
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, true)
-                .unwrap(),
-            TryBodyData::NeedRead
-        ));
-        assert!(matches!(
-            body,
-            Body::Chunked {
-                remaining: 0,
-                need_crlf: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn try_drain_into_respects_max_take() {
-        let mut body = Body::Fixed { remaining: 10 };
-        let mut conn = H1Connection::new(());
-        conn.buf.extend_from_slice(b"0123456789");
-        let mut out = Vec::new();
-
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, 4, false).unwrap(),
-            TryBodyData::Copied
-        ));
-        assert_eq!(out.as_slice(), b"0123");
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, false)
-                .unwrap(),
-            TryBodyData::Copied
-        ));
-        assert_eq!(out.as_slice(), b"0123456789");
-        assert!(matches!(
-            body.try_drain_into(&mut conn, &mut out, READ_BUF_SIZE, false)
-                .unwrap(),
-            TryBodyData::Done
-        ));
     }
 }

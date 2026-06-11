@@ -21,7 +21,6 @@ use futures::{
     future::{self, FutureExt},
 };
 use monoio::{
-    BufResult,
     buf::SliceMut,
     io::{
         AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt, IntoPollIo, Split,
@@ -52,7 +51,6 @@ use crate::{
 type HttpBody = h1::Body;
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const PROXY_WRITE_BATCH_SIZE: usize = 64 * 1024;
 
 // ci-debug: env-gated proxy tracing to pinpoint the rewrite-test hang.
 fn proxy_trace_enabled() -> bool {
@@ -839,11 +837,6 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     }
 
     if let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() {
-        let response_started = Cell::new(false);
-        let mut tracked_w = TrackedWriter {
-            inner: w,
-            started: &response_started,
-        };
         if proxy_trace_enabled() {
             eprintln!(
                 "[ptrace] {} PROXY START {} -> {}",
@@ -856,7 +849,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                 head.clone(),
                 body,
                 &mut reader,
-                &mut tracked_w,
+                w,
                 head_only,
                 peer,
                 scheme,
@@ -1111,12 +1104,6 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                     format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
                 )
                 .await;
-                if response_started.get() {
-                    // Part of the upstream response already reached the
-                    // client; writing an error response now would corrupt
-                    // the H1 framing, so close the connection instead.
-                    return (false, reader);
-                }
                 if !caddy::has_error_routes(&script_outcome) {
                     let send_outcome = send_fixed(
                         w,
@@ -4258,16 +4245,12 @@ where
     };
     if proxy_trace_enabled() {
         eprintln!(
-            "[ptrace] response status={} ver={:?} hint={:?} cl={:?} te={:?} headers={:?}",
+            "[ptrace] response status={} ver={:?} hint={:?} cl={:?} te={:?}",
             status,
             resp_head.version,
             body_hint,
             headers.get(::http::header::CONTENT_LENGTH),
             headers.get(::http::header::TRANSFER_ENCODING),
-            headers
-                .iter()
-                .map(|(n, v)| (n.as_str(), v.to_str().unwrap_or("<bin>")))
-                .collect::<Vec<_>>(),
         );
     }
     if resp_body.is_eof() {
@@ -4930,36 +4913,6 @@ where
     Ok(())
 }
 
-/// Client writer wrapper that records whether any response bytes were
-/// written (or may have been written — the flag is set before the IO await,
-/// so a future dropped mid-write still counts). Error paths use this to tell
-/// whether the connection can still carry a fresh error response or must be
-/// closed to avoid corrupting H1 framing.
-struct TrackedWriter<'a, W> {
-    inner: &'a mut W,
-    started: &'a Cell<bool>,
-}
-
-impl<W: AsyncWriteRent> AsyncWriteRent for TrackedWriter<'_, W> {
-    async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-        self.started.set(true);
-        self.inner.write(buf).await
-    }
-
-    async fn writev<T: monoio::buf::IoVecBuf>(&mut self, buf_vec: T) -> BufResult<usize, T> {
-        self.started.set(true);
-        self.inner.writev(buf_vec).await
-    }
-
-    async fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush().await
-    }
-
-    async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.inner.shutdown().await
-    }
-}
-
 async fn forward_proxy_body<IO>(
     w: &mut impl AsyncWriteRent,
     conn: &mut h1::H1Connection<IO>,
@@ -4968,74 +4921,30 @@ async fn forward_proxy_body<IO>(
 where
     IO: AsyncReadRent,
 {
-    let trace = proxy_trace_enabled();
-    let rechunk = match body.hint() {
-        StreamHint::None => return Ok(()),
-        StreamHint::Fixed => false,
-        StreamHint::Stream => true,
-    };
-    if trace {
-        eprintln!("[ptrace] forward_proxy_body start hint={:?}", body.hint());
-    }
-    let mut batch: Vec<u8> = Vec::with_capacity(PROXY_WRITE_BATCH_SIZE);
-    loop {
-        let room = PROXY_WRITE_BATCH_SIZE.saturating_sub(batch.len());
-        match body.try_drain_into(conn, &mut batch, room, rechunk) {
-            Ok(h1::TryBodyData::Copied) => {
-                if batch.len() >= PROXY_WRITE_BATCH_SIZE {
-                    write_proxy_body_batch(w, &mut batch, rechunk).await?;
-                }
+    match body.hint() {
+        StreamHint::None => Ok(()),
+        StreamHint::Fixed => {
+            while let Some(chunk) = body.next_data(conn).await {
+                let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                let (res, _) = w.write_all(chunk.to_vec()).await;
+                res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
             }
-            Ok(h1::TryBodyData::NeedRead) => {
-                // Flush everything pending to the client before blocking on
-                // the upstream, so a stalled upstream never delays delivery.
-                if !batch.is_empty() {
-                    write_proxy_body_batch(w, &mut batch, rechunk).await?;
-                    continue;
-                }
-                if trace {
-                    eprintln!(
-                        "[ptrace] forward_proxy_body NeedRead -> fill (BLOCKING on backend read)"
-                    );
-                }
-                body.fill(conn, PROXY_WRITE_BATCH_SIZE)
+            Ok(())
+        }
+        StreamHint::Stream => {
+            while let Some(chunk) = body.next_data(conn).await {
+                let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                h1::write_chunk(w, chunk.as_ref())
                     .await
-                    .map_err(|err| anyhow!("proxy body read failed: {err}"))?;
-                if trace {
-                    eprintln!("[ptrace] forward_proxy_body fill returned");
-                }
+                    .map_err(|err| anyhow!("failed to write proxy body chunk: {err}"))?;
+                let _ = w.flush().await;
             }
-            Ok(h1::TryBodyData::Done) => break,
-            Err(err) => return Err(anyhow!("proxy body read failed: {err}")),
+            h1::write_chunk_end(w)
+                .await
+                .map_err(|err| anyhow!("failed to write proxy body end: {err}"))?;
+            Ok(())
         }
     }
-    if trace {
-        eprintln!("[ptrace] forward_proxy_body done");
-    }
-    if rechunk {
-        batch.extend_from_slice(b"0\r\n\r\n");
-    }
-    write_proxy_body_batch(w, &mut batch, false).await?;
-    Ok(())
-}
-
-async fn write_proxy_body_batch(
-    w: &mut impl AsyncWriteRent,
-    batch: &mut Vec<u8>,
-    flush: bool,
-) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let pending = std::mem::take(batch);
-    let (res, mut pending) = w.write_all(pending).await;
-    res.map_err(|err| anyhow!("failed to write proxy body: {err}"))?;
-    pending.clear();
-    *batch = pending;
-    if flush {
-        let _ = w.flush().await;
-    }
-    Ok(())
 }
 
 /// Forward an upstream response body while applying streaming compression
