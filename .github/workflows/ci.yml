@@ -21,6 +21,7 @@ jobs:
   test:
     name: Unit + e2e tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:

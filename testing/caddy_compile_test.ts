@@ -423,10 +423,10 @@ async function rawHttpGetWithHeaderLines(
         break;
       }
       chunks.push(buf.slice(0, n));
-      const response = new TextDecoder().decode(concatBytes(chunks));
-      const split = response.indexOf("\r\n\r\n");
+      const response = concatBytes(chunks);
+      const split = findHeaderEnd(response);
       if (split >= 0) {
-        const head = response.slice(0, split);
+        const head = new TextDecoder().decode(response.slice(0, split));
         const body = response.slice(split + 4);
         const status = Number(head.split(/\s+/)[1]);
         if (
@@ -441,14 +441,23 @@ async function rawHttpGetWithHeaderLines(
           .slice(1)
           .join(":")
           .trim();
-        if (length && body.length >= Number(length)) {
-          return parseRawResponse(head, body.slice(0, Number(length)));
+        if (length && body.byteLength >= Number(length)) {
+          return await parseRawResponseBytes(
+            head,
+            body.slice(0, Number(length)),
+          );
         }
       }
     }
-    const response = new TextDecoder().decode(concatBytes(chunks));
-    const [head, body = ""] = response.split("\r\n\r\n");
-    return parseRawResponse(head, body);
+    const response = concatBytes(chunks);
+    const split = findHeaderEnd(response);
+    if (split < 0) {
+      return parseRawResponse(new TextDecoder().decode(response), "");
+    }
+    return await parseRawResponseBytes(
+      new TextDecoder().decode(response.slice(0, split)),
+      response.slice(split + 4),
+    );
   } finally {
     conn.close();
   }
@@ -523,6 +532,42 @@ function parseRawResponse(
     headerLines,
     body,
   };
+}
+
+async function parseRawResponseBytes(
+  head: string,
+  bodyBytes: Uint8Array,
+): Promise<{
+  status: number;
+  headers: Record<string, string>;
+  headerLines: string[];
+  body: string;
+}> {
+  const response = parseRawResponse(head, "");
+  if (response.headers["content-encoding"]?.toLowerCase() === "gzip") {
+    const compressed = new ArrayBuffer(bodyBytes.byteLength);
+    new Uint8Array(compressed).set(bodyBytes);
+    const stream = new Blob([compressed]).stream().pipeThrough(
+      new DecompressionStream("gzip"),
+    );
+    bodyBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  response.body = new TextDecoder().decode(bodyBytes);
+  return response;
+}
+
+function findHeaderEnd(bytes: Uint8Array): number {
+  for (let i = 0; i + 3 < bytes.length; i++) {
+    if (
+      bytes[i] === 13 &&
+      bytes[i + 1] === 10 &&
+      bytes[i + 2] === 13 &&
+      bytes[i + 3] === 10
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {
@@ -6699,6 +6744,7 @@ Deno.test({
                     },
                   }, {
                     handler: "reverse_proxy",
+                    transport: { protocol: "http", compression: false },
                     upstreams: [{ dial: backend.dial }],
                   }],
                 }],
@@ -10269,7 +10315,11 @@ Deno.test({
     uri /auth
     copy_headers Remote-User
   }
-  reverse_proxy ${backends.appDial}
+  reverse_proxy ${backends.appDial} {
+    transport http {
+      compression off
+    }
+  }
 }`;
       const caddyConfigPath = join(siteDir, "Caddyfile");
       await Deno.writeTextFile(caddyConfigPath, caddyfile);
@@ -10489,6 +10539,7 @@ Deno.test({
           "/submit",
           "payload",
           {
+            "accept-encoding": "identity",
             "content-type": "text/plain",
             "remote-user": "mallory",
           },
