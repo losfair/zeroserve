@@ -96,6 +96,8 @@ jobs:
 
       - name: End-to-end tests
         working-directory: testing
+        env:
+          ZS_PROXY_TRACE: "1"
         run: |
           set +e
 
@@ -147,8 +149,10 @@ jobs:
           fi
           wait "$dpid"; rc=$?
           echo "=== deno test exit rc=$rc ==="
-          echo "----- last 60 lines of e2e output -----"
-          tail -60 /tmp/e2e.log
+          echo "----- placeholder-regex / forward_proxy_body ptrace lines -----"
+          grep -nE 'placeholder-regex|forward_proxy_body|REUSED pooled|FRESH backend|response status=' /tmp/e2e.log | tail -60 || true
+          echo "----- last 80 lines of e2e output -----"
+          tail -80 /tmp/e2e.log
           if [ "$captured" -eq 1 ]; then exit 1; fi
           exit $rc
 

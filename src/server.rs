@@ -54,6 +54,13 @@ type HttpBody = h1::Body;
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const PROXY_WRITE_BATCH_SIZE: usize = 64 * 1024;
 
+// ci-debug: env-gated proxy tracing to pinpoint the rewrite-test hang.
+fn proxy_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var_os("ZS_PROXY_TRACE").is_some())
+}
+
 mod caddy;
 
 use caddy::ResponseHookState;
@@ -3898,9 +3905,25 @@ async fn reverse_proxy_request(
         matches!(target.scheme, BackendScheme::Https),
     );
     let mut conn = match pool::take_connection(&pool_key) {
-        Some(conn) => conn,
+        Some(conn) => {
+            if proxy_trace_enabled() {
+                eprintln!(
+                    "[ptrace] {} {} -> {}:{} REUSED pooled backend conn",
+                    head.method, head.uri, target.host, target.port
+                );
+            }
+            conn
+        }
         None => match connect_backend(&target).await {
-            Ok(conn) => conn,
+            Ok(conn) => {
+                if proxy_trace_enabled() {
+                    eprintln!(
+                        "[ptrace] {} {} -> {}:{} FRESH backend conn",
+                        head.method, head.uri, target.host, target.port
+                    );
+                }
+                conn
+            }
             Err(err) => {
                 drain_payload(reader, &mut body).await;
                 return Err(err);
@@ -4221,6 +4244,20 @@ where
     } else {
         None
     };
+    if proxy_trace_enabled() {
+        eprintln!(
+            "[ptrace] response status={} ver={:?} hint={:?} cl={:?} te={:?} headers={:?}",
+            status,
+            resp_head.version,
+            body_hint,
+            headers.get(::http::header::CONTENT_LENGTH),
+            headers.get(::http::header::TRANSFER_ENCODING),
+            headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.to_str().unwrap_or("<bin>")))
+                .collect::<Vec<_>>(),
+        );
+    }
     if resp_body.is_eof() {
         can_reuse = false;
     }
@@ -4919,11 +4956,15 @@ async fn forward_proxy_body<IO>(
 where
     IO: AsyncReadRent,
 {
+    let trace = proxy_trace_enabled();
     let rechunk = match body.hint() {
         StreamHint::None => return Ok(()),
         StreamHint::Fixed => false,
         StreamHint::Stream => true,
     };
+    if trace {
+        eprintln!("[ptrace] forward_proxy_body start hint={:?}", body.hint());
+    }
     let mut batch: Vec<u8> = Vec::with_capacity(PROXY_WRITE_BATCH_SIZE);
     loop {
         let room = PROXY_WRITE_BATCH_SIZE.saturating_sub(batch.len());
@@ -4940,13 +4981,22 @@ where
                     write_proxy_body_batch(w, &mut batch, rechunk).await?;
                     continue;
                 }
+                if trace {
+                    eprintln!("[ptrace] forward_proxy_body NeedRead -> fill (BLOCKING on backend read)");
+                }
                 body.fill(conn, PROXY_WRITE_BATCH_SIZE)
                     .await
                     .map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+                if trace {
+                    eprintln!("[ptrace] forward_proxy_body fill returned");
+                }
             }
             Ok(h1::TryBodyData::Done) => break,
             Err(err) => return Err(anyhow!("proxy body read failed: {err}")),
         }
+    }
+    if trace {
+        eprintln!("[ptrace] forward_proxy_body done");
     }
     if rechunk {
         batch.extend_from_slice(b"0\r\n\r\n");
