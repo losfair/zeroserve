@@ -59,3 +59,4 @@ zstd = "0.13.3"
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }
+async-ebpf = { path = "vendor/async-ebpf" }

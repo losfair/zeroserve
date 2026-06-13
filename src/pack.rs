@@ -1,12 +1,17 @@
 use std::{
     ffi::OsStr,
     fs, io,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use tar::Builder;
+use ulid::Ulid;
 
+use crate::tinycc;
+
+pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
+pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
 pub const USER_MANUAL: &str = include_str!("../docs/user_manual.md");
 
 pub fn pack_site(root: &Path) -> Result<()> {
@@ -16,20 +21,27 @@ pub fn pack_site(root: &Path) -> Result<()> {
         bail!("--pack expects a directory, got {}", root.display());
     }
 
-    let work_dir = crate::script_compile::WorkDir::new("zeroserve-pack")?;
+    let temp_dir = create_temp_dir()?;
+    let header_dir = extract_header(&temp_dir)?;
     let stdout = io::stdout();
     let mut builder = Builder::new(stdout.lock());
 
-    pack_dir(&mut builder, root, root, &work_dir)?;
-    builder.finish().context("failed to finalize tar stream")?;
-    Ok(())
+    let result = (|| {
+        pack_dir(&mut builder, root, root, &temp_dir, &header_dir)?;
+        builder.finish().context("failed to finalize tar stream")?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
 }
 
 fn pack_dir(
     builder: &mut Builder<impl io::Write>,
     root: &Path,
     dir: &Path,
-    work_dir: &crate::script_compile::WorkDir,
+    temp_dir: &Path,
+    header_dir: &Path,
 ) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
@@ -44,7 +56,7 @@ fn pack_dir(
             builder
                 .append_dir(rel, &path)
                 .with_context(|| format!("failed to append directory {}", rel.display()))?;
-            pack_dir(builder, root, &path, work_dir)?;
+            pack_dir(builder, root, &path, temp_dir, header_dir)?;
             continue;
         }
         if !file_type.is_file() {
@@ -52,12 +64,13 @@ fn pack_dir(
         }
 
         if is_script_c(rel) {
-            let compiled = crate::script_compile::compile_c_path_to_temp_object(&path, work_dir)?;
+            let compiled = compile_script(&path, temp_dir, header_dir)?;
             let mut tar_path = rel.to_path_buf();
             tar_path.set_extension("o");
             builder
                 .append_path_with_name(&compiled.obj_path, &tar_path)
                 .with_context(|| format!("failed to append {}", tar_path.display()))?;
+            compiled.cleanup();
             continue;
         }
 
@@ -102,4 +115,44 @@ fn has_extension(path: &Path, ext: &str) -> bool {
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case(ext))
         .unwrap_or(false)
+}
+
+fn create_temp_dir() -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("zeroserve-pack-{}", Ulid::new()));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create temp dir {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn extract_header(temp_dir: &Path) -> Result<PathBuf> {
+    let header_path = temp_dir.join("zeroserve.h");
+    fs::write(&header_path, ZEROSERVE_H)
+        .with_context(|| format!("failed to write {}", header_path.display()))?;
+    let caddy_header_path = temp_dir.join("zeroserve_caddy.h");
+    fs::write(&caddy_header_path, ZEROSERVE_CADDY_H)
+        .with_context(|| format!("failed to write {}", caddy_header_path.display()))?;
+    Ok(temp_dir.to_path_buf())
+}
+
+struct CompiledScript {
+    obj_path: PathBuf,
+}
+
+impl CompiledScript {
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.obj_path);
+    }
+}
+
+fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<CompiledScript> {
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let unique = Ulid::new();
+    let obj_path = temp_dir.join(format!("{}-{}.o", stem, unique));
+
+    tinycc::compile_file_to_object(source, header_dir, &obj_path)?;
+
+    Ok(CompiledScript { obj_path })
 }

@@ -146,6 +146,8 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
     ),
     ("zs_hex_encode", helpers::h_hex_encode),
     ("zs_hex_decode_in_place", helpers::h_hex_decode_in_place),
+    ("memcpy", helpers::h_memcpy),
+    ("memset", helpers::h_memset),
     ("zs_memcpy", helpers::h_memcpy),
     ("zs_memcmp", helpers::h_memcmp),
     ("zs_memset", helpers::h_memset),

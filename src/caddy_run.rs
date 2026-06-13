@@ -2,18 +2,20 @@
 //! in-memory site tarball ready to be served, running the whole
 //! Caddyfile -> Caddy JSON -> middleware C -> eBPF object -> tarball pipeline.
 //!
-//! The generated middleware C and the resulting tarball never touch disk: the C
-//! source and the compiler's `.bc`/`.o` artifacts live in anonymous `memfd`
-//! files, and the tarball is assembled in memory. Only the static SDK headers
-//! (needed for clang's include path) are materialized in a temporary directory,
-//! which is removed before returning.
+//! The generated middleware C is compiled from memory and the tarball is
+//! assembled in memory. Only the static SDK headers and compiler output scratch
+//! file are materialized in a temporary directory, which is removed before
+//! returning.
 
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use ulid::Ulid;
 
 use crate::config::StaticConfig;
+use crate::pack::{ZEROSERVE_CADDY_H, ZEROSERVE_H};
 use crate::site::Site;
+use crate::tinycc;
 
 /// The name the generated middleware object is given inside the tarball. The
 /// runtime loads every `.zeroserve/scripts/*.o` entry as an eBPF program.
@@ -49,10 +51,46 @@ pub fn build_caddy_tarball(config_path: &Path) -> Result<Vec<u8>> {
         eprintln!("warning: {warning}");
     }
 
-    let object = crate::script_compile::compile_c_source_to_object_bytes("caddy.c", &generated)
+    let object = compile_middleware_to_object(&generated)
         .context("failed to compile generated middleware to an eBPF object")?;
 
     build_tarball(&object).context("failed to assemble in-memory site tarball")
+}
+
+/// Compile the generated middleware C into an eBPF object, entirely in memory.
+/// The static SDK headers and output object are written to a temporary
+/// directory for tinycc, then immediately read back and removed.
+fn compile_middleware_to_object(c_source: &str) -> Result<Vec<u8>> {
+    let header_dir = write_sdk_headers()?;
+    let object_path = header_dir.join("caddy.o");
+    let result =
+        (|| tinycc::compile_source_to_object(c_source, "caddy.c", &header_dir, &object_path))();
+    result?;
+
+    let object = fs::read(&object_path).with_context(|| {
+        format!(
+            "failed to read compiled object from {}",
+            object_path.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(&header_dir);
+    if object.is_empty() {
+        bail!("compiled middleware object is empty");
+    }
+    Ok(object)
+}
+
+/// Materialize the SDK headers into a fresh temporary directory and return it,
+/// for use as tinycc's include path. The caller removes it.
+fn write_sdk_headers() -> Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("zeroserve-caddy-{}", Ulid::new()));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create temp header dir {}", dir.display()))?;
+    fs::write(dir.join("zeroserve.h"), ZEROSERVE_H)
+        .with_context(|| format!("failed to write headers into {}", dir.display()))?;
+    fs::write(dir.join("zeroserve_caddy.h"), ZEROSERVE_CADDY_H)
+        .with_context(|| format!("failed to write headers into {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Assemble a tar archive containing the single compiled middleware object.
@@ -92,9 +130,9 @@ pub fn load_site(config: &StaticConfig) -> Result<Site> {
 /// source Caddyfile path, so the config is re-adapted and recompiled from disk
 /// — reusing the startup tarball would silently ignore Caddyfile edits. This
 /// still works under namespace isolation: the mount namespace keeps the host
-/// filesystem visible (only /etc is shadowed), /tmp stays writable for the SDK
-/// headers, and the nproc limit leaves room for the clang/llc children. On any
-/// failure the caller keeps serving the previous configuration.
+/// filesystem visible (only /etc is shadowed), and /tmp stays writable for the
+/// SDK headers and output object. On any failure the caller keeps serving the
+/// previous configuration.
 pub fn reload_site(config: &StaticConfig) -> Result<Site> {
     if config.caddy_tarball.is_some() {
         let bytes = build_caddy_tarball(&config.tar_path).with_context(|| {

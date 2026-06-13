@@ -23,6 +23,7 @@ mod server;
 mod shared;
 mod site;
 mod thread_pool;
+mod tinycc;
 mod tls;
 
 use std::io::Write;
@@ -146,9 +147,9 @@ fn main() -> Result<()> {
         pack::pack_site(pack_root)?;
         return Ok(());
     }
-    // The `--caddy` flow builds the entire site in memory up front, while clang
-    // and a writable filesystem are still available (before namespace isolation).
-    // The generated middleware C and the tarball stay in memfds.
+    // The `--caddy` flow builds the entire site up front, while a writable
+    // filesystem is still available for the compiler output scratch file
+    // (before namespace isolation).
     let caddy_tarball = match args.caddy.as_ref() {
         Some(path) => {
             eprintln!(

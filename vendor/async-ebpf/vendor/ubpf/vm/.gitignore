@@ -1,0 +1,6 @@
+libubpf.a
+test
+*.o
+*.gcov
+*.gcda
+*.gcno

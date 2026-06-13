@@ -209,7 +209,7 @@ export async function withZeroserveTls(
 }
 
 export async function hasBpfToolchain(): Promise<boolean> {
-  return await hasCommand("clang") && await hasCommand("llc");
+  return true;
 }
 
 export async function waitForServer(

@@ -54,4 +54,4 @@ cd testing
 deno test -A --parallel
 ```
 
-The scripting tests require `clang` and `llc` to be available on PATH; they are skipped if the toolchain is missing.
+The scripting tests use the tinycc library linked into the zeroserve binary.

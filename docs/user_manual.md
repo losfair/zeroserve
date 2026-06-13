@@ -42,7 +42,7 @@ Packaging notes:
 - Any `.c` file in `.zeroserve/scripts/` is compiled to an `.o` eBPF object.
   The resulting `.o` is included in the tarball and the `.c` is omitted.
 - If a `.c` and `.o` share the same name, the `.o` is skipped in favor of recompiling.
-- Script compilation requires `clang` and `llc` on your `PATH`.
+- Script compilation uses the tinycc library linked into the zeroserve binary.
 
 If you want the SDK header without packing:
 
@@ -70,8 +70,8 @@ zeroserve --pack ./public > site.tar
 ```
 
 To skip the manual pack-and-run steps, `--caddy` performs the whole pipeline
-(adapt → compile → in-memory site tarball → serve) in one shot, keeping the
-generated middleware C and the tarball entirely in memory (memfd):
+(adapt → compile → in-memory site tarball → serve) in one shot, compiling the
+generated middleware from memory and keeping the tarball in memory (memfd):
 
 ```bash
 zeroserve --caddy Caddyfile --addr 0.0.0.0:8080
@@ -506,11 +506,10 @@ Option A: let `--pack` compile `.c` sources automatically.
 zeroserve --pack ./site > site.tar
 ```
 
-Option B: compile manually.
+Option B: compile manually with tinycc.
 
 ```bash
-clang -O2 -target bpf -emit-llvm -c input.c -o tmp.bc
-llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj tmp.bc -o out.o
+bpf-tcc -Wall -mcpu=v3 -fno-builtin -I path/to/zeroserve-sdk -c input.c -o out.o
 ```
 
 Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
@@ -1163,4 +1162,8 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 - `--pack expects a directory`: pass a directory path, not a file.
 - `tarball ... does not contain any regular files`: ensure your tarball has
   files, or pass a standalone `.c`/`.o` script.
-- Script compilation fails: verify `clang` and `llc` are on `PATH`.
+- Script compilation fails with `--ebpf-compiler tcc`: rebuild zeroserve
+  against a tinycc tree with BPF support; set `ZEROSERVE_TINYCC_DIR` if tinycc
+  is not at `/mnt/jfs/tinycc`.
+- Script compilation fails with `--ebpf-compiler clang`: ensure `clang` and
+  `llc` are installed and on `PATH`.

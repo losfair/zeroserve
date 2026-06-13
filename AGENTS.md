@@ -52,7 +52,9 @@
 - Run `cd testing && deno test -A --parallel` for user-visible runtime, packaging, Caddy, TLS, proxy, OIDC, rate-limit, body, hostname, and scripting behavior.
 - Narrow test runs are useful while iterating, for example `cd testing && deno test -A caddyfile_test.ts`.
 - Add or update Caddyfile fixtures under `testing/caddyfile_fixtures/` when changing adapter behavior.
-- Scripting tests should tolerate absent `clang`/`llc` only where the existing helpers intentionally skip; do not silently skip non-scripting regressions.
+- Scripting e2e tests use the tinycc library linked into the zeroserve binary
+  by default. Clang/llc coverage should still be exercised when the compiler
+  selection path changes.
 
 ## Security & Runtime Configuration Tips
 
