@@ -1168,8 +1168,8 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 - `--pack expects a directory`: pass a directory path, not a file.
 - `tarball ... does not contain any regular files`: ensure your tarball has
   files, or pass a standalone `.c`/`.o` script.
-- Script compilation fails with `--ebpf-compiler tcc`: rebuild zeroserve
-  against a tinycc tree with BPF support; set `ZEROSERVE_TINYCC_DIR` if tinycc
-  is not at `/mnt/jfs/tinycc`.
+- Script compilation fails with `--ebpf-compiler tcc`: rebuild zeroserve against
+  a tinycc tree with BPF support. By default the build downloads a pinned tinycc
+  archive; set `ZEROSERVE_TINYCC_DIR` to use a local tinycc tree instead.
 - Script compilation fails with `--ebpf-compiler clang`: ensure `clang` and
   `llc` are installed and on `PATH`.
