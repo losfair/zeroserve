@@ -328,6 +328,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("zs_memset(route_groups, 0, sizeof(route_groups));");
     }
     generator.line(HOST_HOIST_MARKER);
+    let mut pending_cleanup_needed = false;
     for compiled in &routes {
         generator.client_ip_config = compiled.client_ip_config.clone();
         generator.named_routes = compiled.named_routes.clone();
@@ -354,7 +355,8 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
             generator.line("}");
             continue;
         }
-        if route_match_can_set_error(&compiled.route) {
+        let match_can_set_error = route_match_can_set_error(&compiled.route);
+        if match_can_set_error {
             let match_id = generator.next_id();
             generator.line(&format!("int route_match_{match_id} = ({matched});"));
             generator.emit_pending_matcher_error()?;
@@ -380,11 +382,17 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
 
         generator.indent -= 1;
         generator.line("}");
-        generator.line("else if (zs_response_pending() != 0) {");
-        generator.indent += 1;
-        generator.line("zs_response_clear();");
-        generator.indent -= 1;
-        generator.line("}");
+        let clear_unmatched_response = match_can_set_error || pending_cleanup_needed;
+        if clear_unmatched_response {
+            generator.line("else if (zs_response_pending() != 0) {");
+            generator.indent += 1;
+            generator.line("zs_response_clear();");
+            generator.indent -= 1;
+            generator.line("}");
+        }
+        if !compiled.route.terminal && !stopped {
+            pending_cleanup_needed = true;
+        }
         generator.indent -= 1;
         generator.line("}");
     }
@@ -1673,7 +1681,8 @@ impl Generator {
             self.line("}");
             return Ok(());
         }
-        if route_match_can_set_error(route) {
+        let match_can_set_error = route_match_can_set_error(route);
+        if match_can_set_error {
             let match_id = self.next_id();
             self.line(&format!("int subroute_match_{match_id} = ({matched});"));
             self.emit_pending_matcher_error()?;
@@ -1831,7 +1840,8 @@ impl Generator {
         if match_is_statically_false(&matched) {
             return Ok(false);
         }
-        if route_match_can_set_error(&route) {
+        let match_can_set_error = route_match_can_set_error(&route);
+        if match_can_set_error {
             let match_id = self.next_id();
             self.line(&format!("int invoke_match_{match_id} = ({matched});"));
             self.emit_pending_matcher_error()?;

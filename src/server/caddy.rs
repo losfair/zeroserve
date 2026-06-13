@@ -20,8 +20,8 @@ use crate::{
     },
     http::h1::RequestHead,
     script::{
-        CaddyFileServer, ConnectionInfo, RawResponseHookOutcome, ResponseHook, ResponseHookOutcome,
-        ScriptOutcome, ScriptRequest, ScriptRuntime,
+        CaddyFileServer, ConnectionInfo, RawResponseHookOutcome, RequestId, ResponseHook,
+        ResponseHookOutcome, ScriptOutcome, ScriptRequest, ScriptRuntime,
     },
     shared::{SharedState, read_fs_file},
     site::{NormalizedPath, Site},
@@ -214,7 +214,7 @@ pub(super) fn has_error_routes(outcome: &ScriptOutcome) -> bool {
 }
 
 pub(super) async fn continue_h1_request<R: AsyncReadRent + 'static>(
-    request_id: Ulid,
+    request_id: RequestId,
     script_runtime: &Rc<ScriptRuntime>,
     shared: &Arc<SharedState>,
     hook_state: &ResponseHookState<'_>,
@@ -256,7 +256,7 @@ pub(super) async fn continue_h1_request<R: AsyncReadRent + 'static>(
 }
 
 pub(super) async fn continue_h2_request(
-    request_id: Ulid,
+    request_id: RequestId,
     script_runtime: &Rc<ScriptRuntime>,
     shared: &Arc<SharedState>,
     hook_state: &ResponseHookState<'_>,
@@ -296,7 +296,7 @@ pub(super) async fn continue_h2_request(
 }
 
 async fn continue_request_with_body_source(
-    request_id: Ulid,
+    request_id: RequestId,
     script_runtime: &Rc<ScriptRuntime>,
     shared: &Arc<SharedState>,
     hook_state: &ResponseHookState<'_>,

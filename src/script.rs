@@ -2,6 +2,7 @@ use std::{
     any::{Any, TypeId},
     cell::{Cell, RefCell},
     collections::HashMap,
+    fmt,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -50,6 +51,38 @@ const MAX_EXTERNAL_OBJECTS: usize = 32;
 pub(crate) const MAX_CALL_DEPTH: usize = 8;
 
 type BodyReaderFuture = Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, BodyReadError>>>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct RequestId(Rc<RefCell<Option<Ulid>>>);
+
+impl RequestId {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn get(&self) -> Ulid {
+        let mut id = self.0.borrow_mut();
+        *id.get_or_insert_with(Ulid::new)
+    }
+}
+
+impl From<Ulid> for RequestId {
+    fn from(value: Ulid) -> Self {
+        Self(Rc::new(RefCell::new(Some(value))))
+    }
+}
+
+impl fmt::Debug for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
 
 pub enum BodyReadError {
     TooLarge,
@@ -394,7 +427,7 @@ pub struct ConnectionInfo {
 
 #[derive(Clone, Debug)]
 pub struct ScriptRequest {
-    pub request_id: Ulid,
+    pub request_id: RequestId,
     pub start_time: Instant,
     pub method: String,
     pub original_method: String,
@@ -482,7 +515,7 @@ impl ScriptRequest {
         sni: Option<String>,
     ) -> Self {
         ScriptRequest {
-            request_id: Ulid::new(),
+            request_id: RequestId::new(),
             start_time: Instant::now(),
             method: String::new(),
             original_method: String::new(),
@@ -2108,7 +2141,7 @@ mod tests {
             values.iter().map(|value| value.to_string()).collect(),
         );
         ScriptRequest {
-            request_id: Ulid::new(),
+            request_id: RequestId::new(),
             start_time: Instant::now(),
             method: "GET".to_string(),
             original_method: "GET".to_string(),

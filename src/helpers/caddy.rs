@@ -217,10 +217,21 @@ pub fn h_caddy_path_regexp_subject(
 ) -> Result<u64, ()> {
     with_ectx(scope, |ctx| {
         let request = ctx.request.borrow();
+        if !caddy_path_needs_decode_or_clean(&request.path) {
+            return deref_and_write_cstr(scope, out_ptr, out_len, &request.path);
+        }
         let decoded = caddy_percent_decode_path(&request.path).ok_or(())?;
         let cleaned = clean_path_caddy(&decoded, true);
         deref_and_write_cstr(scope, out_ptr, out_len, &cleaned)
     })
+}
+
+fn caddy_path_needs_decode_or_clean(path: &str) -> bool {
+    path.as_bytes().contains(&b'%')
+        || path.contains("//")
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
 }
 
 pub fn h_req_rewrite_uri(
@@ -1541,10 +1552,11 @@ pub fn h_caddy_header_match(
     let value_template = read_utf8(scope, value_ptr, value_len)?;
     with_ectx(scope, |ctx| {
         let allowed = expand_caddy_placeholders(ctx, value_template)?;
-        let values = caddy_request_header_values(ctx, &name);
-        Ok(values
-            .iter()
-            .any(|actual| caddy_header_value_match(actual, &allowed)) as u64)
+        with_caddy_request_header_values(ctx, &name, |values| {
+            Ok(values
+                .iter()
+                .any(|actual| caddy_header_value_match(actual, &allowed)) as u64)
+        })
     })
 }
 
@@ -1561,10 +1573,11 @@ pub fn h_caddy_header_match_expanded(
     with_ectx(scope, |ctx| {
         let name = expand_caddy_placeholders(ctx, name_template)?;
         let allowed = expand_caddy_placeholders(ctx, value_template)?;
-        let values = caddy_request_header_values(ctx, &name);
-        Ok(values
-            .iter()
-            .any(|actual| caddy_header_value_match(actual, &allowed)) as u64)
+        with_caddy_request_header_values(ctx, &name, |values| {
+            Ok(values
+                .iter()
+                .any(|actual| caddy_header_value_match(actual, &allowed)) as u64)
+        })
     })
 }
 
@@ -1578,7 +1591,7 @@ pub fn h_caddy_header_present(
 ) -> Result<u64, ()> {
     let name = read_utf8(scope, name_ptr, name_len)?;
     with_ectx(scope, |ctx| {
-        Ok(!caddy_request_header_values(ctx, &name).is_empty() as u64)
+        with_caddy_request_header_values(ctx, &name, |values| Ok(!values.is_empty() as u64))
     })
 }
 
@@ -1593,7 +1606,7 @@ pub fn h_caddy_header_present_expanded(
     let name_template = read_utf8(scope, name_ptr, name_len)?;
     with_ectx(scope, |ctx| {
         let name = expand_caddy_placeholders(ctx, name_template)?;
-        Ok(!caddy_request_header_values(ctx, &name).is_empty() as u64)
+        with_caddy_request_header_values(ctx, &name, |values| Ok(!values.is_empty() as u64))
     })
 }
 
@@ -1640,6 +1653,52 @@ pub fn h_caddy_header_regexp_match_expanded(
     })
 }
 
+fn with_caddy_request_header_values<T>(
+    ctx: &crate::script::ScriptExecutionContext,
+    name: &str,
+    f: impl FnOnce(&[String]) -> T,
+) -> T {
+    let name = name.to_ascii_lowercase();
+    let request = ctx.request.borrow();
+    if name == "host" {
+        return match request.headers.get("host") {
+            Some(value) => f(std::slice::from_ref(value)),
+            None => f(&[]),
+        };
+    }
+    if name == "transfer-encoding"
+        && !request.header_values.contains_key("transfer-encoding")
+        && !request.transfer_encodings.is_empty()
+    {
+        return f(&request.transfer_encodings);
+    }
+    match request.header_values.get(&name) {
+        Some(values) => f(values),
+        None => f(&[]),
+    }
+}
+
+fn caddy_request_header_values(
+    ctx: &crate::script::ScriptExecutionContext,
+    name: &str,
+) -> Vec<String> {
+    with_caddy_request_header_values(ctx, name, <[String]>::to_vec)
+}
+
+fn caddy_header_value_match(actual: &str, allowed: &str) -> bool {
+    if allowed == "*" {
+        true
+    } else if allowed.starts_with('*') && allowed.ends_with('*') && allowed.len() >= 2 {
+        actual.contains(&allowed[1..allowed.len() - 1])
+    } else if let Some(suffix) = allowed.strip_prefix('*') {
+        actual.ends_with(suffix)
+    } else if let Some(prefix) = allowed.strip_suffix('*') {
+        actual.starts_with(prefix)
+    } else {
+        actual == allowed
+    }
+}
+
 pub fn h_caddy_req_header_first_prefix(
     scope: &HelperScope,
     name_ptr: u64,
@@ -1662,47 +1721,6 @@ pub fn h_caddy_req_header_first_prefix(
         };
         Ok(first.starts_with(prefix) as u64)
     })
-}
-
-fn caddy_request_header_values(
-    ctx: &crate::script::ScriptExecutionContext,
-    name: &str,
-) -> Vec<String> {
-    let name = name.to_ascii_lowercase();
-    let request = ctx.request.borrow();
-    if name == "host" {
-        return request
-            .headers
-            .get("host")
-            .cloned()
-            .map(|value| vec![value])
-            .unwrap_or_default();
-    }
-    if name == "transfer-encoding"
-        && !request.header_values.contains_key("transfer-encoding")
-        && !request.transfer_encodings.is_empty()
-    {
-        return request.transfer_encodings.clone();
-    }
-    request
-        .header_values
-        .get(&name)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn caddy_header_value_match(actual: &str, allowed: &str) -> bool {
-    if allowed == "*" {
-        true
-    } else if allowed.starts_with('*') && allowed.ends_with('*') && allowed.len() >= 2 {
-        actual.contains(&allowed[1..allowed.len() - 1])
-    } else if let Some(suffix) = allowed.strip_prefix('*') {
-        actual.ends_with(suffix)
-    } else if let Some(prefix) = allowed.strip_suffix('*') {
-        actual.starts_with(prefix)
-    } else {
-        actual == allowed
-    }
 }
 
 fn caddy_match_path(encoded_path: &str, pattern: &str) -> Result<bool, ()> {
@@ -4987,7 +5005,7 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("host".to_string(), "api.Example.test:8080".to_string());
         crate::script::ScriptRequest {
-            request_id: ulid::Ulid::new(),
+            request_id: crate::script::RequestId::new(),
             start_time: std::time::Instant::now(),
             method: "GET".to_string(),
             original_method: "GET".to_string(),

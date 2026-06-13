@@ -30,7 +30,6 @@ use monoio::{
     net::{TcpListener, TcpStream, UnixStream},
 };
 use monoio_compat::StreamWrapper;
-use ulid::Ulid;
 use url::Url;
 
 use crate::{
@@ -41,8 +40,8 @@ use crate::{
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{
-        BodyReadError, BodySource, ConnectionInfo, HeaderChange, ScriptOutcome, ScriptRequest,
-        ScriptResponse, ScriptRuntime, header_pattern_matches,
+        BodyReadError, BodySource, ConnectionInfo, HeaderChange, RequestId, ScriptOutcome,
+        ScriptRequest, ScriptResponse, ScriptRuntime, header_pattern_matches,
     },
     shared::{SharedState, read_tar_entry, stream_fs_file, stream_tar_entry},
     site::{NormalizedPath, guess_mime, normalize_request_path},
@@ -712,11 +711,11 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     interrupt: &mut (impl Future<Output = ()> + Unpin),
     connection: &ConnectionInfo,
 ) -> (bool, h1::H1Connection<R>) {
-    let request_id = Ulid::new();
+    let request_id = RequestId::new();
     let (mut head, body) = req.into_parts();
     head.tls = matches!(scheme, Scheme::Https);
     if !shared.config.disable_request_logging {
-        log_request(request_id, peer, scheme, &head.method, &head.uri).await;
+        log_request(&request_id, peer, scheme, &head.method, &head.uri).await;
     }
     let head_only = head.method == Method::HEAD;
     let transfer_encodings = if body.is_chunked() {
@@ -760,7 +759,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     };
 
     let script_request = build_script_request(
-        request_id,
+        request_id.clone(),
         &head,
         peer,
         local,
@@ -856,7 +855,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
             Ok(proxy_outcome) => {
                 if proxy_outcome.continue_request {
                     let (continued, mut reader, mut body) = caddy::continue_h1_request(
-                        request_id,
+                        request_id.clone(),
                         script_runtime,
                         shared,
                         &hook_state,
@@ -1120,7 +1119,7 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                 }
                 caddy::set_proxy_error_metadata(&script_outcome, &err.to_string());
                 let (continued, mut reader, mut body) = caddy::continue_h1_request(
-                    request_id,
+                    request_id.clone(),
                     script_runtime,
                     shared,
                     &hook_state,
@@ -1472,7 +1471,7 @@ async fn handle_h2_request<H>(
 where
     H: Future<Output = ()> + Unpin + 'static,
 {
-    let request_id = Ulid::new();
+    let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
     let mut headers = parts.headers;
     h1::normalize_cookie_headers(&mut headers);
@@ -1503,7 +1502,7 @@ where
     }
 
     if !shared.config.disable_request_logging {
-        log_request(request_id, peer, scheme, &head.method, &head.uri).await;
+        log_request(&request_id, peer, scheme, &head.method, &head.uri).await;
     }
 
     // Validate hostname if configured
@@ -1546,7 +1545,7 @@ where
     };
 
     let script_request = build_script_request(
-        request_id,
+        request_id.clone(),
         &head,
         peer,
         local,
@@ -1645,7 +1644,7 @@ where
                 Ok(proxy_outcome) => {
                     if proxy_outcome.continue_request {
                         let (continued, body) = caddy::continue_h2_request(
-                            request_id,
+                            request_id.clone(),
                             &script_runtime,
                             &shared,
                             &hook_state,
@@ -2089,9 +2088,16 @@ async fn send_fixed(
     }
     let (parts, body) = res.into_parts();
     let continue_conn = !connection_has_close(&parts.headers);
-    let _ = write_response_head(w, parts.status, &parts.headers).await;
     if send_body && !body.is_empty() {
-        let _ = w.write_all(body.to_vec()).await;
+        let _ = write_response_head_and_body_raw(
+            w,
+            parts.status.as_u16(),
+            &parts.headers,
+            body.to_vec(),
+        )
+        .await;
+    } else {
+        let _ = write_response_head(w, parts.status, &parts.headers).await;
     }
     let _ = w.flush().await;
     H1SendOutcome {
@@ -2486,8 +2492,8 @@ async fn send_prepared_static_response_h1(
     }
 
     let continue_conn = !connection_has_close(&response.headers);
-    let _ = write_response_head_raw(w, status, &response.headers).await;
     if response.head_only || !send_body {
+        let _ = write_response_head_raw(w, status, &response.headers).await;
         let _ = w.flush().await;
         return H1SendOutcome {
             keep_client: continue_conn,
@@ -2497,15 +2503,19 @@ async fn send_prepared_static_response_h1(
 
     match response.body {
         StaticBody::Empty => {
+            let _ = write_response_head_raw(w, status, &response.headers).await;
             let _ = w.flush().await;
         }
         StaticBody::Bytes(body) => {
             if !body.is_empty() {
-                let _ = w.write_all(body).await;
+                let _ = write_response_head_and_body_raw(w, status, &response.headers, body).await;
+            } else {
+                let _ = write_response_head_raw(w, status, &response.headers).await;
             }
             let _ = w.flush().await;
         }
         StaticBody::File { entry, range } => {
+            let _ = write_response_head_raw(w, status, &response.headers).await;
             let stream_result = if let Some(range) = range {
                 crate::shared::stream_tar_entry_range(
                     entry.clone(),
@@ -2536,6 +2546,7 @@ async fn send_prepared_static_response_h1(
             };
         }
         StaticBody::FsFile { path, size, range } => {
+            let _ = write_response_head_raw(w, status, &response.headers).await;
             let stream_result = stream_fs_file(
                 &path,
                 range.map(|range| range.start).unwrap_or(0),
@@ -3551,7 +3562,7 @@ fn is_entity_tag_header_value(value: &str) -> bool {
 }
 
 fn build_script_request(
-    request_id: Ulid,
+    request_id: RequestId,
     head: &RequestHead,
     peer: std::net::SocketAddr,
     local: std::net::SocketAddr,
@@ -3780,9 +3791,10 @@ async fn send_script_response(
         }
     }
     let continue_conn = !response.force_close && !connection_has_close(&headers);
-    let _ = write_response_head_raw(w, status, &headers).await;
     if !head_only && send_body && !body.is_empty() {
-        let _ = w.write_all(body).await;
+        let _ = write_response_head_and_body_raw(w, status, &headers, body).await;
+    } else {
+        let _ = write_response_head_raw(w, status, &headers).await;
     }
     let _ = w.flush().await;
     H1SendOutcome {
@@ -4830,12 +4842,48 @@ async fn write_response_head_raw(
     status: u16,
     headers: &::http::HeaderMap,
 ) -> Result<()> {
+    let buf = encode_response_head_raw(status, headers);
+    let (res, _) = w.write_all(buf).await;
+    res.map_err(|err| anyhow!("failed to write proxy response head: {err}"))?;
+    Ok(())
+}
+
+async fn write_response_head_and_body_raw(
+    w: &mut impl AsyncWriteRent,
+    status: u16,
+    headers: &::http::HeaderMap,
+    body: Vec<u8>,
+) -> Result<()> {
+    const COALESCE_LIMIT: usize = 16 * 1024;
+    let mut buf = encode_response_head_raw(status, headers);
+    if buf.len() + body.len() <= COALESCE_LIMIT {
+        buf.extend_from_slice(&body);
+        let (res, _) = w.write_all(buf).await;
+        res.map_err(|err| anyhow!("failed to write proxy response: {err}"))?;
+    } else {
+        let (res, _) = w.write_all(buf).await;
+        res.map_err(|err| anyhow!("failed to write proxy response head: {err}"))?;
+        let (res, _) = w.write_all(body).await;
+        res.map_err(|err| anyhow!("failed to write proxy response body: {err}"))?;
+    }
+    Ok(())
+}
+
+fn encode_response_head_raw(status: u16, headers: &::http::HeaderMap) -> Vec<u8> {
     let reason = StatusCode::from_u16(status)
         .ok()
-        .and_then(|status| status.canonical_reason().map(str::to_string))
-        .unwrap_or_else(|| format!("status code {status}"));
+        .and_then(|status| status.canonical_reason());
     let mut buf = Vec::new();
-    buf.extend_from_slice(format!("HTTP/1.1 {status:03} {reason}\r\n").as_bytes());
+    match reason {
+        Some(reason) => {
+            buf.extend_from_slice(format!("HTTP/1.1 {status:03} {reason}\r\n").as_bytes());
+        }
+        None => {
+            buf.extend_from_slice(
+                format!("HTTP/1.1 {status:03} status code {status}\r\n").as_bytes(),
+            );
+        }
+    }
     for (name, value) in headers.iter() {
         buf.extend_from_slice(name.as_str().as_bytes());
         buf.extend_from_slice(b": ");
@@ -4843,9 +4891,7 @@ async fn write_response_head_raw(
         buf.extend_from_slice(b"\r\n");
     }
     buf.extend_from_slice(b"\r\n");
-    let (res, _) = w.write_all(buf).await;
-    res.map_err(|err| anyhow!("failed to write proxy response head: {err}"))?;
-    Ok(())
+    buf
 }
 
 async fn forward_request_body<IO, R>(
@@ -5442,7 +5488,7 @@ fn hostname_without_port(host: &str) -> &str {
 }
 
 async fn log_request(
-    request_id: Ulid,
+    request_id: &RequestId,
     peer: std::net::SocketAddr,
     scheme: Scheme,
     method: &Method,

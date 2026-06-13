@@ -476,13 +476,22 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<usize, HttpError> {
 impl<IO: AsyncReadRent> H1Connection<IO> {
     async fn read_more(&mut self) -> Result<usize, HttpError> {
         let io = self.io.as_mut().ok_or(HttpError::MissingIo)?;
-        let buf = vec![0u8; READ_BUF_SIZE];
+        let mut buf = self.scratch.take().unwrap_or_default();
+        buf.resize(READ_BUF_SIZE, 0);
         let (res, buf) = io.read(buf).await;
-        let n = res?;
-        if n > 0 {
-            self.buf.extend_from_slice(&buf[..n]);
+        match res {
+            Ok(n) => {
+                if n > 0 {
+                    self.buf.extend_from_slice(&buf[..n]);
+                }
+                self.scratch = Some(buf);
+                Ok(n)
+            }
+            Err(err) => {
+                self.scratch = Some(buf);
+                Err(err.into())
+            }
         }
-        Ok(n)
     }
 
     async fn read_headers(&mut self) -> Result<Option<Vec<u8>>, HttpError> {

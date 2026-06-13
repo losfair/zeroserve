@@ -615,6 +615,7 @@ where
         ssl: stream,
         io,
         scratch: vec![0u8; READ_CHUNK],
+        plaintext: vec![0u8; READ_CHUNK],
         shutdown_sent: false,
         outer_sni,
     }))
@@ -748,6 +749,7 @@ pub struct BoringStream<IO> {
     ssl: SslStream<MemBridge>,
     io: IO,
     scratch: Vec<u8>,
+    plaintext: Vec<u8>,
     shutdown_sent: bool,
     /// The cleartext outer SNI parsed from the wire ClientHello, set only when
     /// ECH was accepted (BoringSSL replaces `servername()` with the decrypted
@@ -866,8 +868,7 @@ impl<IO: AsyncWriteRent> BoringStream<IO> {
         }
         let out = std::mem::take(&mut self.ssl.get_mut().outbound);
         let (res, _) = self.io.write_all(out).await;
-        res?;
-        self.io.flush().await
+        res.map(|_| ())
     }
 }
 
@@ -908,18 +909,20 @@ impl<IO: AsyncReadRent + AsyncWriteRent> AsyncReadRent for BoringStream<IO> {
             return (Ok(0), buf);
         }
         let want = cap.min(self.scratch.len().max(READ_CHUNK));
-        let mut plaintext = vec![0u8; want];
+        if self.plaintext.len() < want {
+            self.plaintext.resize(want, 0);
+        }
         loop {
             // Drain any records BoringSSL wants to send (e.g. session tickets,
             // key updates) before potentially blocking on a read.
             if let Err(e) = self.flush_outbound().await {
                 return (Err(e), buf);
             }
-            match self.ssl.ssl_read(&mut plaintext) {
+            match self.ssl.ssl_read(&mut self.plaintext[..want]) {
                 Ok(n) => {
                     unsafe {
                         let dst = buf.write_ptr();
-                        dst.copy_from_nonoverlapping(plaintext.as_ptr(), n);
+                        dst.copy_from_nonoverlapping(self.plaintext.as_ptr(), n);
                         buf.set_init(n);
                     }
                     return (Ok(n), buf);
@@ -985,8 +988,21 @@ impl<IO: AsyncReadRent + AsyncWriteRent> AsyncWriteRent for BoringStream<IO> {
         if data.is_empty() {
             return (Ok(0), buf);
         }
-        // ssl_write either consumes the whole buffer into the BIO or asks for
-        // more I/O; loop until it accepts the bytes, pumping the socket.
+        // ssl_write normally consumes the caller's buffer synchronously. Only
+        // allocate a retry buffer when BoringSSL asks us to perform socket I/O
+        // before it can accept the plaintext.
+        match self.ssl.ssl_write(data) {
+            Ok(n) => {
+                if let Err(e) = self.flush_outbound().await {
+                    return (Err(e), buf);
+                }
+                return (Ok(n), buf);
+            }
+            Err(e) if !matches!(e.code(), ErrorCode::WANT_WRITE | ErrorCode::WANT_READ) => {
+                return (Err(ssl_io_error(&e)), buf);
+            }
+            Err(_) => {}
+        }
         let data = data.to_vec();
         loop {
             match self.ssl.ssl_write(&data) {
