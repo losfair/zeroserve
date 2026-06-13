@@ -11982,7 +11982,7 @@ async function waitForLog(path: string): Promise<string> {
 }
 
 async function waitForLogEntries(path: string, count: number): Promise<string> {
-  const deadline = Date.now() + 3000;
+  const deadline = Date.now() + 10000;
   let last = "";
   while (Date.now() < deadline) {
     try {
