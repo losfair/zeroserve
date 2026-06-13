@@ -13,8 +13,7 @@ lalrpop = "0.23"
 lalrpop-util = "0.23"
 arc-swap = "1"
 chrono = "0.4"
-async-ebpf = "0.3.2"
-#async-ebpf = { path = "../async-ebpf" }
+async-ebpf = "0.4.0-alpha.1"
 base64ct = { version = "1", features = ["alloc"] }
 dashmap = "6"
 blake3 = "1"
@@ -59,4 +58,3 @@ zstd = "0.13.3"
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }
-async-ebpf = { path = "/home/user/async-ebpf" }
