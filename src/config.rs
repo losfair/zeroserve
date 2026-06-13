@@ -2,7 +2,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::cli::{Cli, ListenAddr};
+use crate::{
+    bpf_compiler::EbpfCompiler,
+    cli::{Cli, ListenAddr},
+};
 
 pub struct StaticConfig {
     pub http_addr: ListenAddr,
@@ -35,6 +38,7 @@ pub struct StaticConfig {
     pub max_rate_limit_buckets: usize,
     pub script_code_size_limit: usize,
     pub validate_hostnames: Vec<String>,
+    pub ebpf_compiler: EbpfCompiler,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -141,6 +145,7 @@ impl TryFrom<Cli> for StaticConfig {
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
             script_code_size_limit,
             validate_hostnames: cli.validate_hostnames,
+            ebpf_compiler: cli.ebpf_compiler,
         })
     }
 }

@@ -54,4 +54,6 @@ cd testing
 deno test -A --parallel
 ```
 
-The scripting tests use the tinycc library linked into the zeroserve binary.
+The scripting tests use the builtin tinycc compiler by default. Pass
+`--ebpf-compiler clang` to use clang/llc for `.zeroserve/scripts/*.c` and
+generated `--caddy` middleware instead.

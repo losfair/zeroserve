@@ -8,13 +8,13 @@ use anyhow::{Context, Result, bail};
 use tar::Builder;
 use ulid::Ulid;
 
-use crate::tinycc;
+use crate::bpf_compiler::{self, EbpfCompiler};
 
 pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
 pub const ZEROSERVE_CADDY_H: &[u8] = include_bytes!("../sdk/zeroserve_caddy.h");
 pub const USER_MANUAL: &str = include_str!("../docs/user_manual.md");
 
-pub fn pack_site(root: &Path) -> Result<()> {
+pub fn pack_site(root: &Path, compiler: EbpfCompiler) -> Result<()> {
     let meta = fs::metadata(root)
         .with_context(|| format!("failed to stat pack path {}", root.display()))?;
     if !meta.is_dir() {
@@ -27,7 +27,7 @@ pub fn pack_site(root: &Path) -> Result<()> {
     let mut builder = Builder::new(stdout.lock());
 
     let result = (|| {
-        pack_dir(&mut builder, root, root, &temp_dir, &header_dir)?;
+        pack_dir(&mut builder, root, root, &temp_dir, &header_dir, compiler)?;
         builder.finish().context("failed to finalize tar stream")?;
         Ok(())
     })();
@@ -42,6 +42,7 @@ fn pack_dir(
     dir: &Path,
     temp_dir: &Path,
     header_dir: &Path,
+    compiler: EbpfCompiler,
 ) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
@@ -56,7 +57,7 @@ fn pack_dir(
             builder
                 .append_dir(rel, &path)
                 .with_context(|| format!("failed to append directory {}", rel.display()))?;
-            pack_dir(builder, root, &path, temp_dir, header_dir)?;
+            pack_dir(builder, root, &path, temp_dir, header_dir, compiler)?;
             continue;
         }
         if !file_type.is_file() {
@@ -64,7 +65,7 @@ fn pack_dir(
         }
 
         if is_script_c(rel) {
-            let compiled = compile_script(&path, temp_dir, header_dir)?;
+            let compiled = compile_script(&path, temp_dir, header_dir, compiler)?;
             let mut tar_path = rel.to_path_buf();
             tar_path.set_extension("o");
             builder
@@ -144,7 +145,12 @@ impl CompiledScript {
     }
 }
 
-fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<CompiledScript> {
+fn compile_script(
+    source: &Path,
+    temp_dir: &Path,
+    header_dir: &Path,
+    compiler: EbpfCompiler,
+) -> Result<CompiledScript> {
     let stem = source
         .file_stem()
         .and_then(|s| s.to_str())
@@ -152,7 +158,7 @@ fn compile_script(source: &Path, temp_dir: &Path, header_dir: &Path) -> Result<C
     let unique = Ulid::new();
     let obj_path = temp_dir.join(format!("{}-{}.o", stem, unique));
 
-    tinycc::compile_file_to_object(source, header_dir, &obj_path)?;
+    bpf_compiler::compile_file_to_object(compiler, source, header_dir, &obj_path)?;
 
     Ok(CompiledScript { obj_path })
 }

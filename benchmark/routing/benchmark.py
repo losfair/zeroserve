@@ -370,6 +370,12 @@ def main():
         action="store_true",
         help="every vhost reverse-proxies to a shared HTTP nginx backend",
     )
+    ap.add_argument(
+        "--ebpf-compiler",
+        choices=["tcc", "clang"],
+        default="tcc",
+        help="eBPF C compiler used by zeroserve --caddy",
+    )
     args = ap.parse_args()
 
     global TLS, PROXY
@@ -453,6 +459,8 @@ def main():
             str(BINARY),
             "--caddy",
             str(caddyfile),
+            "--ebpf-compiler",
+            args.ebpf_compiler,
             "--threads",
             str(SERVER_THREADS),
             "--disable-request-logging",
@@ -538,6 +546,7 @@ def main():
         "duration": args.duration,
         "tls": TLS,
         "proxy": PROXY,
+        "ebpf_compiler": args.ebpf_compiler if args.server == "zeroserve" else None,
         "results": results,
     }
     with open(Path(__file__).parent / "results.jsonl", "a") as f:

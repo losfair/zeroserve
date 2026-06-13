@@ -2,6 +2,8 @@ use std::{net::SocketAddr, os::fd::RawFd, path::PathBuf, str::FromStr};
 
 use clap::Parser;
 
+use crate::bpf_compiler::EbpfCompiler;
+
 /// A listen address: either a socket address or a file descriptor.
 #[derive(Debug, Clone)]
 pub enum ListenAddr {
@@ -107,6 +109,10 @@ pub struct Cli {
     /// Pack a directory to stdout as a site tarball.
     #[arg(long, value_name = "DIR", conflicts_with = "tarball")]
     pub pack: Option<PathBuf>,
+
+    /// Compiler for .zeroserve/scripts/*.c and --caddy generated eBPF middleware.
+    #[arg(long, value_enum, default_value_t = EbpfCompiler::Tcc)]
+    pub ebpf_compiler: EbpfCompiler,
 
     /// Dump the embedded SDK header to stdout.
     #[arg(long, conflicts_with_all = ["pack", "tarball", "manual"])]
@@ -257,5 +263,20 @@ mod tests {
         let err = Cli::try_parse_from(["zeroserve", "--manual", "site.tar"]).unwrap_err();
 
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn ebpf_compiler_defaults_to_tcc() {
+        let cli = Cli::try_parse_from(["zeroserve", "site.tar"]).unwrap();
+
+        assert_eq!(cli.ebpf_compiler, EbpfCompiler::Tcc);
+    }
+
+    #[test]
+    fn ebpf_compiler_accepts_clang() {
+        let cli =
+            Cli::try_parse_from(["zeroserve", "--ebpf-compiler", "clang", "site.tar"]).unwrap();
+
+        assert_eq!(cli.ebpf_compiler, EbpfCompiler::Clang);
     }
 }

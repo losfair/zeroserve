@@ -42,7 +42,8 @@ Packaging notes:
 - Any `.c` file in `.zeroserve/scripts/` is compiled to an `.o` eBPF object.
   The resulting `.o` is included in the tarball and the `.c` is omitted.
 - If a `.c` and `.o` share the same name, the `.o` is skipped in favor of recompiling.
-- Script compilation uses the tinycc library linked into the zeroserve binary.
+- Script compilation uses the builtin tinycc backend by default. Use
+  `--ebpf-compiler clang` to compile with clang and llc instead.
 
 If you want the SDK header without packing:
 
@@ -70,11 +71,12 @@ zeroserve --pack ./public > site.tar
 ```
 
 To skip the manual pack-and-run steps, `--caddy` performs the whole pipeline
-(adapt → compile → in-memory site tarball → serve) in one shot, compiling the
-generated middleware from memory and keeping the tarball in memory (memfd):
+(adapt → compile → in-memory site tarball → serve) in one shot, using the
+selected eBPF compiler and keeping the tarball in memory (memfd):
 
 ```bash
 zeroserve --caddy Caddyfile --addr 0.0.0.0:8080
+zeroserve --caddy Caddyfile --ebpf-compiler clang --addr 0.0.0.0:8080
 ```
 
 ### Caddyfile support
@@ -279,6 +281,8 @@ Key options:
 - `--caddy <CADDYFILE>`: Run a Caddyfile (or Caddy JSON) directly — adapt,
   compile, build an in-memory site tarball, and serve it, all in memory
   (memfd). Used in place of the `SITE_TAR_OR_SCRIPT` argument.
+- `--ebpf-compiler <tcc|clang>`: Select the compiler for `.zeroserve/scripts/*.c`
+  during `--pack` and generated middleware during `--caddy`. Defaults to `tcc`.
 - `--adapt-caddyfile <CADDYFILE>`: Adapt a Caddyfile to Caddy JSON and print it
   to stdout (without compiling), for inspecting the adapter output.
 - `--manual`: Print the embedded user manual to stdout.
@@ -506,10 +510,12 @@ Option A: let `--pack` compile `.c` sources automatically.
 zeroserve --pack ./site > site.tar
 ```
 
-Option B: compile manually with tinycc.
+Option B: compile manually.
 
 ```bash
 bpf-tcc -Wall -mcpu=v3 -fno-builtin -I path/to/zeroserve-sdk -c input.c -o out.o
+clang -O2 -Wall -target bpf -fno-builtin -emit-llvm -c -I path/to/zeroserve-sdk input.c -o out.bc
+llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj out.bc -o out.o
 ```
 
 Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
