@@ -14,7 +14,7 @@ export async function packSite(siteRoot: string): Promise<string> {
   const tarPath = await Deno.makeTempFile({ suffix: ".tar" });
   const output = await runCommand(
     zeroservePath,
-    ["--pack", siteRoot],
+    [...ebpfCompilerArgs(), "--pack", siteRoot],
     { cwd: repoRoot },
   );
   await Deno.writeFile(tarPath, output.stdout);
@@ -85,6 +85,7 @@ export async function spawnZeroserve(
       "127.0.0.1:0",
       ...(opts.tls ? ["--tls-addr", "127.0.0.1:0"] : []),
       "--disable-request-logging",
+      ...ebpfCompilerArgs(args),
       ...args,
     ],
     cwd: repoRoot,
@@ -109,6 +110,22 @@ export async function spawnZeroserve(
     await stopProcess(child, statusPromise);
     throw err;
   }
+}
+
+function ebpfCompilerArgs(existingArgs: string[] = []): string[] {
+  if (existingArgs.includes("--ebpf-compiler")) {
+    return [];
+  }
+  const compiler = Deno.env.get("ZEROSERVE_EBPF_COMPILER");
+  if (compiler === undefined || compiler === "") {
+    return [];
+  }
+  if (compiler !== "tcc" && compiler !== "clang") {
+    throw new Error(
+      `ZEROSERVE_EBPF_COMPILER must be "tcc" or "clang", got ${compiler}`,
+    );
+  }
+  return ["--ebpf-compiler", compiler];
 }
 
 async function waitForListenPorts(

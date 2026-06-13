@@ -1,14 +1,11 @@
 use std::{
-    ffi::{OsStr, OsString},
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
-use nix::sys::memfd::{MFdFlags, memfd_create};
 use ulid::Ulid;
 
 pub const ZEROSERVE_H: &[u8] = include_bytes!("../sdk/zeroserve.h");
@@ -64,7 +61,6 @@ pub fn compile_c_path_to_temp_object(source: &Path, work_dir: &WorkDir) -> Resul
         bc_path.as_os_str(),
         work_dir.path(),
         &source.display().to_string(),
-        false,
     )?;
     run_llc(
         bc_path.as_os_str(),
@@ -90,38 +86,6 @@ pub fn compile_c_path_to_object_bytes(source: &Path) -> Result<Vec<u8>> {
     Ok(object)
 }
 
-pub fn compile_c_source_to_object_bytes(name: &str, c_source: &str) -> Result<Vec<u8>> {
-    let mut c_memfd = make_memfd(name)?;
-    c_memfd
-        .write_all(c_source.as_bytes())
-        .context("failed to write generated C into memfd")?;
-    c_memfd.flush().ok();
-
-    let bc_memfd = make_memfd("zeroserve-script.bc")?;
-    let mut o_memfd = make_memfd("zeroserve-script.o")?;
-    let work_dir = WorkDir::new("zeroserve-c-compile")?;
-
-    let source = fd_path(&c_memfd);
-    let bitcode = fd_path(&bc_memfd);
-    let object = fd_path(&o_memfd);
-    run_clang(&source, &bitcode, work_dir.path(), name, true)?;
-    run_llc(&bitcode, &object, name)?;
-
-    // clang/llc wrote through a separate open file description; rewind our own
-    // handle before reading the produced object back out.
-    o_memfd
-        .seek(SeekFrom::Start(0))
-        .context("failed to rewind object memfd")?;
-    let mut object = Vec::new();
-    o_memfd
-        .read_to_end(&mut object)
-        .context("failed to read compiled object from memfd")?;
-    if object.is_empty() {
-        bail!("compiled object for {name} is empty");
-    }
-    Ok(object)
-}
-
 fn write_sdk_headers(dir: &Path) -> Result<()> {
     fs::write(dir.join("zeroserve.h"), ZEROSERVE_H)
         .with_context(|| format!("failed to write headers into {}", dir.display()))?;
@@ -130,13 +94,7 @@ fn write_sdk_headers(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_clang(
-    source: &OsStr,
-    bitcode: &OsStr,
-    header_dir: &Path,
-    label: &str,
-    force_c: bool,
-) -> Result<()> {
+fn run_clang(source: &OsStr, bitcode: &OsStr, header_dir: &Path, label: &str) -> Result<()> {
     let mut command = Command::new("clang");
     command.args([
         "-O2",
@@ -146,9 +104,6 @@ fn run_clang(
         "-fno-builtin",
         "-emit-llvm",
     ]);
-    if force_c {
-        command.args(["-x", "c"]);
-    }
     let status = command
         .arg("-c")
         .arg("-I")
@@ -183,18 +138,4 @@ fn run_llc(bitcode: &OsStr, object: &OsStr, label: &str) -> Result<()> {
         bail!("llc failed for {label}");
     }
     Ok(())
-}
-
-/// Create an anonymous in-memory file. The fd is left inheritable (no
-/// `MFD_CLOEXEC`) so clang/llc child processes can reach it through
-/// `/proc/self/fd/<fd>`.
-fn make_memfd(name: &str) -> Result<File> {
-    let cname = std::ffi::CString::new(name).expect("memfd name has no interior NUL");
-    let fd = memfd_create(cname.as_c_str(), MFdFlags::empty())
-        .with_context(|| format!("memfd_create({name}) failed"))?;
-    Ok(File::from(fd))
-}
-
-fn fd_path(file: &File) -> OsString {
-    OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
