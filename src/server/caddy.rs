@@ -191,6 +191,10 @@ impl<'a> ResponseHookState<'a> {
             );
         }
     }
+
+    pub(super) fn has_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
 }
 
 pub(super) fn set_proxy_error_metadata(outcome: &ScriptOutcome, message: &str) {
@@ -595,7 +599,7 @@ pub(super) fn populate_reverse_proxy_response_state(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
 ) {
     populate_reverse_proxy_response_metadata(
         hook_state,
@@ -611,7 +615,7 @@ pub(super) async fn prepare_reverse_proxy_raw_h1_response_headers(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> RawResponseHookOutcome {
@@ -637,7 +641,7 @@ pub(super) async fn prepare_reverse_proxy_response_headers(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &mut ::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
     early_response_headers: Option<&::http::HeaderMap>,
     metadata: &HashMap<String, String>,
 ) -> ResponseHookOutcome {
@@ -683,7 +687,7 @@ pub(super) fn populate_reverse_proxy_response_metadata(
     status: StatusCode,
     raw_status_text: Option<&str>,
     headers: &::http::HeaderMap,
-    upstream_latency: Duration,
+    upstream_latency: Option<Duration>,
 ) {
     let Some(hook_state) = hook_state else {
         return;
@@ -704,14 +708,16 @@ pub(super) fn populate_reverse_proxy_response_metadata(
         })
         .unwrap_or_else(|| status.as_u16().to_string());
     metadata.insert("http.reverse_proxy.status_text".to_string(), status_text);
-    metadata.insert(
-        "http.reverse_proxy.upstream.latency".to_string(),
-        caddy_duration_string(upstream_latency),
-    );
-    metadata.insert(
-        "http.reverse_proxy.upstream.latency_ms".to_string(),
-        caddy_duration_ms_string(upstream_latency),
-    );
+    if let Some(upstream_latency) = upstream_latency {
+        metadata.insert(
+            "http.reverse_proxy.upstream.latency".to_string(),
+            caddy_duration_string(upstream_latency),
+        );
+        metadata.insert(
+            "http.reverse_proxy.upstream.latency_ms".to_string(),
+            caddy_duration_ms_string(upstream_latency),
+        );
+    }
 
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
     for (name, value) in headers.iter() {

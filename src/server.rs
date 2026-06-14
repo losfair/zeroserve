@@ -4239,7 +4239,10 @@ where
     IO: AsyncReadRent + AsyncWriteRent + Split,
     R: AsyncReadRent,
 {
-    let roundtrip_start = Instant::now();
+    let roundtrip_start = hook_state
+        .as_ref()
+        .is_some_and(|state| state.has_hooks())
+        .then(Instant::now);
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
@@ -4272,7 +4275,7 @@ where
         Ok(None) => return Err(anyhow!("proxy backend closed without response")),
         Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
     };
-    let upstream_latency = roundtrip_start.elapsed();
+    let upstream_latency = roundtrip_start.map(|start| start.elapsed());
 
     let (resp_head, mut resp_body) = response.into_parts();
     let status = resp_head.status;
@@ -4447,7 +4450,10 @@ async fn proxy_over_connection_h2<IO>(
 where
     IO: AsyncReadRent + AsyncWriteRent + Split,
 {
-    let roundtrip_start = Instant::now();
+    let roundtrip_start = hook_state
+        .as_ref()
+        .is_some_and(|state| state.has_hooks())
+        .then(Instant::now);
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
@@ -4482,7 +4488,7 @@ where
         Ok(None) => return Err(anyhow!("proxy backend closed without response")),
         Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
     };
-    let upstream_latency = roundtrip_start.elapsed();
+    let upstream_latency = roundtrip_start.map(|start| start.elapsed());
 
     let (resp_head, mut resp_body) = response.into_parts();
     let mut status = resp_head.status;

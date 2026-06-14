@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c926c20395f4587e39b99fee3e2b96128d84d8e97e2d993f19d925cbbd99e31"
+checksum = "aaff244eb3dc4c5b850a5d10aa31cba7caa5c0bdd48d5009b7ee88adf0eb4661"
 dependencies = [
  "bindgen",
  "cmake",

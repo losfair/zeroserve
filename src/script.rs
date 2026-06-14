@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -2144,7 +2145,15 @@ impl Timeslicer for MonoioTimeslicer {
     }
 
     fn yield_now(&self) -> impl Future<Output = ()> {
-        monoio::time::sleep(Duration::from_millis(0))
+        let yielded = Cell::new(false);
+        std::future::poll_fn(move |cx| {
+            if yielded.replace(true) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
     }
 }
 
