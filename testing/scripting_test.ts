@@ -2939,6 +2939,163 @@ Deno.test({
     },
 });
 
+async function rawGetTextWithDeadline(
+    baseUrl: string,
+    path: string,
+    timeoutMs: number,
+): Promise<{ status: number; body: string } | null> {
+    const url = new URL(baseUrl);
+    const hostname = url.hostname;
+    const port = Number(url.port);
+    let conn: Deno.Conn | null = null;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const request = (async () => {
+        conn = await Deno.connect({ hostname, port });
+        try {
+            const text = [
+                `GET ${path} HTTP/1.1`,
+                `Host: ${hostname}:${port}`,
+                "User-Agent: deno-test",
+                "Accept: text/plain",
+                "Accept-Encoding: identity",
+                "Connection: close",
+                "",
+                "",
+            ].join("\r\n");
+            await writeAll(conn, encoder.encode(text));
+            const { head, rest } = await readUntil(
+                conn,
+                encoder.encode("\r\n\r\n"),
+            );
+            const responseHead = decoder.decode(head);
+            const lines = responseHead
+                .split("\r\n")
+                .filter((line) => line.length > 0);
+            if (lines.length === 0) {
+                throw new Error("missing response status line");
+            }
+            const [_, statusCode] = lines[0].split(" ");
+            const status = Number.parseInt(statusCode ?? "", 10);
+            if (!Number.isFinite(status)) {
+                throw new Error(`invalid response status: ${lines[0]}`);
+            }
+            const headers = new Headers();
+            for (const line of lines.slice(1)) {
+                const idx = line.indexOf(":");
+                if (idx === -1) {
+                    continue;
+                }
+                headers.append(
+                    line.slice(0, idx).trim(),
+                    line.slice(idx + 1).trim(),
+                );
+            }
+            const transferEncoding = headers.get("transfer-encoding");
+            const contentLength = headers.get("content-length");
+            let body: ByteArray;
+            if (
+                transferEncoding &&
+                transferEncoding.toLowerCase().includes("chunked")
+            ) {
+                body = await readChunkedBody(conn, rest);
+            } else if (contentLength) {
+                body = await readContentLengthBody(
+                    conn,
+                    rest,
+                    Number.parseInt(contentLength, 10),
+                );
+            } else {
+                body = await readToEnd(conn, rest);
+            }
+            return {
+                status,
+                body: decoder.decode(body),
+            };
+        } catch (err) {
+            if (timedOut) {
+                return null;
+            }
+            throw err;
+        } finally {
+            conn.close();
+            conn = null;
+        }
+    })();
+    const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => {
+            timedOut = true;
+            conn?.close();
+            resolve(null);
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([request, timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+Deno.test({
+    name:
+        "e2e: async preemption lets a healthy request run while another spins on one thread",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const siteDir = await Deno.makeTempDir();
+        let tarPath: string | null = null;
+        try {
+            await Deno.writeTextFile(join(siteDir, "index.html"), "spin\n");
+            const scriptsDir = join(siteDir, ".zeroserve", "scripts");
+            await Deno.mkdir(scriptsDir, { recursive: true });
+            await Deno.writeTextFile(join(scriptsDir, "spin.c"), SPIN_SCRIPT);
+            tarPath = await packSite(siteDir);
+
+            await withZeroserve(
+                tarPath,
+                async (baseUrl) => {
+                    const before = await rawGetTextWithDeadline(
+                        baseUrl,
+                        "/healthz",
+                        1000,
+                    );
+                    assert(before !== null, "baseline request timed out");
+                    assertEquals(before.status, 200);
+                    assertEquals(before.body, "ok\n");
+
+                    const controller = new AbortController();
+                    const spinning = fetch(`${baseUrl}/spin`, {
+                        signal: controller.signal,
+                    }).catch((err) => err);
+                    try {
+                        await new Promise((resolve) => setTimeout(resolve, 300));
+
+                        const healthy = await rawGetTextWithDeadline(
+                            baseUrl,
+                            "/healthz",
+                            2000,
+                        );
+                        assert(
+                            healthy !== null,
+                            "healthy request timed out while another request spun",
+                        );
+                        assertEquals(healthy.status, 200);
+                        assertEquals(healthy.body, "ok\n");
+                    } finally {
+                        controller.abort();
+                        await spinning;
+                    }
+                },
+                ["--threads", "1", "--preempt-timer-interval-ms", "10"],
+            );
+        } finally {
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+            await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+        }
+    },
+});
+
 // A single script that is both gateway and callee. Its `mutate` call mutates the
 // shared request and metadata, then the request handler reads those back —
 // proving that request mutations and metadata set by a callee propagate to the
