@@ -18,6 +18,7 @@ typedef long ssize_t;
 #define ZS_SECTION(name) __attribute__((section(name)))
 #define ZS_ENTRY ZS_SECTION("zeroserve.request")
 #define ZS_TLS_ENTRY ZS_SECTION("zeroserve.tls")
+#define ZS_TLS_REQUEST_ENTRY ZS_SECTION("zeroserve.tls.request")
 #define ZS_INLINE __attribute__((always_inline))
 /* Marks a definition that a given generated script may legitimately not
  * reference, suppressing clang's -Wunused-function. */

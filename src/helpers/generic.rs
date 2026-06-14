@@ -590,21 +590,3 @@ pub fn h_caddy_simple_reverse_proxy(
         Ok(0)
     })
 }
-
-pub fn h_caddy_simple_host_reverse_proxy(
-    scope: &HelperScope,
-    url_ptr: u64,
-    url_len: u64,
-    a: u64,
-    b: u64,
-    c: u64,
-) -> Result<u64, ()> {
-    h_caddy_simple_reverse_proxy(scope, url_ptr, url_len, a, b, c)?;
-    with_ectx(scope, |ctx| {
-        ctx.metadata.borrow_mut().insert(
-            "zs.caddy.simple_host_reverse_proxy".to_string(),
-            "1".to_string(),
-        );
-        Ok(0)
-    })
-}

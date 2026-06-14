@@ -602,7 +602,6 @@ struct Generator {
     /// value is the insertion id behind the emitted `ZS_HOST_ID_<id>` define;
     /// the define resolves to the pattern's sorted table index at finish.
     host_table: BTreeMap<String, usize>,
-    simple_host_route_switch: bool,
 }
 
 impl Generator {
@@ -645,35 +644,34 @@ impl Generator {
     }
 
     fn emit_tls_entrypoint(&mut self) -> Result<()> {
-        let policies = self
+        let certificate_policies = self
             .tls_connection_policies
             .iter()
-            .filter(|policy| {
-                policy.client_authentication.is_some() || policy.certificate_selection.is_some()
-            })
+            .filter(|policy| policy.certificate_selection.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        if policies.is_empty() {
-            return Ok(());
-        }
-
-        self.line("ZS_TLS_ENTRY");
-        self.line("zs_u64 caddy_tls(void) {");
-        self.indent += 1;
-        self.line("char caddy_tls_sni[256];");
-        self.line(&format!(
-            "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
-            c_str("{http.request.tls.server_name}"),
-            "{http.request.tls.server_name}".len()
-        ));
-        self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
-
-        for policy in policies {
-            let condition = tls_policy_sni_condition(&policy);
-            self.line(&format!("if ({condition}) {{"));
+        if !certificate_policies.is_empty() {
+            self.line("ZS_TLS_ENTRY");
+            self.line("zs_u64 caddy_tls(void) {");
             self.indent += 1;
-            if let Some(selection) = &policy.certificate_selection {
-                let selection = normalize_tls_certificate_selection(selection)?;
+            self.line("char caddy_tls_sni[256];");
+            self.line(&format!(
+                "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
+                c_str("{http.request.tls.server_name}"),
+                "{http.request.tls.server_name}".len()
+            ));
+            self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
+
+            for policy in certificate_policies {
+                let condition = tls_policy_sni_condition(&policy);
+                self.line(&format!("if ({condition}) {{"));
+                self.indent += 1;
+                let selection = normalize_tls_certificate_selection(
+                    policy
+                        .certificate_selection
+                        .as_ref()
+                        .expect("certificate policy must have selection"),
+                )?;
                 self.line(&format!(
                     "if (zs_caddy_tls_certificate({}, {}, {}, {}) == 0) {{",
                     c_str(&selection.certificate),
@@ -686,21 +684,57 @@ impl Generator {
                 self.line("return 0;");
                 self.indent -= 1;
                 self.line("}");
-            }
-            if let Some(auth) = &policy.client_authentication {
-                let auth = normalize_tls_client_auth(auth)?;
-                let auth = serde_json::to_string(&auth)?;
-                self.line(&format!(
-                    "if (zs_caddy_tls_client_auth({}, {}) == 0) {{",
-                    c_str(&auth),
-                    auth.len()
-                ));
-                self.indent += 1;
-                self.line("zs_abort();");
-                self.line("return 0;");
                 self.indent -= 1;
                 self.line("}");
             }
+
+            self.line("return 0;");
+            self.indent -= 1;
+            self.line("}");
+        }
+
+        let client_auth_policies = self
+            .tls_connection_policies
+            .iter()
+            .filter(|policy| policy.client_authentication.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        if client_auth_policies.is_empty() {
+            return Ok(());
+        }
+
+        self.line("ZS_TLS_REQUEST_ENTRY");
+        self.line("zs_u64 caddy_tls_request(void) {");
+        self.indent += 1;
+        self.line("char caddy_tls_sni[256];");
+        self.line(&format!(
+            "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
+            c_str("{http.request.tls.server_name}"),
+            "{http.request.tls.server_name}".len()
+        ));
+        self.line("zs_u64 caddy_tls_sni_len = zs_caddy_clamp_len(caddy_tls_sni_raw, sizeof(caddy_tls_sni));");
+
+        for policy in client_auth_policies {
+            let condition = tls_policy_sni_condition(&policy);
+            self.line(&format!("if ({condition}) {{"));
+            self.indent += 1;
+            let auth = normalize_tls_client_auth(
+                policy
+                    .client_authentication
+                    .as_ref()
+                    .expect("client auth policy must have client_authentication"),
+            )?;
+            let auth = serde_json::to_string(&auth)?;
+            self.line(&format!(
+                "if (zs_caddy_tls_client_auth({}, {}) == 0) {{",
+                c_str(&auth),
+                auth.len()
+            ));
+            self.indent += 1;
+            self.line("zs_abort();");
+            self.line("return 0;");
+            self.indent -= 1;
+            self.line("}");
             self.indent -= 1;
             self.line("}");
         }
@@ -769,10 +803,7 @@ impl Generator {
                 compiled.route_index
             ));
             self.line("if (zs_response_pending() != 0) return 0;");
-            let old_simple_host_route_switch = self.simple_host_route_switch;
-            self.simple_host_route_switch = true;
             let stopped = self.emit_handlers(&compiled.route.handlers)?;
-            self.simple_host_route_switch = old_simple_host_route_switch;
             if !stopped {
                 self.emit_terminal_empty_handler("route");
             }
@@ -3099,12 +3130,11 @@ impl Generator {
             && headers.is_none()
             && handle_response.is_none()
         {
-            let helper = if self.simple_host_route_switch {
-                "zs_caddy_simple_host_reverse_proxy"
-            } else {
-                "zs_caddy_simple_reverse_proxy"
-            };
-            self.line(&format!("{helper}({}, {});", c_str(&url), url.len()));
+            self.line(&format!(
+                "zs_caddy_simple_reverse_proxy({}, {});",
+                c_str(&url),
+                url.len()
+            ));
             self.line("return 0;");
             if handle_response.is_some() {
                 self.indent -= 1;
@@ -9327,7 +9357,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_tls_client_auth_policy_to_tls_section() {
+    fn compiles_tls_client_auth_policy_to_request_tls_section() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {
             "tls_connection_policies": [{
@@ -9346,7 +9376,8 @@ mod tests {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("ZS_TLS_ENTRY"), "{c}");
+        assert!(!c.contains("ZS_TLS_ENTRY"), "{c}");
+        assert!(c.contains("ZS_TLS_REQUEST_ENTRY"), "{c}");
         assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
         assert!(c.contains("zs_abort();"), "{c}");
         assert!(c.contains("example.com"), "{c}");

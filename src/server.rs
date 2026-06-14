@@ -762,30 +762,6 @@ where
 
     head.tls = matches!(scheme, Scheme::Https);
     let head_only = head.method == Method::HEAD;
-    if let Some(proxy_url) = cached_simple_host_proxy(&head) {
-        let res = match conn.io_mut() {
-            Ok(w) => {
-                reverse_proxy_simple_request(&proxy_url, &head, w, head_only, peer, scheme, true)
-                    .await
-            }
-            Err(err) => Err(anyhow!("client connection missing io: {err}")),
-        };
-        return match res {
-            Ok(proxy_outcome) => SimpleH1ProxyResult::Handled(proxy_outcome.send.keep_client),
-            Err(err) => {
-                async_log(format!("[handle] cached reverse proxy: {:?}\n", err).into_bytes()).await;
-                let keep_client = match conn.io_mut() {
-                    Ok(w) => {
-                        send_fixed(w, bad_gateway(), None, &HashMap::new(), None)
-                            .await
-                            .keep_client
-                    }
-                    Err(_) => false,
-                };
-                SimpleH1ProxyResult::Handled(keep_client)
-            }
-        };
-    }
     let original_head = head.clone();
     let request_id = RequestId::new();
     let Some(normalized_path) = normalize_request_path(head.uri.path()) else {
@@ -844,7 +820,15 @@ where
         return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
     }
 
-    let hook_state = ResponseHookState::from_outcome(script_runtime, shared, &script_outcome);
+    let hook_state = if script_outcome.response_hooks.is_empty() {
+        None
+    } else {
+        Some(ResponseHookState::from_outcome(
+            script_runtime,
+            shared,
+            &script_outcome,
+        ))
+    };
     let encode_state = script_outcome.encode.clone().map(|config| {
         crate::helpers::compress::EncodeState::from_request_headers(config, &head.headers)
     });
@@ -861,7 +845,7 @@ where
             h1::is_websocket_upgrade_request(&head),
             Some(&script_outcome.early_response_headers),
             &script_outcome.metadata,
-            Some(&hook_state),
+            hook_state.as_ref(),
             script_outcome.request.proxy_method(),
             script_outcome.request.proxy_uri(),
             script_outcome.request.proxy_headers(),
@@ -880,7 +864,7 @@ where
                 head_only,
                 peer,
                 scheme,
-                caddy_uses_default_forwarded(&script_outcome.metadata, Some(&hook_state)),
+                caddy_uses_default_forwarded(&script_outcome.metadata, hook_state.as_ref()),
             )
             .await
         }
@@ -888,13 +872,6 @@ where
     };
     match res {
         Ok(proxy_outcome) => {
-            if script_outcome
-                .metadata
-                .get("zs.caddy.simple_host_reverse_proxy")
-                .is_some_and(|value| value == "1")
-            {
-                remember_simple_host_proxy(&head, proxy_url);
-            }
             log_caddy_access(
                 shared,
                 &head,
@@ -916,7 +893,7 @@ where
                         bad_gateway(),
                         Some(&script_outcome.early_response_headers),
                         &script_outcome.metadata,
-                        Some(&hook_state),
+                        hook_state.as_ref(),
                     )
                     .await
                 }
@@ -4565,32 +4542,6 @@ fn caddy_uses_default_forwarded(
     caddy::caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
         .as_deref()
         == Some("default")
-}
-
-thread_local! {
-    static SIMPLE_HOST_PROXY_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-}
-
-fn simple_host_proxy_cache_key(head: &RequestHead) -> Option<String> {
-    head.headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(hostname_without_port)
-        .filter(|host| !host.is_empty())
-        .map(str::to_ascii_lowercase)
-}
-
-fn cached_simple_host_proxy(head: &RequestHead) -> Option<String> {
-    let key = simple_host_proxy_cache_key(head)?;
-    SIMPLE_HOST_PROXY_CACHE.with(|cache| cache.borrow().get(&key).cloned())
-}
-
-fn remember_simple_host_proxy(head: &RequestHead, proxy_url: &str) {
-    if let Some(key) = simple_host_proxy_cache_key(head) {
-        SIMPLE_HOST_PROXY_CACHE.with(|cache| {
-            cache.borrow_mut().insert(key, proxy_url.to_string());
-        });
-    }
 }
 
 fn encode_simple_proxy_request_head(
