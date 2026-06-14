@@ -3150,7 +3150,10 @@ impl Generator {
                 "zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy.compression\"), ZS_STR(\"off\"));",
             );
         }
-        self.emit_caddy_forwarded_headers(handler.config.get("trusted_proxies"))?;
+        self.emit_caddy_forwarded_headers(
+            handler.config.get("trusted_proxies"),
+            headers.is_none(),
+        )?;
         if transport_host_default {
             self.emit_reverse_proxy_transport_host_header()?;
         }
@@ -3801,8 +3804,12 @@ impl Generator {
         Ok(())
     }
 
-    fn emit_caddy_forwarded_headers(&mut self, trusted_proxies: Option<&Value>) -> Result<()> {
-        if self.reverse_proxy_uses_default_forwarded(trusted_proxies)? {
+    fn emit_caddy_forwarded_headers(
+        &mut self,
+        trusted_proxies: Option<&Value>,
+        can_mark_default: bool,
+    ) -> Result<()> {
+        if can_mark_default && self.reverse_proxy_uses_default_forwarded(trusted_proxies)? {
             self.line(
                 "zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy.forwarded\"), ZS_STR(\"default\"));",
             );

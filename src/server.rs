@@ -4561,9 +4561,22 @@ fn encode_simple_proxy_request_head(
         if is_simple_proxy_skip_request_header(name_str, caddy_default_forwarded) {
             continue;
         }
+        if name_str.eq_ignore_ascii_case("te")
+            && !value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("trailers"))
+            })
+        {
+            continue;
+        }
         out.extend_from_slice(name_str.as_bytes());
         out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
+        if name_str.eq_ignore_ascii_case("te") {
+            out.extend_from_slice(b"trailers");
+        } else {
+            out.extend_from_slice(value.as_bytes());
+        }
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"x-forwarded-for: ");
@@ -4619,7 +4632,6 @@ fn is_simple_proxy_skip_request_header(name: &str, caddy_default_forwarded: bool
         || name.eq_ignore_ascii_case("proxy-authenticate")
         || name.eq_ignore_ascii_case("proxy-authorization")
         || name.eq_ignore_ascii_case("keep-alive")
-        || name.eq_ignore_ascii_case("te")
         || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
