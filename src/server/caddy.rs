@@ -119,6 +119,10 @@ impl<'a> ResponseHookState<'a> {
         }
     }
 
+    pub(super) fn has_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
     pub(super) async fn run(
         &self,
         status: StatusCode,
@@ -918,8 +922,35 @@ fn apply_reverse_proxy_forwarded_headers(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
 ) {
+    if caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
+        .as_deref()
+        == Some("default")
+    {
+        apply_caddy_default_forwarded_headers(headers, peer, scheme);
+        return;
+    }
     if !reverse_proxy_uses_caddy_headers(metadata, hook_state) {
         apply_caddy_forwarded_headers(headers, peer, scheme);
+    }
+}
+
+fn apply_caddy_default_forwarded_headers(
+    headers: &mut ::http::HeaderMap,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+) {
+    if let Ok(value) = ::http::HeaderValue::from_str(&peer.ip().to_string()) {
+        headers.insert("x-forwarded-for", value);
+    }
+    if let Ok(value) = ::http::HeaderValue::from_str(scheme.as_str()) {
+        headers.insert("x-forwarded-proto", value);
+    }
+    let host = headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if let Ok(value) = ::http::HeaderValue::from_str(host) {
+        headers.insert("x-forwarded-host", value);
     }
 }
 

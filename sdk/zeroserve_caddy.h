@@ -3,6 +3,11 @@
 
 #include <zeroserve.h>
 
+extern zs_s64 zs_caddy_simple_reverse_proxy(const char *backend_url,
+                                            zs_u64 backend_url_len);
+extern zs_s64 zs_caddy_simple_host_reverse_proxy(const char *backend_url,
+                                                 zs_u64 backend_url_len);
+
 static ZS_INLINE ZS_MAYBE_UNUSED zs_u64 zs_caddy_clamp_len(zs_s64 len, zs_u64 cap) {
   if (len <= 0 || cap == 0)
     return 0;

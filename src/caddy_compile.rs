@@ -328,6 +328,26 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.line("zs_memset(route_groups, 0, sizeof(route_groups));");
     }
     generator.line(HOST_HOIST_MARKER);
+    if generator.emit_exact_host_route_switch(&routes)? {
+        generator.blank();
+        generator.line("/* Caddy emptyHandler: unrouted requests receive 200 OK. */");
+        generator.line("zs_caddy_respond_static(\"200\", 3, \"{}\", 2);");
+        generator.line("return 0;");
+        generator.indent -= 1;
+        generator.line("}");
+        generator.finish_response_hook();
+        for warning in generator.ignored_warnings {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        let out = resolve_host_hoist_markers(
+            &generator.out,
+            generator.host_hoist_used,
+            &generator.host_table,
+        );
+        return Ok((out, warnings));
+    }
     let mut pending_cleanup_needed = false;
     for compiled in &routes {
         generator.client_ip_config = compiled.client_ip_config.clone();
@@ -582,6 +602,7 @@ struct Generator {
     /// value is the insertion id behind the emitted `ZS_HOST_ID_<id>` define;
     /// the define resolves to the pattern's sorted table index at finish.
     host_table: BTreeMap<String, usize>,
+    simple_host_route_switch: bool,
 }
 
 impl Generator {
@@ -704,6 +725,93 @@ impl Generator {
             self.line("zs_caddy_respond_static(\"200\", 3, \"{}\", 2);");
         }
         self.line("return 0;");
+    }
+
+    fn emit_exact_host_route_switch(&mut self, routes: &[CompiledRoute]) -> Result<bool> {
+        if routes.len() < 2 || !self.route_groups.is_empty() {
+            return Ok(false);
+        }
+        let mut host_ids = Vec::with_capacity(routes.len());
+        let mut seen = BTreeSet::new();
+        for compiled in routes {
+            if !compiled.route.terminal
+                || compiled.route.group.is_some()
+                || !compiled.error_routes.is_empty()
+                || route_match_can_set_error(&compiled.route)
+            {
+                return Ok(false);
+            }
+            let Some(host_id) = self.route_single_exact_host_id(&compiled.route)? else {
+                return Ok(false);
+            };
+            if !seen.insert(host_id) {
+                return Ok(false);
+            }
+            host_ids.push(host_id);
+        }
+
+        self.host_hoist_used = true;
+        self.line(
+            "if (caddy_req_host_raw >= 0 && (zs_u64)caddy_req_host_raw < sizeof(caddy_req_host)) {",
+        );
+        self.indent += 1;
+        self.line("switch (caddy_req_host_id) {");
+        self.indent += 1;
+        for (compiled, host_id) in routes.iter().zip(host_ids) {
+            self.client_ip_config = compiled.client_ip_config.clone();
+            self.named_routes = compiled.named_routes.clone();
+            self.error_routes = compiled.error_routes.clone();
+            self.line(&format!("case ZS_HOST_ID_{host_id}:"));
+            self.indent += 1;
+            self.line(&format!(
+                "/* server {}, route {} */",
+                c_comment(&compiled.server_name),
+                compiled.route_index
+            ));
+            self.line("if (zs_response_pending() != 0) return 0;");
+            let old_simple_host_route_switch = self.simple_host_route_switch;
+            self.simple_host_route_switch = true;
+            let stopped = self.emit_handlers(&compiled.route.handlers)?;
+            self.simple_host_route_switch = old_simple_host_route_switch;
+            if !stopped {
+                self.emit_terminal_empty_handler("route");
+            }
+            self.line("break;");
+            self.indent -= 1;
+        }
+        self.line("default:");
+        self.indent += 1;
+        self.line("break;");
+        self.indent -= 1;
+        self.indent -= 1;
+        self.line("}");
+        self.indent -= 1;
+        self.line("}");
+        Ok(true)
+    }
+
+    fn route_single_exact_host_id(&mut self, route: &Route) -> Result<Option<usize>> {
+        let [set] = route.matcher_sets.as_slice() else {
+            return Ok(None);
+        };
+        if set.len() != 1 {
+            return Ok(None);
+        }
+        let Some(value) = set.get("host") else {
+            return Ok(None);
+        };
+        let values = strict_string_array(value, "host")?;
+        let [host] = values.as_slice() else {
+            return Ok(None);
+        };
+        if contains_placeholder(host) {
+            return Ok(None);
+        }
+        let normalized = caddy_normalize_host_pattern(host)?;
+        if caddy_host_fuzzy(&normalized) {
+            return Ok(None);
+        }
+        Ok(Some(self.host_table_id(&normalized.to_ascii_lowercase())))
     }
 
     fn emit_route_match(&mut self, route: &Route) -> Result<String> {
@@ -2893,26 +3001,32 @@ impl Generator {
         validate_reverse_proxy_fields(&handler.config, &mut self.ignored_warnings)?;
         let proxy_id = self.next_id();
         let skip_key = format!("zs.caddy.reverse_proxy.skip.{proxy_id}");
+        let handle_response = handler
+            .config
+            .get("handle_response")
+            .filter(|value| !value.is_null());
         self.line("{");
         self.indent += 1;
-        self.line(&format!("char reverse_proxy_skip_{proxy_id}[2];"));
-        self.line(&format!(
-            "zs_s64 reverse_proxy_skip_{proxy_id}_raw = zs_meta_get({}, {}, reverse_proxy_skip_{proxy_id}, sizeof(reverse_proxy_skip_{proxy_id}));",
-            c_str(&skip_key),
-            skip_key.len()
-        ));
-        self.line(&format!(
-            "if (reverse_proxy_skip_{proxy_id}_raw > 0 && (zs_u64)reverse_proxy_skip_{proxy_id}_raw < sizeof(reverse_proxy_skip_{proxy_id}) && zs_caddy_eq(reverse_proxy_skip_{proxy_id}, zs_caddy_clamp_len(reverse_proxy_skip_{proxy_id}_raw, sizeof(reverse_proxy_skip_{proxy_id})), \"1\", 1)) {{"
-        ));
-        self.indent += 1;
-        self.line(&format!(
-            "zs_meta_set({}, {}, ZS_STR(\"0\"));",
-            c_str(&skip_key),
-            skip_key.len()
-        ));
-        self.indent -= 1;
-        self.line("} else {");
-        self.indent += 1;
+        if handle_response.is_some() {
+            self.line(&format!("char reverse_proxy_skip_{proxy_id}[2];"));
+            self.line(&format!(
+                "zs_s64 reverse_proxy_skip_{proxy_id}_raw = zs_meta_get({}, {}, reverse_proxy_skip_{proxy_id}, sizeof(reverse_proxy_skip_{proxy_id}));",
+                c_str(&skip_key),
+                skip_key.len()
+            ));
+            self.line(&format!(
+                "if (reverse_proxy_skip_{proxy_id}_raw > 0 && (zs_u64)reverse_proxy_skip_{proxy_id}_raw < sizeof(reverse_proxy_skip_{proxy_id}) && zs_caddy_eq(reverse_proxy_skip_{proxy_id}, zs_caddy_clamp_len(reverse_proxy_skip_{proxy_id}_raw, sizeof(reverse_proxy_skip_{proxy_id})), \"1\", 1)) {{"
+            ));
+            self.indent += 1;
+            self.line(&format!(
+                "zs_meta_set({}, {}, ZS_STR(\"0\"));",
+                c_str(&skip_key),
+                skip_key.len()
+            ));
+            self.indent -= 1;
+            self.line("} else {");
+            self.indent += 1;
+        }
         let upstreams = handler
             .config
             .get("upstreams")
@@ -2931,10 +3045,6 @@ impl Generator {
         let headers = handler
             .config
             .get("headers")
-            .filter(|value| !value.is_null());
-        let handle_response = handler
-            .config
-            .get("handle_response")
             .filter(|value| !value.is_null());
         let transport_host_default = reverse_proxy_transport_sets_host(&url);
         if let Some(rewrite) = handler
@@ -2980,6 +3090,30 @@ impl Generator {
         if let Some(handle_response) = handle_response {
             self.emit_reverse_proxy_handle_response(handle_response, &skip_key)?;
         }
+        let default_forwarded =
+            self.reverse_proxy_uses_default_forwarded(handler.config.get("trusted_proxies"))?;
+        if prepared_url.is_none()
+            && default_forwarded
+            && !reverse_proxy_transport_compression_off(handler.config.get("transport"))
+            && !transport_host_default
+            && headers.is_none()
+            && handle_response.is_none()
+        {
+            let helper = if self.simple_host_route_switch {
+                "zs_caddy_simple_host_reverse_proxy"
+            } else {
+                "zs_caddy_simple_reverse_proxy"
+            };
+            self.line(&format!("{helper}({}, {});", c_str(&url), url.len()));
+            self.line("return 0;");
+            if handle_response.is_some() {
+                self.indent -= 1;
+                self.line("}");
+            }
+            self.indent -= 1;
+            self.line("}");
+            return Ok(true);
+        }
         self.line("zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy\"), ZS_STR(\"1\"));");
         if reverse_proxy_transport_compression_off(handler.config.get("transport")) {
             self.line(
@@ -3006,8 +3140,10 @@ impl Generator {
             ));
             self.line("return 0;");
         }
-        self.indent -= 1;
-        self.line("}");
+        if handle_response.is_some() {
+            self.indent -= 1;
+            self.line("}");
+        }
         self.indent -= 1;
         self.line("}");
         Ok(handle_response.is_none())
@@ -3636,6 +3772,12 @@ impl Generator {
     }
 
     fn emit_caddy_forwarded_headers(&mut self, trusted_proxies: Option<&Value>) -> Result<()> {
+        if self.reverse_proxy_uses_default_forwarded(trusted_proxies)? {
+            self.line(
+                "zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy.forwarded\"), ZS_STR(\"default\"));",
+            );
+            return Ok(());
+        }
         let trusted_proxies = reverse_proxy_trusted_proxy_ranges(trusted_proxies)?;
         let server_trusted_proxies = self
             .client_ip_config
@@ -3671,6 +3813,22 @@ impl Generator {
             config.len()
         ));
         Ok(())
+    }
+
+    fn reverse_proxy_uses_default_forwarded(
+        &self,
+        trusted_proxies: Option<&Value>,
+    ) -> Result<bool> {
+        let trusted_proxies = reverse_proxy_trusted_proxy_ranges(trusted_proxies)?;
+        let server_trusted_proxies_empty = self
+            .client_ip_config
+            .as_ref()
+            .is_none_or(|config| config.trusted_ranges.is_empty());
+        let server_trusted_unix = self
+            .client_ip_config
+            .as_ref()
+            .is_some_and(|config| config.trusted_unix);
+        Ok(trusted_proxies.is_empty() && server_trusted_proxies_empty && !server_trusted_unix)
     }
 
     fn emit_request_body(&mut self, handler: &Handler) -> Result<bool> {
@@ -10304,7 +10462,7 @@ mod tests {
         assert!(c.contains("zs_req_set_header(\"X-Test\""));
         assert!(c.contains("zs_caddy_response_headers("));
         assert!(c.contains("zs_caddy_set_path_preserve_query(\"/upstream\""));
-        assert!(c.contains("zs_caddy_reverse_proxy_forwarded("));
+        assert!(c.contains("zs.caddy.reverse_proxy.forwarded"));
         assert!(c.contains("zs_caddy_reverse_proxy_url(\"http://127.0.0.1:9000\""));
         assert!(c.contains("zs_reverse_proxy(reverse_proxy_url_"));
     }
@@ -10326,7 +10484,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(
-            c.contains("zs_reverse_proxy(\"unix//run/docker.sock\", 21);"),
+            c.contains("zs_caddy_simple_reverse_proxy(\"unix//run/docker.sock\", 21);"),
             "{c}"
         );
         assert!(!c.contains("http://unix//run/docker.sock"), "{c}");
@@ -10599,7 +10757,7 @@ mod tests {
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_caddy_reverse_proxy_rewrite("));
         assert!(c.contains("\\\"uri\\\":\\\"/backend{http.request.uri.prefixed_query}\\\""));
-        assert!(c.contains("zs_reverse_proxy(\"http://127.0.0.1:9000\""));
+        assert!(c.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:9000\""));
     }
 
     #[test]
@@ -11392,7 +11550,7 @@ mod tests {
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(
-            code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""),
+            code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""),
             "{code}"
         );
         assert!(!code.contains("zs_caddy_reverse_proxy_rewrite("), "{code}");
@@ -11418,7 +11576,7 @@ mod tests {
             let (code, warnings) = compile_caddy_json_collecting(&source)
                 .unwrap_or_else(|err| panic!("{health_checks}: {err}"));
             assert!(warnings.is_empty(), "{health_checks}: {warnings:?}");
-            assert!(code.contains("zs_reverse_proxy("), "{code}");
+            assert!(code.contains("zs_caddy_simple_reverse_proxy("), "{code}");
         }
     }
 
@@ -12047,7 +12205,10 @@ mod tests {
                     .any(|w| w.contains(&format!("ignoring reverse_proxy field \"{field}\""))),
                 "{field}: {warnings:?}"
             );
-            assert!(code.contains("zs_reverse_proxy("), "{field}: {code}");
+            assert!(
+                code.contains("zs_caddy_simple_reverse_proxy("),
+                "{field}: {code}"
+            );
             assert!(!code.contains("warning:"), "{field}: {code}");
         }
     }
@@ -12148,7 +12309,7 @@ mod tests {
         }"#;
 
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
-        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
         for field in [
             "read_timeout",
             "write_timeout",
@@ -12187,7 +12348,7 @@ mod tests {
         assert!(adapter_warnings.is_empty(), "{adapter_warnings:?}");
 
         let (code, compiler_warnings) = compile_caddy_json_collecting(&json.to_string()).unwrap();
-        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
         for field in [
             "read_timeout",
             "write_timeout",
@@ -12268,7 +12429,7 @@ mod tests {
 
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
     }
 
     #[test]
@@ -12456,7 +12617,7 @@ mod tests {
 
             let c = compile_caddy_json(&source)
                 .unwrap_or_else(|err| panic!("max_requests {max_requests}: {err}"));
-            assert!(c.contains("zs_reverse_proxy("), "{c}");
+            assert!(c.contains("zs_caddy_simple_reverse_proxy("), "{c}");
         }
     }
 

@@ -719,7 +719,9 @@ async fn flush_out<IO: AsyncWriteRent>(bridge: &mut MemBridge, io: &mut IO) -> R
         return Ok(());
     }
     let out = std::mem::take(&mut bridge.outbound);
-    let (res, _) = io.write_all(out).await;
+    let (res, mut out) = io.write_all(out).await;
+    out.clear();
+    bridge.outbound = out;
     res.context("writing TLS records to socket")?;
     io.flush().await.context("flushing socket")?;
     Ok(())
@@ -867,7 +869,9 @@ impl<IO: AsyncWriteRent> BoringStream<IO> {
             return Ok(());
         }
         let out = std::mem::take(&mut self.ssl.get_mut().outbound);
-        let (res, _) = self.io.write_all(out).await;
+        let (res, mut out) = self.io.write_all(out).await;
+        out.clear();
+        self.ssl.get_mut().outbound = out;
         res.map(|_| ())
     }
 }

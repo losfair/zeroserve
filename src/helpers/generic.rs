@@ -562,3 +562,49 @@ pub fn h_reverse_proxy(
         Ok(0)
     })
 }
+
+pub fn h_caddy_simple_reverse_proxy(
+    scope: &HelperScope,
+    url_ptr: u64,
+    url_len: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) -> Result<u64, ()> {
+    let url = read_utf8(scope, url_ptr, url_len)?;
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(());
+    }
+    with_ectx(scope, |ctx| {
+        if ctx.response.is_some() || ctx.reverse_proxy.is_some() {
+            return Err(());
+        }
+        ctx.reverse_proxy = Some(url.to_string());
+        let mut metadata = ctx.metadata.borrow_mut();
+        metadata.insert("zs.caddy.reverse_proxy".to_string(), "1".to_string());
+        metadata.insert(
+            "zs.caddy.reverse_proxy.forwarded".to_string(),
+            "default".to_string(),
+        );
+        Ok(0)
+    })
+}
+
+pub fn h_caddy_simple_host_reverse_proxy(
+    scope: &HelperScope,
+    url_ptr: u64,
+    url_len: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+) -> Result<u64, ()> {
+    h_caddy_simple_reverse_proxy(scope, url_ptr, url_len, a, b, c)?;
+    with_ectx(scope, |ctx| {
+        ctx.metadata.borrow_mut().insert(
+            "zs.caddy.simple_host_reverse_proxy".to_string(),
+            "1".to_string(),
+        );
+        Ok(0)
+    })
+}

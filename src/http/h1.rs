@@ -83,6 +83,10 @@ impl Request {
     pub fn into_parts(self) -> (RequestHead, Body) {
         (self.head, self.body)
     }
+
+    pub fn from_parts(head: RequestHead, body: Body) -> Self {
+        Self { head, body }
+    }
 }
 
 pub struct Response {
@@ -94,6 +98,18 @@ impl Response {
     pub fn into_parts(self) -> (ResponseHead, Body) {
         (self.head, self.body)
     }
+}
+
+pub enum ResponseRead {
+    RawFixed(RawFixedResponse),
+    Parsed(Response),
+}
+
+pub struct RawFixedResponse {
+    pub status: u16,
+    pub can_reuse: bool,
+    pub head: Vec<u8>,
+    pub body: Body,
 }
 
 pub enum Body {
@@ -361,12 +377,17 @@ impl<IO> H1Connection<IO> {
         }
     }
 
-    pub fn io_mut(&mut self) -> Result<&mut IO, HttpError> {
-        self.io.as_mut().ok_or(HttpError::MissingIo)
+    pub fn with_buffer(io: IO, buf: Vec<u8>) -> Self {
+        Self {
+            io: Some(io),
+            buf,
+            pos: 0,
+            scratch: None,
+        }
     }
 
-    pub fn io_ref(&self) -> Option<&IO> {
-        self.io.as_ref()
+    pub fn io_mut(&mut self) -> Result<&mut IO, HttpError> {
+        self.io.as_mut().ok_or(HttpError::MissingIo)
     }
 
     pub fn take_io(&mut self) -> Option<(IO, Vec<u8>)> {
@@ -476,6 +497,25 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<usize, HttpError> {
 impl<IO: AsyncReadRent> H1Connection<IO> {
     async fn read_more(&mut self) -> Result<usize, HttpError> {
         let io = self.io.as_mut().ok_or(HttpError::MissingIo)?;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            let mut buf = std::mem::take(&mut self.buf);
+            buf.resize(READ_BUF_SIZE, 0);
+            let (res, mut buf) = io.read(buf).await;
+            match res {
+                Ok(n) => {
+                    buf.truncate(n);
+                    self.buf = buf;
+                    return Ok(n);
+                }
+                Err(err) => {
+                    buf.clear();
+                    self.buf = buf;
+                    return Err(err.into());
+                }
+            }
+        }
         let mut buf = self.scratch.take().unwrap_or_default();
         buf.resize(READ_BUF_SIZE, 0);
         let (res, buf) = io.read(buf).await;
@@ -586,6 +626,25 @@ impl<IO: AsyncReadRent> H1Connection<IO> {
     /// buffer is retained on the connection and reused across calls.
     async fn fill_buf(&mut self, max_read_size: usize) -> Result<usize, HttpError> {
         let io = self.io.as_mut().ok_or(HttpError::MissingIo)?;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            let mut buf = std::mem::take(&mut self.buf);
+            buf.resize(max_read_size.max(1), 0);
+            let (res, mut buf) = io.read(buf).await;
+            return match res {
+                Ok(n) => {
+                    buf.truncate(n);
+                    self.buf = buf;
+                    Ok(n)
+                }
+                Err(err) => {
+                    buf.clear();
+                    self.buf = buf;
+                    Err(err.into())
+                }
+            };
+        }
         let mut buf = self.scratch.take().unwrap_or_default();
         buf.resize(max_read_size.max(1), 0);
         let (res, buf) = io.read(buf).await;
@@ -648,6 +707,157 @@ impl<IO: AsyncReadRent> H1Connection<IO> {
         let body = response_body_from_headers(&head);
         Ok(Some(Response { head, body }))
     }
+
+    pub async fn next_response_fast(&mut self) -> Result<Option<ResponseRead>, HttpError> {
+        let raw = match self.read_headers().await? {
+            Some(raw) => raw,
+            None => return Ok(None),
+        };
+        match raw_fixed_response(&raw) {
+            Ok(Some(response)) => Ok(Some(ResponseRead::RawFixed(response))),
+            Ok(None) => {
+                let head = parse_response_head(&raw)?;
+                let body = response_body_from_headers(&head);
+                Ok(Some(ResponseRead::Parsed(Response { head, body })))
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn raw_fixed_response(raw: &[u8]) -> Result<Option<RawFixedResponse>, HttpError> {
+    let Some(line_end) = raw.windows(2).position(|x| x == b"\r\n") else {
+        return Err(HttpError::InvalidResponse("missing status line"));
+    };
+    let status_line = &raw[..line_end];
+    let mut parts = status_line.split(|b| *b == b' ');
+    let version = parts
+        .next()
+        .ok_or(HttpError::InvalidResponse("missing version"))?;
+    let status = parts
+        .find(|part| !part.is_empty())
+        .ok_or(HttpError::InvalidResponse("missing status"))?;
+    if status.len() != 3 || !status.iter().all(u8::is_ascii_digit) {
+        return Err(HttpError::InvalidResponse("invalid status"));
+    }
+    let status = ((status[0] - b'0') as u16) * 100
+        + ((status[1] - b'0') as u16) * 10
+        + (status[2] - b'0') as u16;
+    if version != b"HTTP/1.1" || !raw_status_allows_body(status) {
+        return Ok(None);
+    }
+
+    let mut content_length = None;
+    let mut connection_close = false;
+    let mut out = Vec::with_capacity(raw.len() + 2);
+    out.extend_from_slice(status_line);
+    out.extend_from_slice(b"\r\n");
+
+    let mut pos = line_end + 2;
+    while pos < raw.len() {
+        let (line, next_pos) =
+            if let Some(rel_end) = raw[pos..].windows(2).position(|x| x == b"\r\n") {
+                (&raw[pos..pos + rel_end], pos + rel_end + 2)
+            } else {
+                (&raw[pos..], raw.len())
+            };
+        pos = next_pos;
+        if line.is_empty() {
+            continue;
+        }
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            return Err(HttpError::InvalidHeader);
+        };
+        let name = trim_ascii(&line[..colon]);
+        let value = trim_ascii(&line[colon + 1..]);
+        if header_name_eq(name, b"connection") {
+            connection_close = header_value_has_token(value, b"close");
+        }
+        if header_name_eq(name, b"content-length") {
+            content_length = Some(parse_u64_ascii(value).ok_or(HttpError::InvalidHeader)?);
+        }
+        if is_hop_header_name(name) {
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+
+    let Some(content_length) = content_length else {
+        return Ok(None);
+    };
+    if content_length == 0 {
+        return Ok(None);
+    }
+    out.extend_from_slice(b"\r\n");
+    Ok(Some(RawFixedResponse {
+        status,
+        can_reuse: !connection_close,
+        head: out,
+        body: Body::Fixed {
+            remaining: content_length,
+        },
+    }))
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn header_name_eq(name: &[u8], expected: &[u8]) -> bool {
+    name.len() == expected.len()
+        && name
+            .iter()
+            .zip(expected)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn header_value_has_token(value: &[u8], token: &[u8]) -> bool {
+    value.split(|b| *b == b',').map(trim_ascii).any(|part| {
+        part.len() == token.len()
+            && part
+                .iter()
+                .zip(token)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+fn parse_u64_ascii(value: &[u8]) -> Option<u64> {
+    let mut out = 0u64;
+    for b in value {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(out)
+}
+
+fn is_hop_header_name(name: &[u8]) -> bool {
+    [
+        b"alt-svc".as_slice(),
+        b"connection",
+        b"proxy-connection",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"keep-alive",
+        b"te",
+        b"trailer",
+        b"transfer-encoding",
+        b"upgrade",
+    ]
+    .iter()
+    .any(|candidate| header_name_eq(name, candidate))
+}
+
+fn raw_status_allows_body(status: u16) -> bool {
+    !(status < 200 || status == 204 || status == 304)
 }
 
 pub fn request_body_from_headers(head: &RequestHead) -> Body {
@@ -820,31 +1030,28 @@ pub async fn write_chunk_end(w: &mut impl AsyncWriteRent) -> Result<(), HttpErro
 }
 
 fn parse_request_head(raw: &[u8]) -> Result<RequestHead, HttpError> {
-    let text = std::str::from_utf8(raw).map_err(|_| HttpError::InvalidRequest("non-utf8"))?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or(HttpError::InvalidRequest("missing request line"))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or(HttpError::InvalidRequest("missing method"))?;
-    let uri = parts
-        .next()
-        .ok_or(HttpError::InvalidRequest("missing uri"))?;
-    let version = parts
-        .next()
-        .ok_or(HttpError::InvalidRequest("missing version"))?;
-    if parts.next().is_some() {
+    let line_end = raw
+        .windows(2)
+        .position(|x| x == b"\r\n")
+        .unwrap_or(raw.len());
+    let request_line = &raw[..line_end];
+    let (method, rest) =
+        split_ascii_word(request_line).ok_or(HttpError::InvalidRequest("missing method"))?;
+    let (uri, rest) = split_ascii_word(rest).ok_or(HttpError::InvalidRequest("missing uri"))?;
+    let (version, rest) =
+        split_ascii_word(rest).ok_or(HttpError::InvalidRequest("missing version"))?;
+    if !trim_ascii(rest).is_empty() {
         return Err(HttpError::InvalidRequest("extra request line fields"));
     }
-    let method = Method::from_bytes(method.as_bytes())
-        .map_err(|_| HttpError::InvalidRequest("invalid method"))?;
+    let method =
+        Method::from_bytes(method).map_err(|_| HttpError::InvalidRequest("invalid method"))?;
+    let uri = std::str::from_utf8(uri).map_err(|_| HttpError::InvalidRequest("non-utf8 uri"))?;
     let uri: Uri = uri
         .parse()
         .map_err(|_| HttpError::InvalidRequest("invalid uri"))?;
-    let version = parse_version(version).ok_or(HttpError::InvalidRequest("invalid version"))?;
-    let mut headers = parse_headers(lines)?;
+    let version =
+        parse_version_bytes(version).ok_or(HttpError::InvalidRequest("invalid version"))?;
+    let mut headers = parse_headers_bytes(raw.get(line_end + 2..).unwrap_or_default())?;
     normalize_cookie_headers(&mut headers);
 
     Ok(RequestHead {
@@ -854,6 +1061,25 @@ fn parse_request_head(raw: &[u8]) -> Result<RequestHead, HttpError> {
         headers,
         tls: false,
     })
+}
+
+fn split_ascii_word(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let value = trim_ascii_start(value);
+    if value.is_empty() {
+        return None;
+    }
+    let end = value
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(value.len());
+    Some((&value[..end], &value[end..]))
+}
+
+fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    value
 }
 
 fn parse_response_head(raw: &[u8]) -> Result<ResponseHead, HttpError> {
@@ -906,10 +1132,45 @@ where
     Ok(headers)
 }
 
+fn parse_headers_bytes(mut raw: &[u8]) -> Result<HeaderMap, HttpError> {
+    let mut headers = HeaderMap::new();
+    while !raw.is_empty() {
+        let (line, rest) = if let Some(pos) = raw.windows(2).position(|x| x == b"\r\n") {
+            (&raw[..pos], &raw[pos + 2..])
+        } else {
+            (raw, &[][..])
+        };
+        raw = rest;
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            return Err(HttpError::InvalidHeader);
+        };
+        let name = trim_ascii(&line[..colon]);
+        if name.is_empty() {
+            return Err(HttpError::InvalidHeader);
+        }
+        let value = trim_ascii(&line[colon + 1..]);
+        let name = HeaderName::from_bytes(name).map_err(|_| HttpError::InvalidHeader)?;
+        let value = HttpHeaderValue::from_bytes(value).map_err(|_| HttpError::InvalidHeader)?;
+        headers.append(name, value);
+    }
+    Ok(headers)
+}
+
 fn parse_version(value: &str) -> Option<Version> {
     match value {
         "HTTP/1.1" => Some(Version::HTTP_11),
         "HTTP/1.0" => Some(Version::HTTP_10),
+        _ => None,
+    }
+}
+
+fn parse_version_bytes(value: &[u8]) -> Option<Version> {
+    match value {
+        b"HTTP/1.1" => Some(Version::HTTP_11),
+        b"HTTP/1.0" => Some(Version::HTTP_10),
         _ => None,
     }
 }

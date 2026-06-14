@@ -344,6 +344,8 @@ def run_wrk(host: str, path: str, duration: int) -> dict:
 
 
 def main():
+    global TLS, PROXY, SERVER_THREADS
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
     ap.add_argument("--sites", type=int, default=256)
@@ -376,11 +378,28 @@ def main():
         default="tcc",
         help="eBPF C compiler used by zeroserve --caddy",
     )
+    ap.add_argument(
+        "--preempt-timer-interval-ms",
+        type=int,
+        default=2,
+        help="zeroserve eBPF async preemption timer interval",
+    )
+    ap.add_argument(
+        "--nginx-binary",
+        default="/usr/sbin/nginx",
+        help="nginx binary for --server nginx",
+    )
+    ap.add_argument(
+        "--server-threads",
+        type=int,
+        default=SERVER_THREADS,
+        help="server worker threads/processes (zeroserve --threads, Caddy GOMAXPROCS, nginx worker_processes)",
+    )
     args = ap.parse_args()
 
-    global TLS, PROXY
     TLS = args.tls
     PROXY = args.proxy
+    SERVER_THREADS = args.server_threads
 
     if args.server == "zeroserve" and not BINARY.exists():
         sys.exit(f"missing {BINARY}; run cargo build --release first")
@@ -445,7 +464,7 @@ def main():
         nginx_conf.write_text(gen_nginx_conf(args.sites, WORKDIR))
         (WORKDIR / "nginx-tmp").mkdir(exist_ok=True)
         cmd = [
-            "nginx",
+            args.nginx_binary,
             "-c",
             str(nginx_conf),
             "-p",
@@ -463,6 +482,8 @@ def main():
             args.ebpf_compiler,
             "--threads",
             str(SERVER_THREADS),
+            "--preempt-timer-interval-ms",
+            str(args.preempt_timer_interval_ms),
             "--disable-request-logging",
         ]
         if TLS:
@@ -488,7 +509,15 @@ def main():
         backend_conf.write_text(gen_backend_conf(WORKDIR))
         (WORKDIR / "nginx-tmp").mkdir(exist_ok=True)
         backend_proc = subprocess.Popen(
-            ["nginx", "-c", str(backend_conf), "-p", str(WORKDIR), "-g", "daemon off;"],
+            [
+                args.nginx_binary,
+                "-c",
+                str(backend_conf),
+                "-p",
+                str(WORKDIR),
+                "-g",
+                "daemon off;",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -546,7 +575,11 @@ def main():
         "duration": args.duration,
         "tls": TLS,
         "proxy": PROXY,
+        "server_threads": SERVER_THREADS,
         "ebpf_compiler": args.ebpf_compiler if args.server == "zeroserve" else None,
+        "preempt_timer_interval_ms": (
+            args.preempt_timer_interval_ms if args.server == "zeroserve" else None
+        ),
         "results": results,
     }
     with open(Path(__file__).parent / "results.jsonl", "a") as f:
