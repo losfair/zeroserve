@@ -363,10 +363,6 @@ static SCRIPT_HELPERS: &[(&str, Helper)] = &[
         helpers::h_caddy_reverse_proxy_rewrite,
     ),
     ("zs_reverse_proxy", helpers::h_reverse_proxy),
-    (
-        "zs_caddy_simple_reverse_proxy",
-        helpers::h_caddy_simple_reverse_proxy,
-    ),
     ("zs_file_server", helpers::h_file_server),
     (
         "zs_aws_v4_authorization_header",

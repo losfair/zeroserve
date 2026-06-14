@@ -3130,29 +3130,6 @@ impl Generator {
         if let Some(handle_response) = handle_response {
             self.emit_reverse_proxy_handle_response(handle_response, &skip_key)?;
         }
-        let default_forwarded =
-            self.reverse_proxy_uses_default_forwarded(handler.config.get("trusted_proxies"))?;
-        if prepared_url.is_none()
-            && default_forwarded
-            && !reverse_proxy_transport_compression_off(handler.config.get("transport"))
-            && !transport_host_default
-            && headers.is_none()
-            && handle_response.is_none()
-        {
-            self.line(&format!(
-                "zs_caddy_simple_reverse_proxy({}, {});",
-                c_str(&url),
-                url.len()
-            ));
-            self.line("return 0;");
-            if handle_response.is_some() {
-                self.indent -= 1;
-                self.line("}");
-            }
-            self.indent -= 1;
-            self.line("}");
-            return Ok(true);
-        }
         self.line("zs_meta_set(ZS_STR(\"zs.caddy.reverse_proxy\"), ZS_STR(\"1\"));");
         if reverse_proxy_transport_compression_off(handler.config.get("transport")) {
             self.line(
@@ -10531,7 +10508,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(
-            c.contains("zs_caddy_simple_reverse_proxy(\"unix//run/docker.sock\", 21);"),
+            c.contains("zs_reverse_proxy(\"unix//run/docker.sock\", 21);"),
             "{c}"
         );
         assert!(!c.contains("http://unix//run/docker.sock"), "{c}");
@@ -10804,7 +10781,7 @@ mod tests {
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_caddy_reverse_proxy_rewrite("));
         assert!(c.contains("\\\"uri\\\":\\\"/backend{http.request.uri.prefixed_query}\\\""));
-        assert!(c.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:9000\""));
+        assert!(c.contains("zs_reverse_proxy(\"http://127.0.0.1:9000\""));
     }
 
     #[test]
@@ -11597,7 +11574,7 @@ mod tests {
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(
-            code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""),
+            code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""),
             "{code}"
         );
         assert!(!code.contains("zs_caddy_reverse_proxy_rewrite("), "{code}");
@@ -11623,7 +11600,7 @@ mod tests {
             let (code, warnings) = compile_caddy_json_collecting(&source)
                 .unwrap_or_else(|err| panic!("{health_checks}: {err}"));
             assert!(warnings.is_empty(), "{health_checks}: {warnings:?}");
-            assert!(code.contains("zs_caddy_simple_reverse_proxy("), "{code}");
+            assert!(code.contains("zs_reverse_proxy("), "{code}");
         }
     }
 
@@ -12252,10 +12229,7 @@ mod tests {
                     .any(|w| w.contains(&format!("ignoring reverse_proxy field \"{field}\""))),
                 "{field}: {warnings:?}"
             );
-            assert!(
-                code.contains("zs_caddy_simple_reverse_proxy("),
-                "{field}: {code}"
-            );
+            assert!(code.contains("zs_reverse_proxy("), "{field}: {code}");
             assert!(!code.contains("warning:"), "{field}: {code}");
         }
     }
@@ -12356,7 +12330,7 @@ mod tests {
         }"#;
 
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
-        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
         for field in [
             "read_timeout",
             "write_timeout",
@@ -12395,7 +12369,7 @@ mod tests {
         assert!(adapter_warnings.is_empty(), "{adapter_warnings:?}");
 
         let (code, compiler_warnings) = compile_caddy_json_collecting(&json.to_string()).unwrap();
-        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
         for field in [
             "read_timeout",
             "write_timeout",
@@ -12476,7 +12450,7 @@ mod tests {
 
         let (code, warnings) = compile_caddy_json_collecting(source).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(code.contains("zs_caddy_simple_reverse_proxy(\"http://127.0.0.1:8080\""));
+        assert!(code.contains("zs_reverse_proxy(\"http://127.0.0.1:8080\""));
     }
 
     #[test]
@@ -12664,7 +12638,7 @@ mod tests {
 
             let c = compile_caddy_json(&source)
                 .unwrap_or_else(|err| panic!("max_requests {max_requests}: {err}"));
-            assert!(c.contains("zs_caddy_simple_reverse_proxy("), "{c}");
+            assert!(c.contains("zs_reverse_proxy("), "{c}");
         }
     }
 

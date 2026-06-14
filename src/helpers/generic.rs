@@ -562,27 +562,3 @@ pub fn h_reverse_proxy(
         Ok(0)
     })
 }
-
-pub fn h_caddy_simple_reverse_proxy(
-    scope: &HelperScope,
-    url_ptr: u64,
-    url_len: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) -> Result<u64, ()> {
-    let url = read_utf8(scope, url_ptr, url_len)?;
-    let url = url.trim();
-    if url.is_empty() {
-        return Err(());
-    }
-    with_ectx(scope, |ctx| {
-        if ctx.response.is_some() || ctx.reverse_proxy.is_some() {
-            return Err(());
-        }
-        ctx.reverse_proxy = Some(url.to_string());
-        ctx.caddy_reverse_proxy = true;
-        ctx.caddy_default_forwarded = true;
-        Ok(0)
-    })
-}
