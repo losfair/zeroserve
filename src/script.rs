@@ -558,8 +558,12 @@ impl ScriptRequest {
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
-        self.headers.get(&name).map(String::as_str)
+        if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+            self.headers.get(name).map(String::as_str)
+        } else {
+            let name = name.to_ascii_lowercase();
+            self.headers.get(&name).map(String::as_str)
+        }
     }
 
     pub fn query_param(&self, name: &str) -> Option<&str> {

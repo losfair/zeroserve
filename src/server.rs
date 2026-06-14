@@ -3978,26 +3978,16 @@ fn build_script_request(
     transfer_encodings: Vec<String>,
     connection: ConnectionInfo,
 ) -> ScriptRequest {
-    let mut headers = HashMap::new();
-    let mut header_values = HashMap::<String, Vec<String>>::new();
-    for name in head.headers.keys() {
-        let lower_name = name.as_str().to_ascii_lowercase();
-        if header_values.contains_key(&lower_name) {
+    let mut headers = HashMap::with_capacity(head.headers.len());
+    let mut header_values = HashMap::<String, Vec<String>>::with_capacity(head.headers.len());
+    for (name, value) in head.headers.iter() {
+        let Ok(value) = value.to_str() else {
             continue;
-        }
-        let values = head
-            .headers
-            .get_all(name)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if let Some(value) = values.last() {
-            headers.insert(lower_name.clone(), value.clone());
-        }
-        if !values.is_empty() {
-            header_values.insert(lower_name, values);
-        }
+        };
+        let lower_name = name.as_str().to_ascii_lowercase();
+        let value = value.to_string();
+        headers.insert(lower_name.clone(), value.clone());
+        header_values.entry(lower_name).or_default().push(value);
     }
 
     // Convert NormalizedPath to sanitized + urlencoded path string (with leading /).
