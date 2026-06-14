@@ -1,3 +1,4 @@
 /target
 *.swp
 *.pem
+/benchmark/routing/results.jsonl
