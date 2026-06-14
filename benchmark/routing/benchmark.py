@@ -395,6 +395,11 @@ def main():
         default=SERVER_THREADS,
         help="server worker threads/processes (zeroserve --threads, Caddy GOMAXPROCS, nginx worker_processes)",
     )
+    ap.add_argument(
+        "--results-jsonl",
+        default=str(Path(__file__).parent / "results.jsonl"),
+        help="path to append benchmark result records as JSON lines",
+    )
     args = ap.parse_args()
 
     TLS = args.tls
@@ -582,7 +587,7 @@ def main():
         ),
         "results": results,
     }
-    with open(Path(__file__).parent / "results.jsonl", "a") as f:
+    with open(args.results_jsonl, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 

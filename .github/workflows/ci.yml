@@ -108,6 +108,62 @@ jobs:
         run: deno test -A --parallel
 
   # ---------------------------------------------------------------------------
+  # Small routing benchmark matrix used as a performance smoke test. This keeps
+  # runtime bounded while covering the optimized N=8 / 2-thread / 10ms
+  # preemption shape across servers, compilers, protocols, and proxy mode.
+  # ---------------------------------------------------------------------------
+  benchmark:
+    name: Routing benchmarks (n=8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build, benchmark, and toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang llvm libclang-dev pkg-config \
+            nginx openssl wrk
+          echo "$(llvm-config --bindir)" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmark
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install pinned Caddy
+        env:
+          CADDY_COMMIT: d3986f824d2e82310405d5ca520d61f3e2e701c9
+        run: |
+          go install "github.com/caddyserver/caddy/v2/cmd/caddy@${CADDY_COMMIT}"
+          echo "CADDY_BIN=$(go env GOPATH)/bin/caddy" >> "$GITHUB_ENV"
+
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Add benchmark hostnames
+        run: |
+          echo "127.0.0.1 host0000.bench host0007.bench nomatch.bench" | sudo tee -a /etc/hosts
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Routing benchmark matrix
+        run: |
+          python3 benchmark/routing/ci_matrix.py \
+            --duration 3 \
+            --runs 1 \
+            --caddy-binary "$CADDY_BIN" \
+            --nginx-binary /usr/sbin/nginx
+
+  # ---------------------------------------------------------------------------
   # Release binaries for linux/amd64 and linux/arm64, linked against glibc 2.31
   # via cargo-zigbuild. Runs on every push/PR to catch build breaks; artifacts
   # are consumed by the `release` job on tags.
