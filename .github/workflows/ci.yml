@@ -113,9 +113,17 @@ jobs:
   # preemption shape across servers, compilers, protocols, and proxy mode.
   # ---------------------------------------------------------------------------
   benchmark:
-    name: Routing benchmarks (n=8)
-    runs-on: ubuntu-latest
+    name: Routing benchmarks (n=8, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -131,7 +139,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: benchmark
+          key: benchmark-${{ matrix.arch }}
 
       - uses: actions/setup-go@v5
         with:
