@@ -119,6 +119,10 @@ impl<'a> ResponseHookState<'a> {
         }
     }
 
+    pub(super) fn has_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
     pub(super) async fn run(
         &self,
         status: StatusCode,
@@ -190,10 +194,6 @@ impl<'a> ResponseHookState<'a> {
                 joined,
             );
         }
-    }
-
-    pub(super) fn has_hooks(&self) -> bool {
-        !self.hooks.is_empty()
     }
 }
 

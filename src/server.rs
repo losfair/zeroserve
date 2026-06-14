@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    io::ErrorKind,
+    io::{ErrorKind, Write as _},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
@@ -398,7 +398,7 @@ async fn run_tls_listener(
                             )
                             .await;
                         }
-                    } else if let Err(err) = handle_h1_connection(
+                    } else if let Err(err) = handle_h1_connection_unsplit_fast(
                         &mut conn_hup,
                         tls_stream,
                         reported_peer,
@@ -563,7 +563,130 @@ where
     H: Future<Output = ()> + Unpin + 'static,
 {
     let (r, mut w) = io.into_split();
-    let mut reader = h1::H1Connection::new(r);
+    let reader = h1::H1Connection::new(r);
+    handle_h1_split_loop(
+        hup,
+        reader,
+        &mut w,
+        peer,
+        local,
+        shared,
+        scheme,
+        script_runtime,
+        connection,
+    )
+    .await
+}
+
+async fn handle_h1_connection_unsplit_fast<IO, H>(
+    hup: &mut H,
+    io: IO,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    scheme: Scheme,
+    script_runtime: Rc<ScriptRuntime>,
+    connection: ConnectionInfo,
+) -> Result<()>
+where
+    IO: AsyncReadRent + AsyncWriteRent + Split + 'static,
+    H: Future<Output = ()> + Unpin + 'static,
+{
+    let mut conn = h1::H1Connection::new(io);
+    loop {
+        let result = conn.next_request().await;
+        let request = match result {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(err) => {
+                if matches!(err, HttpError::Io(ref x) if x.kind() == ErrorKind::ConnectionReset
+                    || x.kind() == ErrorKind::UnexpectedEof)
+                    || matches!(err, HttpError::UnexpectedEof)
+                {
+                    break;
+                }
+                eprintln!(
+                    "{} request from {peer} could not be parsed: {err}",
+                    scheme.as_str()
+                );
+                break;
+            }
+        };
+
+        match try_handle_simple_h1_proxy_unsplit(
+            request,
+            &mut conn,
+            &shared,
+            &script_runtime,
+            peer,
+            local,
+            scheme,
+            hup,
+            &connection,
+        )
+        .await
+        {
+            SimpleH1ProxyResult::Handled(continue_conn) => {
+                if !continue_conn {
+                    break;
+                }
+            }
+            SimpleH1ProxyResult::Fallback(request) => {
+                let Some((io, leftover)) = conn.take_io() else {
+                    break;
+                };
+                let (r, mut w) = io.into_split();
+                let reader = h1::H1Connection::with_buffer(r, leftover);
+                let (continue_conn, reader) = handle_request(
+                    request,
+                    reader,
+                    &shared,
+                    &script_runtime,
+                    peer,
+                    local,
+                    scheme,
+                    &mut w,
+                    hup,
+                    &connection,
+                )
+                .await;
+                if continue_conn {
+                    handle_h1_split_loop(
+                        hup,
+                        reader,
+                        &mut w,
+                        peer,
+                        local,
+                        shared,
+                        scheme,
+                        script_runtime,
+                        connection,
+                    )
+                    .await?;
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_h1_split_loop<R, W, H>(
+    hup: &mut H,
+    mut reader: h1::H1Connection<R>,
+    w: &mut W,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    scheme: Scheme,
+    script_runtime: Rc<ScriptRuntime>,
+    connection: ConnectionInfo,
+) -> Result<()>
+where
+    R: AsyncReadRent + 'static,
+    W: AsyncWriteRent,
+    H: Future<Output = ()> + Unpin + 'static,
+{
     loop {
         let result = reader.next_request().await;
         let request = match result {
@@ -592,7 +715,7 @@ where
             peer,
             local,
             scheme,
-            &mut w,
+            w,
             hup,
             &connection,
         )
@@ -603,6 +726,198 @@ where
         }
     }
     Ok(())
+}
+
+enum SimpleH1ProxyResult {
+    Handled(bool),
+    Fallback(Request),
+}
+
+async fn try_handle_simple_h1_proxy_unsplit<IO, H>(
+    req: Request,
+    conn: &mut h1::H1Connection<IO>,
+    shared: &Arc<SharedState>,
+    script_runtime: &Rc<ScriptRuntime>,
+    peer: std::net::SocketAddr,
+    local: std::net::SocketAddr,
+    scheme: Scheme,
+    interrupt: &mut H,
+    connection: &ConnectionInfo,
+) -> SimpleH1ProxyResult
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+    H: Future<Output = ()> + Unpin,
+{
+    let (mut head, body) = req.into_parts();
+    if !matches!(body.hint(), StreamHint::None) {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(head, body));
+    }
+    if !shared.config.disable_request_logging
+        || !shared.config.validate_hostnames.is_empty()
+        || !matches!(head.method, Method::GET | Method::HEAD)
+        || request_authority_sni_mismatch(&head, connection)
+    {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(head, h1::Body::None));
+    }
+
+    head.tls = matches!(scheme, Scheme::Https);
+    let head_only = head.method == Method::HEAD;
+    let original_head = head.clone();
+    let request_id = RequestId::new();
+    let Some(normalized_path) = normalize_request_path(head.uri.path()) else {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
+    };
+    let script_request = build_script_request(
+        request_id.clone(),
+        &head,
+        peer,
+        local,
+        scheme,
+        &normalized_path,
+        Vec::new(),
+        connection.clone(),
+    );
+    let body_source = BodySource::empty();
+    let script_outcome = monoio::select! {
+        x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
+        _ = &mut *interrupt => {
+            async_log(format!("[handle] {}: interrupted\n", request_id).into_bytes()).await;
+            return SimpleH1ProxyResult::Handled(false);
+        }
+    };
+    let script_outcome = match script_outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            async_log(format!("[handle] {}: script runtime: {:?}\n", request_id, err).into_bytes())
+                .await;
+            ScriptOutcome::from_request(build_script_request(
+                request_id.clone(),
+                &head,
+                peer,
+                local,
+                scheme,
+                &normalized_path,
+                Vec::new(),
+                connection.clone(),
+            ))
+        }
+    };
+
+    if let Err(err) = apply_script_request(&mut head, &script_outcome.request) {
+        async_log(
+            format!(
+                "[handle] {}: script request update: {:?}\n",
+                request_id, err
+            )
+            .into_bytes(),
+        )
+        .await;
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
+    }
+    if script_outcome.request.uri_changed()
+        && normalized_script_request_path(&script_outcome.request).is_none()
+    {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
+    }
+
+    let hook_state = if script_outcome.response_hooks.is_empty() {
+        None
+    } else {
+        Some(ResponseHookState::from_outcome(
+            script_runtime,
+            shared,
+            &script_outcome,
+        ))
+    };
+    let encode_state = script_outcome.encode.clone().map(|config| {
+        crate::helpers::compress::EncodeState::from_request_headers(config, &head.headers)
+    });
+    if script_outcome.abort {
+        return SimpleH1ProxyResult::Handled(false);
+    }
+    let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() else {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
+    };
+    if caddy::has_error_routes(&script_outcome)
+        || !can_use_simple_proxy_fast_path(
+            &head,
+            &h1::Body::None,
+            h1::is_websocket_upgrade_request(&head),
+            Some(&script_outcome.early_response_headers),
+            &script_outcome.metadata,
+            hook_state.as_ref(),
+            script_outcome.request.proxy_method(),
+            script_outcome.request.proxy_uri(),
+            script_outcome.request.proxy_headers(),
+            encode_state.as_ref(),
+        )
+    {
+        return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
+    }
+
+    let res = match conn.io_mut() {
+        Ok(w) => {
+            reverse_proxy_simple_request(
+                proxy_url,
+                &head,
+                w,
+                head_only,
+                peer,
+                scheme,
+                caddy_uses_default_forwarded(
+                    &script_outcome.metadata,
+                    hook_state.as_ref(),
+                    script_outcome.caddy_default_forwarded,
+                ),
+            )
+            .await
+        }
+        Err(err) => Err(anyhow!("client connection missing io: {err}")),
+    };
+    match res {
+        Ok(proxy_outcome) => {
+            log_caddy_access(
+                shared,
+                &head,
+                peer,
+                scheme,
+                proxy_outcome.send.status,
+                &script_outcome.metadata,
+            )
+            .await;
+            SimpleH1ProxyResult::Handled(proxy_outcome.send.keep_client)
+        }
+        Err(err) => {
+            async_log(format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes())
+                .await;
+            let send_outcome = match conn.io_mut() {
+                Ok(w) => {
+                    send_fixed(
+                        w,
+                        bad_gateway(),
+                        Some(&script_outcome.early_response_headers),
+                        &script_outcome.metadata,
+                        hook_state.as_ref(),
+                    )
+                    .await
+                }
+                Err(_) => H1SendOutcome {
+                    keep_client: false,
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                },
+            };
+            log_caddy_access(
+                shared,
+                &head,
+                peer,
+                scheme,
+                send_outcome.status,
+                &script_outcome.metadata,
+            )
+            .await;
+            SimpleH1ProxyResult::Handled(send_outcome.keep_client)
+        }
+    }
 }
 
 async fn handle_h2c_connection(
@@ -825,6 +1140,80 @@ async fn handle_request<R: AsyncReadRent + 'static>(
     }
 
     if let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() {
+        if !caddy::has_error_routes(&script_outcome)
+            && can_use_simple_proxy_fast_path(
+                &head,
+                &body,
+                h1::is_websocket_upgrade_request(&head),
+                Some(&script_outcome.early_response_headers),
+                &script_outcome.metadata,
+                Some(&hook_state),
+                script_outcome.request.proxy_method(),
+                script_outcome.request.proxy_uri(),
+                script_outcome.request.proxy_headers(),
+                encode_state.as_ref(),
+            )
+        {
+            let res = reverse_proxy_request(
+                proxy_url,
+                head.clone(),
+                body,
+                &mut reader,
+                w,
+                head_only,
+                peer,
+                scheme,
+                Some(&script_outcome.early_response_headers),
+                &script_outcome.metadata,
+                Some(&hook_state),
+                script_outcome.request.proxy_method(),
+                script_outcome.request.proxy_uri(),
+                script_outcome.request.proxy_headers(),
+                script_outcome.request_body_limit,
+                script_outcome.caddy_reverse_proxy,
+                script_outcome.caddy_default_forwarded,
+                encode_state.as_ref(),
+            )
+            .await;
+            return match res {
+                Ok(proxy_outcome) => {
+                    log_caddy_access(
+                        shared,
+                        &head,
+                        peer,
+                        scheme,
+                        proxy_outcome.send.status,
+                        &script_outcome.metadata,
+                    )
+                    .await;
+                    (proxy_outcome.send.keep_client, reader)
+                }
+                Err(err) => {
+                    async_log(
+                        format!("[handle] {}: reverse proxy: {:?}\n", request_id, err).into_bytes(),
+                    )
+                    .await;
+                    let send_outcome = send_fixed(
+                        w,
+                        bad_gateway(),
+                        Some(&script_outcome.early_response_headers),
+                        &script_outcome.metadata,
+                        Some(&hook_state),
+                    )
+                    .await;
+                    log_caddy_access(
+                        shared,
+                        &head,
+                        peer,
+                        scheme,
+                        send_outcome.status,
+                        &script_outcome.metadata,
+                    )
+                    .await;
+                    (send_outcome.keep_client, reader)
+                }
+            };
+        }
         let response_started = Cell::new(false);
         let mut tracked_w = TrackedWriter {
             inner: w,
@@ -3896,6 +4285,36 @@ async fn reverse_proxy_request(
     }
 
     let is_ws_request = h1::is_websocket_upgrade_request(&head);
+    if can_use_simple_proxy_fast_path(
+        &head,
+        &body,
+        is_ws_request,
+        early_response_headers,
+        metadata,
+        hook_state,
+        proxy_method,
+        proxy_uri,
+        proxy_headers,
+        encode,
+    ) {
+        return match reverse_proxy_simple_request(
+            backend_url,
+            &head,
+            w,
+            head_only,
+            peer,
+            scheme,
+            caddy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded),
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                drain_payload(reader, &mut body).await;
+                Err(err)
+            }
+        };
+    }
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
     caddy::prepare_reverse_proxy_request_headers_h1(
         &mut headers,
@@ -3991,6 +4410,245 @@ async fn reverse_proxy_request(
     }
 
     Ok(outcome)
+}
+
+async fn reverse_proxy_simple_request(
+    backend_url: &str,
+    head: &RequestHead,
+    w: &mut impl AsyncWriteRent,
+    _head_only: bool,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    caddy_default_forwarded: bool,
+) -> Result<ProxyOutcome> {
+    let target = cached_backend_target(backend_url)?;
+    let request_head =
+        encode_simple_proxy_request_head(head, &target, peer, scheme, caddy_default_forwarded)?;
+    let pool_key = target.pool_key();
+    let mut conn = match pool::take_connection(&pool_key) {
+        Some(conn) => conn,
+        None => connect_backend(&target).await?,
+    };
+    let outcome = match &mut conn {
+        PooledConnection::Http(codec) => {
+            proxy_simple_over_connection(codec, request_head, w).await?
+        }
+        PooledConnection::Https(codec) => {
+            proxy_simple_over_connection(codec, request_head, w).await?
+        }
+        PooledConnection::Unix(codec) => {
+            proxy_simple_over_connection(codec, request_head, w).await?
+        }
+    };
+    if outcome.reuse_backend {
+        pool::return_connection(pool_key, conn);
+    }
+    Ok(outcome)
+}
+
+fn can_use_simple_proxy_fast_path(
+    head: &RequestHead,
+    body: &HttpBody,
+    is_ws_request: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    proxy_method: Option<&str>,
+    proxy_uri: Option<&str>,
+    proxy_headers: Option<&::http::HeaderMap>,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> bool {
+    matches!(head.method, Method::GET)
+        && matches!(body.hint(), StreamHint::None)
+        && !is_ws_request
+        && proxy_method.is_none()
+        && proxy_uri.is_none()
+        && proxy_headers.is_none()
+        && can_use_raw_fixed_proxy_response(
+            early_response_headers,
+            metadata,
+            hook_state,
+            false,
+            false,
+            encode,
+        )
+}
+
+async fn proxy_simple_over_connection<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    request_head: Vec<u8>,
+    w: &mut impl AsyncWriteRent,
+) -> Result<ProxyOutcome>
+where
+    IO: AsyncReadRent + AsyncWriteRent,
+{
+    let (res, _) = conn
+        .io_mut()
+        .map_err(|err| anyhow!("proxy backend missing io: {err}"))?
+        .write_all(request_head)
+        .await;
+    res.map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+
+    let response = match conn.next_response_fast().await {
+        Ok(Some(h1::ResponseRead::RawFixed(raw))) => {
+            let status = raw.status;
+            let can_reuse = raw.can_reuse;
+            let mut head = raw.head;
+            let mut body = raw.body;
+            collect_proxy_body_into(conn, &mut body, &mut head).await?;
+            write_raw_response(w, head).await?;
+            let _ = w.flush().await;
+            return Ok(ProxyOutcome {
+                reuse_backend: can_reuse,
+                send: H1SendOutcome {
+                    keep_client: true,
+                    status,
+                },
+                continue_request: false,
+                preserved_body: None,
+            });
+        }
+        Ok(Some(h1::ResponseRead::Parsed(resp))) => resp,
+        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+    };
+
+    let (resp_head, mut resp_body) = response.into_parts();
+    let status = resp_head.status.as_u16();
+    let can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut headers = resp_head.headers;
+    strip_hop_headers(&mut headers, false);
+    let body_hint = resp_body.hint();
+    let send_body = should_send_proxy_body_raw(status, body_hint, false);
+    if send_body {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    } else if !raw_status_allows_body(status) {
+        strip_no_body_headers(&mut headers);
+    } else {
+        apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    }
+    write_response_head_raw(w, status, &headers).await?;
+    if send_body {
+        forward_proxy_body(w, conn, &mut resp_body).await?;
+    } else {
+        drain_proxy_payload(conn, &mut resp_body).await?;
+    }
+    let _ = w.flush().await;
+    Ok(ProxyOutcome {
+        reuse_backend: can_reuse,
+        send: H1SendOutcome {
+            keep_client: true,
+            status,
+        },
+        continue_request: false,
+        preserved_body: None,
+    })
+}
+
+fn caddy_uses_default_forwarded(
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    caddy_default_forwarded: bool,
+) -> bool {
+    caddy::reverse_proxy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded)
+}
+
+fn encode_simple_proxy_request_head(
+    head: &RequestHead,
+    target: &BackendTarget,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    caddy_default_forwarded: bool,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(head.method.as_str().as_bytes());
+    out.extend_from_slice(b" ");
+    append_backend_uri(&mut out, target, &head.uri);
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    for (name, value) in head.headers.iter() {
+        let name_str = name.as_str();
+        if is_simple_proxy_skip_request_header(name_str, caddy_default_forwarded) {
+            continue;
+        }
+        if name_str.eq_ignore_ascii_case("te")
+            && !value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("trailers"))
+            })
+        {
+            continue;
+        }
+        out.extend_from_slice(name_str.as_bytes());
+        out.extend_from_slice(b": ");
+        if name_str.eq_ignore_ascii_case("te") {
+            out.extend_from_slice(b"trailers");
+        } else {
+            out.extend_from_slice(value.as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"x-forwarded-for: ");
+    let _ = write!(&mut out, "{}", peer.ip());
+    out.extend_from_slice(b"\r\nx-forwarded-proto: ");
+    out.extend_from_slice(scheme.as_str().as_bytes());
+    out.extend_from_slice(b"\r\nx-forwarded-host: ");
+    if let Some(host) = head
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        out.extend_from_slice(host.as_bytes());
+    }
+    out.extend_from_slice(b"\r\n\r\n");
+    Ok(out)
+}
+
+fn append_backend_uri(out: &mut Vec<u8>, target: &BackendTarget, req_uri: &Uri) {
+    let base = target.base_path.trim_end_matches('/');
+    let req_path = req_uri.path();
+    let req_path = if req_path.is_empty() { "/" } else { req_path };
+    if base.is_empty() || base == "/" {
+        out.extend_from_slice(req_path.as_bytes());
+    } else {
+        out.extend_from_slice(base.as_bytes());
+        out.extend_from_slice(b"/");
+        out.extend_from_slice(req_path.trim_start_matches('/').as_bytes());
+    }
+    match (target.base_query.as_deref(), req_uri.query()) {
+        (Some(base), Some(extra)) if !base.is_empty() && !extra.is_empty() => {
+            out.extend_from_slice(b"?");
+            out.extend_from_slice(base.as_bytes());
+            out.extend_from_slice(b"&");
+            out.extend_from_slice(extra.as_bytes());
+        }
+        (Some(base), _) if !base.is_empty() => {
+            out.extend_from_slice(b"?");
+            out.extend_from_slice(base.as_bytes());
+        }
+        (_, Some(extra)) if !extra.is_empty() => {
+            out.extend_from_slice(b"?");
+            out.extend_from_slice(extra.as_bytes());
+        }
+        _ => {}
+    }
+}
+
+fn is_simple_proxy_skip_request_header(name: &str, caddy_default_forwarded: bool) -> bool {
+    name.eq_ignore_ascii_case("alt-svc")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("content-length")
+        || (caddy_default_forwarded
+            && (name.eq_ignore_ascii_case("x-forwarded-for")
+                || name.eq_ignore_ascii_case("x-forwarded-proto")
+                || name.eq_ignore_ascii_case("x-forwarded-host")))
 }
 
 struct H2ProxyOutcome {
@@ -4270,10 +4928,43 @@ where
         }
     }
 
-    let response = match conn.next_response().await {
-        Ok(Some(resp)) => resp,
-        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+    let response = if can_use_raw_fixed_proxy_response(
+        early_response_headers,
+        metadata,
+        hook_state,
+        is_ws_request,
+        head_only,
+        encode,
+    ) {
+        match conn.next_response_fast().await {
+            Ok(Some(h1::ResponseRead::RawFixed(raw))) => {
+                let status = raw.status;
+                let can_reuse = raw.can_reuse;
+                let mut head = raw.head;
+                let mut body = raw.body;
+                collect_proxy_body_into(conn, &mut body, &mut head).await?;
+                write_raw_response(w, head).await?;
+                let _ = w.flush().await;
+                return Ok(ProxyOutcome {
+                    reuse_backend: can_reuse,
+                    send: H1SendOutcome {
+                        keep_client: true,
+                        status,
+                    },
+                    continue_request: false,
+                    preserved_body: None,
+                });
+            }
+            Ok(Some(h1::ResponseRead::Parsed(resp))) => resp,
+            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+        }
+    } else {
+        match conn.next_response().await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+        }
     };
     let upstream_latency = roundtrip_start.map(|start| start.elapsed());
 
@@ -4400,6 +5091,21 @@ where
         strip_no_body_headers(&mut headers);
     } else {
         apply_proxy_response_headers(&mut headers, body_hint, send_body);
+    }
+
+    if send_body && !head_only && encode.is_none() && matches!(body_hint, StreamHint::Fixed) {
+        let body = collect_proxy_body(conn, &mut resp_body).await?;
+        write_response_head_and_body_raw(w, raw_status, &headers, body).await?;
+        let _ = w.flush().await;
+        return Ok(ProxyOutcome {
+            reuse_backend: can_reuse,
+            send: H1SendOutcome {
+                keep_client: true,
+                status: raw_status,
+            },
+            continue_request: false,
+            preserved_body: None,
+        });
     }
 
     write_response_head_raw(w, raw_status, &headers).await?;
@@ -4604,6 +5310,24 @@ fn should_reuse_proxy_connection(version: ::http::Version, headers: &::http::Hea
         return false;
     }
     !connection_has_close(headers)
+}
+
+fn can_use_raw_fixed_proxy_response(
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    is_ws_request: bool,
+    head_only: bool,
+    encode: Option<&crate::helpers::compress::EncodeState>,
+) -> bool {
+    !is_ws_request
+        && !head_only
+        && encode.is_none()
+        && early_response_headers.is_none_or(::http::HeaderMap::is_empty)
+        && hook_state.is_none_or(|state| !state.has_hooks())
+        && !metadata
+            .keys()
+            .any(|key| key.starts_with("zs.response.header."))
 }
 
 fn connection_has_close(headers: &::http::HeaderMap) -> bool {
@@ -4894,6 +5618,12 @@ async fn write_response_head_and_body_raw(
     Ok(())
 }
 
+async fn write_raw_response(w: &mut impl AsyncWriteRent, response: Vec<u8>) -> Result<()> {
+    let (res, _) = w.write_all(response).await;
+    res.map_err(|err| anyhow!("failed to write proxy response: {err}"))?;
+    Ok(())
+}
+
 fn encode_response_head_raw(status: u16, headers: &::http::HeaderMap) -> Vec<u8> {
     let reason = StatusCode::from_u16(status)
         .ok()
@@ -4987,6 +5717,36 @@ where
 {
     while let Some(chunk) = body.next_data(conn).await {
         chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+    }
+    Ok(())
+}
+
+async fn collect_proxy_body<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+) -> Result<Vec<u8>>
+where
+    IO: AsyncReadRent,
+{
+    let mut out = Vec::new();
+    while let Some(chunk) = body.next_data(conn).await {
+        let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+        out.extend_from_slice(chunk.as_ref());
+    }
+    Ok(out)
+}
+
+async fn collect_proxy_body_into<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    body: &mut h1::Body,
+    out: &mut Vec<u8>,
+) -> Result<()>
+where
+    IO: AsyncReadRent,
+{
+    while let Some(chunk) = body.next_data(conn).await {
+        let chunk = chunk.map_err(|err| anyhow!("proxy body read failed: {err}"))?;
+        out.extend_from_slice(chunk.as_ref());
     }
     Ok(())
 }
