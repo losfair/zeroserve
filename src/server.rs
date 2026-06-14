@@ -801,7 +801,6 @@ where
         Vec::new(),
         connection.clone(),
     );
-    let script_request_fallback = script_request.clone();
     let body_source = BodySource::empty();
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request, body_source) => x,
@@ -815,7 +814,16 @@ where
         Err(err) => {
             async_log(format!("[handle] {}: script runtime: {:?}\n", request_id, err).into_bytes())
                 .await;
-            ScriptOutcome::from_request(script_request_fallback)
+            ScriptOutcome::from_request(build_script_request(
+                request_id.clone(),
+                &head,
+                peer,
+                local,
+                scheme,
+                &normalized_path,
+                Vec::new(),
+                connection.clone(),
+            ))
         }
     };
 
@@ -1950,9 +1958,8 @@ where
         scheme,
         &normalized_path,
         Vec::new(),
-        connection,
+        connection.clone(),
     );
-    let script_request_fallback = script_request.clone();
     let mut hup_wait = hup.clone();
     let script_outcome = monoio::select! {
         x = script_runtime.run_request(shared.site.load_full(), script_request, body_source.clone()) => x,
@@ -1966,7 +1973,16 @@ where
         Err(err) => {
             async_log(format!("[handle] {}: script runtime: {:?}\n", request_id, err).into_bytes())
                 .await;
-            ScriptOutcome::from_request(script_request_fallback)
+            ScriptOutcome::from_request(build_script_request(
+                request_id.clone(),
+                &head,
+                peer,
+                local,
+                scheme,
+                &normalized_path,
+                Vec::new(),
+                connection,
+            ))
         }
     };
 
