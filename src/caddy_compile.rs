@@ -322,6 +322,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     generator.line("ZS_ENTRY");
     generator.line("zs_u64 entry(void) {");
     generator.indent += 1;
+    generator.emit_tls_request_checks()?;
     generator.emit_access_log_config();
     if !generator.route_groups.is_empty() {
         generator.line("int route_groups[32];");
@@ -693,6 +694,11 @@ impl Generator {
             self.line("}");
         }
 
+        self.blank();
+        Ok(())
+    }
+
+    fn emit_tls_request_checks(&mut self) -> Result<()> {
         let client_auth_policies = self
             .tls_connection_policies
             .iter()
@@ -703,9 +709,6 @@ impl Generator {
             return Ok(());
         }
 
-        self.line("ZS_TLS_REQUEST_ENTRY");
-        self.line("zs_u64 caddy_tls_request(void) {");
-        self.indent += 1;
         self.line("char caddy_tls_sni[256];");
         self.line(&format!(
             "zs_s64 caddy_tls_sni_raw = zs_caddy_expand({}, {}, caddy_tls_sni, sizeof(caddy_tls_sni));",
@@ -739,9 +742,6 @@ impl Generator {
             self.line("}");
         }
 
-        self.line("return 0;");
-        self.indent -= 1;
-        self.line("}");
         self.blank();
         Ok(())
     }
@@ -9357,7 +9357,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_tls_client_auth_policy_to_request_tls_section() {
+    fn compiles_tls_client_auth_policy_into_request_entry() {
         let source = r#"{
           "apps": {"http": {"servers": {"srv0": {
             "tls_connection_policies": [{
@@ -9377,7 +9377,7 @@ mod tests {
 
         let c = compile_caddy_json(source).unwrap();
         assert!(!c.contains("ZS_TLS_ENTRY"), "{c}");
-        assert!(c.contains("ZS_TLS_REQUEST_ENTRY"), "{c}");
+        assert!(c.contains("ZS_ENTRY"), "{c}");
         assert!(c.contains("zs_caddy_tls_client_auth"), "{c}");
         assert!(c.contains("zs_abort();"), "{c}");
         assert!(c.contains("example.com"), "{c}");

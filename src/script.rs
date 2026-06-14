@@ -40,7 +40,6 @@ use crate::{
 
 const SCRIPT_ENTRYPOINT: &str = "zeroserve.request";
 const SCRIPT_TLS_ENTRYPOINT: &str = "zeroserve.tls";
-const SCRIPT_TLS_REQUEST_ENTRYPOINT: &str = "zeroserve.tls.request";
 /// Prefix for the per-function code sections that expose a script to inter-script
 /// calls. A callee exports `zeroserve.call.<name>` sections; `zs_call` resolves
 /// `<name>` against this prefix.
@@ -1859,7 +1858,7 @@ async fn run_request_scripts_with_state(
     let mut encode: Option<crate::helpers::compress::EncodeConfig> = None;
     let preemption = PreemptionEnabled::new(t);
 
-    'sections: for section in [SCRIPT_TLS_REQUEST_ENTRYPOINT, SCRIPT_ENTRYPOINT] {
+    'sections: for section in [SCRIPT_ENTRYPOINT] {
         for (name, program) in scripts.iter() {
             if !program.has_section(section) {
                 continue;

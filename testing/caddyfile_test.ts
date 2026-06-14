@@ -240,7 +240,6 @@ Deno.test("caddy-compile adapts tls certificate files to zeroserve TLS section",
     "Caddyfile",
   );
   assertStringIncludes(c, "ZS_TLS_ENTRY");
-  assertEquals(c.includes("ZS_TLS_REQUEST_ENTRY"), false);
   assertStringIncludes(c, "zs_caddy_tls_certificate(");
   assertStringIncludes(c, "/tmp/example.crt");
   assertStringIncludes(c, "/tmp/example.key");
