@@ -859,9 +859,22 @@ fn script_request_wire_uri(request: &ScriptRequest) -> String {
 pub(super) fn reverse_proxy_uses_caddy_headers(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
 ) -> bool {
-    caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy").as_deref()
-        == Some("1")
+    caddy_reverse_proxy
+        || caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy").as_deref()
+            == Some("1")
+}
+
+pub(super) fn reverse_proxy_uses_default_forwarded(
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    caddy_default_forwarded: bool,
+) -> bool {
+    caddy_default_forwarded
+        || caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
+            .as_deref()
+            == Some("default")
 }
 
 pub(super) fn prepare_reverse_proxy_request_headers_h1(
@@ -872,10 +885,26 @@ pub(super) fn prepare_reverse_proxy_request_headers_h1(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    strip_reverse_proxy_request_headers(headers, websocket, metadata, hook_state);
+    strip_reverse_proxy_request_headers(
+        headers,
+        websocket,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+    );
     super::apply_proxy_request_headers(headers, body);
-    finish_reverse_proxy_request_headers(headers, peer, scheme, metadata, hook_state);
+    finish_reverse_proxy_request_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
 }
 
 pub(super) fn prepare_reverse_proxy_request_headers_h2(
@@ -885,10 +914,20 @@ pub(super) fn prepare_reverse_proxy_request_headers_h2(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) -> bool {
-    strip_reverse_proxy_request_headers(headers, false, metadata, hook_state);
+    strip_reverse_proxy_request_headers(headers, false, metadata, hook_state, caddy_reverse_proxy);
     let chunked = super::apply_proxy_request_headers_h2(headers, has_body);
-    finish_reverse_proxy_request_headers(headers, peer, scheme, metadata, hook_state);
+    finish_reverse_proxy_request_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
     chunked
 }
 
@@ -897,11 +936,12 @@ fn strip_reverse_proxy_request_headers(
     websocket: bool,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
 ) {
     super::strip_proxy_request_hop_headers(
         headers,
         websocket,
-        reverse_proxy_uses_caddy_headers(metadata, hook_state),
+        reverse_proxy_uses_caddy_headers(metadata, hook_state, caddy_reverse_proxy),
     );
 }
 
@@ -911,8 +951,18 @@ fn finish_reverse_proxy_request_headers(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    apply_reverse_proxy_forwarded_headers(headers, peer, scheme, metadata, hook_state);
+    apply_reverse_proxy_forwarded_headers(
+        headers,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
 }
 
 fn apply_reverse_proxy_forwarded_headers(
@@ -921,15 +971,14 @@ fn apply_reverse_proxy_forwarded_headers(
     scheme: Scheme,
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
 ) {
-    if caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
-        .as_deref()
-        == Some("default")
-    {
+    if reverse_proxy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded) {
         apply_caddy_default_forwarded_headers(headers, peer, scheme);
         return;
     }
-    if !reverse_proxy_uses_caddy_headers(metadata, hook_state) {
+    if !reverse_proxy_uses_caddy_headers(metadata, hook_state, caddy_reverse_proxy) {
         apply_caddy_forwarded_headers(headers, peer, scheme);
     }
 }

@@ -802,7 +802,6 @@ impl Generator {
                 c_comment(&compiled.server_name),
                 compiled.route_index
             ));
-            self.line("if (zs_response_pending() != 0) return 0;");
             let stopped = self.emit_handlers(&compiled.route.handlers)?;
             if !stopped {
                 self.emit_terminal_empty_handler("route");
@@ -1802,13 +1801,18 @@ impl Generator {
     }
 
     fn emit_subroute_routes(&mut self, routes: &[Route]) -> Result<bool> {
+        let mut pending_cleanup_needed = false;
         for route in routes {
-            self.emit_subroute_route(route)?;
+            let route_can_leave_pending =
+                self.emit_subroute_route(route, pending_cleanup_needed)?;
+            if route_can_leave_pending {
+                pending_cleanup_needed = true;
+            }
         }
         Ok(false)
     }
 
-    fn emit_subroute_route(&mut self, route: &Route) -> Result<()> {
+    fn emit_subroute_route(&mut self, route: &Route, pending_possible: bool) -> Result<bool> {
         validate_route_fields(route, "subroute route")?;
         // Brace-scoped like top-level routes so matcher buffers can share
         // stack slots across sibling routes.
@@ -1818,7 +1822,7 @@ impl Generator {
         if match_is_statically_false(&matched) {
             self.indent -= 1;
             self.line("}");
-            return Ok(());
+            return Ok(false);
         }
         let match_can_set_error = route_match_can_set_error(route);
         if match_can_set_error {
@@ -1830,7 +1834,9 @@ impl Generator {
             self.line(&format!("if ({matched}) {{"));
         }
         self.indent += 1;
-        self.line("if (zs_response_pending() != 0) return 0;");
+        if pending_possible || match_can_set_error {
+            self.line("if (zs_response_pending() != 0) return 0;");
+        }
         let grouped = self.emit_route_group_guard(route, "subroute")?;
 
         let terminal = self.emit_handlers(&route.handlers)?;
@@ -1844,14 +1850,17 @@ impl Generator {
         }
         self.indent -= 1;
         self.line("}");
-        self.line("else if (zs_response_pending() != 0) {");
-        self.indent += 1;
-        self.line("zs_response_clear();");
+        let clear_unmatched_response = match_can_set_error || pending_possible;
+        if clear_unmatched_response {
+            self.line("else if (zs_response_pending() != 0) {");
+            self.indent += 1;
+            self.line("zs_response_clear();");
+            self.indent -= 1;
+            self.line("}");
+        }
         self.indent -= 1;
         self.line("}");
-        self.indent -= 1;
-        self.line("}");
-        Ok(())
+        Ok(!route.terminal && !terminal)
     }
 
     fn emit_handler(&mut self, handler: &Handler) -> Result<bool> {

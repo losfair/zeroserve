@@ -864,7 +864,11 @@ where
                 head_only,
                 peer,
                 scheme,
-                caddy_uses_default_forwarded(&script_outcome.metadata, hook_state.as_ref()),
+                caddy_uses_default_forwarded(
+                    &script_outcome.metadata,
+                    hook_state.as_ref(),
+                    script_outcome.caddy_default_forwarded,
+                ),
             )
             .await
         }
@@ -1166,6 +1170,8 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                 script_outcome.request.proxy_uri(),
                 script_outcome.request.proxy_headers(),
                 script_outcome.request_body_limit,
+                script_outcome.caddy_reverse_proxy,
+                script_outcome.caddy_default_forwarded,
                 encode_state.as_ref(),
             )
             .await;
@@ -1230,6 +1236,8 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                 script_outcome.request.proxy_uri(),
                 script_outcome.request.proxy_headers(),
                 script_outcome.request_body_limit,
+                script_outcome.caddy_reverse_proxy,
+                script_outcome.caddy_default_forwarded,
                 encode_state.as_ref(),
             ) => x,
             _ = &mut *interrupt => Err(anyhow::anyhow!("interrupted")),
@@ -1305,6 +1313,8 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                             continued.request.proxy_uri(),
                             continued.request.proxy_headers(),
                             continued.request_body_limit,
+                            continued.caddy_reverse_proxy,
+                            continued.caddy_default_forwarded,
                             continued_encode_state.as_ref(),
                         )
                         .await;
@@ -1568,6 +1578,8 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                         continued.request.proxy_uri(),
                         continued.request.proxy_headers(),
                         continued.request_body_limit,
+                        continued.caddy_reverse_proxy,
+                        continued.caddy_default_forwarded,
                         continued_encode_state.as_ref(),
                     )
                     .await;
@@ -2027,6 +2039,8 @@ where
                     script_outcome.request.proxy_uri(),
                     script_outcome.request.proxy_headers(),
                     script_outcome.request_body_limit,
+                    script_outcome.caddy_reverse_proxy,
+                    script_outcome.caddy_default_forwarded,
                     encode_state.as_ref(),
                 ) => x,
                 _ = &mut hup_wait => Err(anyhow::anyhow!("interrupted")),
@@ -2111,6 +2125,8 @@ where
                                     continued.request.proxy_uri(),
                                     continued.request.proxy_headers(),
                                     continued.request_body_limit,
+                                    continued.caddy_reverse_proxy,
+                                    continued.caddy_default_forwarded,
                                     continued_encode_state.as_ref(),
                                 )
                                 .await;
@@ -4232,6 +4248,8 @@ async fn reverse_proxy_request(
     proxy_uri: Option<&str>,
     proxy_headers: Option<&::http::HeaderMap>,
     request_body_limit: Option<usize>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
     encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<ProxyOutcome> {
     let target = match cached_backend_target(backend_url) {
@@ -4296,7 +4314,7 @@ async fn reverse_proxy_request(
             head_only,
             peer,
             scheme,
-            caddy_uses_default_forwarded(metadata, hook_state),
+            caddy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded),
         )
         .await
         {
@@ -4320,6 +4338,8 @@ async fn reverse_proxy_request(
         scheme,
         metadata,
         hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
     );
 
     head.uri = uri;
@@ -4538,10 +4558,9 @@ where
 fn caddy_uses_default_forwarded(
     metadata: &HashMap<String, String>,
     hook_state: Option<&ResponseHookState<'_>>,
+    caddy_default_forwarded: bool,
 ) -> bool {
-    caddy::caddy_proxy_metadata_value(metadata, hook_state, "zs.caddy.reverse_proxy.forwarded")
-        .as_deref()
-        == Some("default")
+    caddy::reverse_proxy_uses_default_forwarded(metadata, hook_state, caddy_default_forwarded)
 }
 
 fn encode_simple_proxy_request_head(
@@ -4663,6 +4682,8 @@ async fn reverse_proxy_request_h2(
     proxy_uri: Option<&str>,
     proxy_headers: Option<&::http::HeaderMap>,
     request_body_limit: Option<usize>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
     encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<H2ProxyOutcome> {
     let target = match cached_backend_target(backend_url) {
@@ -4714,6 +4735,8 @@ async fn reverse_proxy_request_h2(
         scheme,
         metadata,
         hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
     );
 
     head.uri = uri;

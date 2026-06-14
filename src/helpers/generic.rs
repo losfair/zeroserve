@@ -581,12 +581,8 @@ pub fn h_caddy_simple_reverse_proxy(
             return Err(());
         }
         ctx.reverse_proxy = Some(url.to_string());
-        let mut metadata = ctx.metadata.borrow_mut();
-        metadata.insert("zs.caddy.reverse_proxy".to_string(), "1".to_string());
-        metadata.insert(
-            "zs.caddy.reverse_proxy.forwarded".to_string(),
-            "default".to_string(),
-        );
+        ctx.caddy_reverse_proxy = true;
+        ctx.caddy_default_forwarded = true;
         Ok(0)
     })
 }
