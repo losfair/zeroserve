@@ -7771,6 +7771,24 @@ fn caddy_host_fuzzy(host: &str) -> bool {
 }
 
 fn upstream_to_url(dial: &str, transport: Option<&Value>) -> Result<String> {
+    if dial.starts_with("iroh://") {
+        if contains_placeholder(dial) {
+            bail!("reverse_proxy iroh upstream addresses cannot contain placeholders");
+        }
+        if transport.is_some_and(|value| !value.is_null()) {
+            bail!("reverse_proxy iroh upstreams cannot use Caddy transport options");
+        }
+        #[cfg(feature = "iroh-proxy")]
+        {
+            return Ok(dial.to_string());
+        }
+        #[cfg(not(feature = "iroh-proxy"))]
+        {
+            bail!(
+                "reverse_proxy iroh upstreams require building zeroserve with the `iroh-proxy` feature"
+            );
+        }
+    }
     if dial.starts_with("http://") || dial.starts_with("https://") {
         if contains_placeholder(dial) {
             bail!("reverse_proxy upstream addresses with URL schemes cannot contain placeholders");

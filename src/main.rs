@@ -10,6 +10,7 @@ mod ech;
 mod helpers;
 mod http;
 mod hupwatch;
+mod iroh_proxy;
 mod ja4;
 mod json;
 mod logging;
@@ -200,6 +201,8 @@ fn main() -> Result<()> {
         Ok(()) => {}
         Err(err) => eprintln!("warning: {err}"),
     }
+
+    iroh_proxy::init(&config).with_context(|| "failed to initialize iroh proxy transport")?;
 
     if !config.disable_ns_isolation {
         setup_ns_isolation(&config).with_context(

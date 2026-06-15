@@ -37,6 +37,7 @@ use crate::{
     config::StaticConfig,
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     hupwatch::HupWatcher,
+    iroh_proxy::{IrohProxyRequest, IrohTarget},
     logging::async_log,
     pool::{self, PoolKey, PooledConnection},
     script::{
@@ -838,7 +839,12 @@ where
     let Some(proxy_url) = script_outcome.reverse_proxy.as_deref() else {
         return SimpleH1ProxyResult::Fallback(Request::from_parts(original_head, h1::Body::None));
     };
+    let simple_target = cached_backend_target(proxy_url);
     if caddy::has_error_routes(&script_outcome)
+        || matches!(
+            simple_target.as_ref().map(|target| target.scheme),
+            Ok(BackendScheme::Iroh)
+        )
         || !can_use_simple_proxy_fast_path(
             &head,
             &h1::Body::None,
@@ -4284,6 +4290,27 @@ async fn reverse_proxy_request(
         });
     }
 
+    if matches!(target.scheme, BackendScheme::Iroh) {
+        return reverse_proxy_iroh_request(
+            &target,
+            head,
+            body,
+            reader,
+            w,
+            head_only,
+            peer,
+            scheme,
+            early_response_headers,
+            metadata,
+            hook_state,
+            proxy_headers,
+            request_body_limit,
+            caddy_reverse_proxy,
+            caddy_default_forwarded,
+        )
+        .await;
+    }
+
     let is_ws_request = h1::is_websocket_upgrade_request(&head);
     if can_use_simple_proxy_fast_path(
         &head,
@@ -4716,6 +4743,26 @@ async fn reverse_proxy_request_h2(
         });
     }
 
+    if matches!(target.scheme, BackendScheme::Iroh) {
+        return reverse_proxy_iroh_request_h2(
+            &target,
+            head,
+            body,
+            respond,
+            head_only,
+            peer,
+            scheme,
+            early_response_headers,
+            metadata,
+            hook_state,
+            proxy_headers,
+            request_body_limit,
+            caddy_reverse_proxy,
+            caddy_default_forwarded,
+        )
+        .await;
+    }
+
     let has_body = send_request_body && !body.is_end_stream();
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
     let chunked = caddy::prepare_reverse_proxy_request_headers_h2(
@@ -4809,7 +4856,415 @@ async fn reverse_proxy_request_h2(
     })
 }
 
+async fn reverse_proxy_iroh_request<R>(
+    target: &BackendTarget,
+    mut head: RequestHead,
+    mut body: HttpBody,
+    reader: &mut h1::H1Connection<R>,
+    w: &mut impl AsyncWriteRent,
+    head_only: bool,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    proxy_headers: Option<&::http::HeaderMap>,
+    request_body_limit: Option<usize>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
+) -> Result<ProxyOutcome>
+where
+    R: AsyncReadRent,
+{
+    let is_ws_request = h1::is_websocket_upgrade_request(&head);
+    if is_ws_request {
+        drain_payload(reader, &mut body).await;
+        let send = send_fixed(
+            w,
+            bad_gateway(),
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await;
+        return Ok(ProxyOutcome {
+            reuse_backend: false,
+            send,
+            continue_request: false,
+            preserved_body: None,
+        });
+    }
+
+    let client_connection_close = connection_has_close(&head.headers);
+    let send_request_body = !matches!(head.method, Method::GET | Method::HEAD);
+    let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
+    caddy::prepare_reverse_proxy_request_headers_h1(
+        &mut headers,
+        if send_request_body {
+            &body
+        } else {
+            &h1::Body::None
+        },
+        false,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
+
+    prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
+    head.headers = headers;
+    let (body_tx, request_body) = crate::iroh_proxy::request_body_channel();
+    let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
+        target: target
+            .iroh
+            .clone()
+            .ok_or_else(|| anyhow!("iroh backend missing target metadata"))?,
+        method: head.method.as_str().to_string(),
+        uri: head.uri.to_string(),
+        headers: head.headers,
+        body: request_body,
+    })?;
+
+    if send_request_body {
+        match stream_h1_request_body_to_iroh(reader, &mut body, &body_tx, request_body_limit)
+            .await?
+        {
+            StreamRequestBodyOutcome::Complete => {}
+            StreamRequestBodyOutcome::TooLarge => {
+                crate::iroh_proxy::send_request_body_error(
+                    &body_tx,
+                    "request body exceeded configured limit".to_string(),
+                )
+                .await;
+                drop(body_tx);
+                let send = send_fixed(
+                    w,
+                    payload_too_large(),
+                    early_response_headers,
+                    metadata,
+                    hook_state,
+                )
+                .await;
+                return Ok(ProxyOutcome {
+                    reuse_backend: false,
+                    send,
+                    continue_request: false,
+                    preserved_body: None,
+                });
+            }
+        }
+    } else {
+        drain_payload(reader, &mut body).await;
+    }
+    drop(body_tx);
+
+    let response = fetch.response().await?;
+    let send = send_iroh_response_h1(
+        w,
+        response,
+        head_only,
+        client_connection_close,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await?;
+    Ok(ProxyOutcome {
+        reuse_backend: false,
+        send,
+        continue_request: false,
+        preserved_body: None,
+    })
+}
+
+async fn reverse_proxy_iroh_request_h2(
+    target: &BackendTarget,
+    mut head: RequestHead,
+    mut body: h2::RecvStream,
+    respond: &mut h2::server::SendResponse<Bytes>,
+    head_only: bool,
+    peer: std::net::SocketAddr,
+    scheme: Scheme,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+    proxy_headers: Option<&::http::HeaderMap>,
+    request_body_limit: Option<usize>,
+    caddy_reverse_proxy: bool,
+    caddy_default_forwarded: bool,
+) -> Result<H2ProxyOutcome> {
+    let send_request_body = !matches!(head.method, Method::GET | Method::HEAD);
+    let has_body = send_request_body && !body.is_end_stream();
+    let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
+    caddy::prepare_reverse_proxy_request_headers_h2(
+        &mut headers,
+        has_body,
+        peer,
+        scheme,
+        metadata,
+        hook_state,
+        caddy_reverse_proxy,
+        caddy_default_forwarded,
+    );
+
+    prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
+    head.headers = headers;
+    let (body_tx, request_body) = crate::iroh_proxy::request_body_channel();
+    let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
+        target: target
+            .iroh
+            .clone()
+            .ok_or_else(|| anyhow!("iroh backend missing target metadata"))?,
+        method: head.method.as_str().to_string(),
+        uri: head.uri.to_string(),
+        headers: head.headers,
+        body: request_body,
+    })?;
+
+    if send_request_body {
+        match stream_h2_request_body_to_iroh(&mut body, &body_tx, request_body_limit).await? {
+            StreamRequestBodyOutcome::Complete => {}
+            StreamRequestBodyOutcome::TooLarge => {
+                crate::iroh_proxy::send_request_body_error(
+                    &body_tx,
+                    "request body exceeded configured limit".to_string(),
+                )
+                .await;
+                drop(body_tx);
+                let status = send_h2_response(
+                    respond,
+                    payload_too_large(),
+                    head_only,
+                    early_response_headers,
+                    metadata,
+                    hook_state,
+                )
+                .await?;
+                return Ok(H2ProxyOutcome {
+                    continue_request: false,
+                    preserved_body: None,
+                    status: Some(status),
+                });
+            }
+        }
+    }
+    drop(body_tx);
+
+    let response = fetch.response().await?;
+    let status = response.status.as_u16();
+    send_iroh_response_h2(
+        respond,
+        response,
+        head_only,
+        early_response_headers,
+        metadata,
+        hook_state,
+    )
+    .await?;
+    Ok(H2ProxyOutcome {
+        continue_request: false,
+        preserved_body: None,
+        status: Some(status),
+    })
+}
+
+enum StreamRequestBodyOutcome {
+    Complete,
+    TooLarge,
+}
+
+async fn stream_h1_request_body_to_iroh<R: AsyncReadRent>(
+    reader: &mut h1::H1Connection<R>,
+    body: &mut h1::Body,
+    sender: &crate::iroh_proxy::RequestBodySender,
+    limit: Option<usize>,
+) -> Result<StreamRequestBodyOutcome> {
+    let mut bytes_seen = 0usize;
+    while let Some(chunk) = body.next_data(reader).await {
+        let chunk = chunk.map_err(|err| anyhow!("failed to read request body: {err}"))?;
+        bytes_seen = bytes_seen.saturating_add(chunk.len());
+        if limit.is_some_and(|limit| bytes_seen > limit) {
+            drain_payload(reader, body).await;
+            return Ok(StreamRequestBodyOutcome::TooLarge);
+        }
+        crate::iroh_proxy::send_request_body_chunk(sender, chunk).await?;
+    }
+    Ok(StreamRequestBodyOutcome::Complete)
+}
+
+async fn stream_h2_request_body_to_iroh(
+    body: &mut h2::RecvStream,
+    sender: &crate::iroh_proxy::RequestBodySender,
+    limit: Option<usize>,
+) -> Result<StreamRequestBodyOutcome> {
+    let mut bytes_seen = 0usize;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|err| anyhow!("failed to read h2 request body: {err}"))?;
+        bytes_seen = bytes_seen.saturating_add(chunk.len());
+        if limit.is_some_and(|limit| bytes_seen > limit) {
+            return Ok(StreamRequestBodyOutcome::TooLarge);
+        }
+        body.flow_control()
+            .release_capacity(chunk.len())
+            .map_err(|err| anyhow!("failed to release h2 request body capacity: {err}"))?;
+        crate::iroh_proxy::send_request_body_chunk(sender, chunk).await?;
+    }
+    Ok(StreamRequestBodyOutcome::Complete)
+}
+
+fn prepare_streaming_iroh_request_headers(
+    headers: &mut ::http::HeaderMap,
+    has_body: bool,
+    fallback_host: &str,
+) -> Result<()> {
+    strip_hop_headers(headers, false);
+    headers.remove(::http::header::TRANSFER_ENCODING);
+    if !has_body {
+        headers.remove(::http::header::CONTENT_LENGTH);
+    }
+    if !headers.contains_key(::http::header::HOST) {
+        let value = ::http::HeaderValue::from_str(fallback_host)
+            .map_err(|err| anyhow!("invalid iroh host header: {err}"))?;
+        headers.insert(::http::header::HOST, value);
+    }
+    Ok(())
+}
+
+async fn send_iroh_response_h1(
+    w: &mut impl AsyncWriteRent,
+    mut response: crate::iroh_proxy::IrohProxyResponse,
+    head_only: bool,
+    client_connection_close: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<H1SendOutcome> {
+    let mut headers = response.headers;
+    strip_hop_headers(&mut headers, false);
+    let hook_outcome = caddy::prepare_reverse_proxy_raw_h1_response_headers(
+        hook_state,
+        response.status,
+        None,
+        &mut headers,
+        None,
+        early_response_headers,
+        metadata,
+    )
+    .await;
+    let status = hook_outcome.status;
+    let send_body = raw_status_allows_body(status) && !head_only;
+    if !send_body {
+        strip_no_body_headers(&mut headers);
+    }
+
+    let chunked = send_body
+        && !headers.contains_key(::http::header::CONTENT_LENGTH)
+        && !headers.contains_key(::http::header::TRANSFER_ENCODING);
+    if chunked {
+        headers.insert(
+            ::http::header::TRANSFER_ENCODING,
+            ::http::HeaderValue::from_static("chunked"),
+        );
+    }
+
+    write_response_head_raw(w, status, &headers).await?;
+    if !send_body {
+        drain_iroh_response_body(&mut response.body).await;
+        let _ = w.flush().await;
+        return Ok(H1SendOutcome {
+            keep_client: !client_connection_close && !connection_has_close(&headers),
+            status,
+        });
+    }
+
+    while let Some(chunk) = crate::iroh_proxy::next_response_body_chunk(&mut response.body).await? {
+        if chunked {
+            h1::write_chunk(w, chunk.as_ref())
+                .await
+                .map_err(|err| anyhow!("failed to write iroh response chunk: {err}"))?;
+        } else {
+            let (res, _) = w.write_all(chunk.to_vec()).await;
+            res.map_err(|err| anyhow!("failed to write iroh response body: {err}"))?;
+        }
+    }
+    if chunked {
+        h1::write_chunk_end(w)
+            .await
+            .map_err(|err| anyhow!("failed to finish iroh response chunks: {err}"))?;
+    }
+    let _ = w.flush().await;
+    Ok(H1SendOutcome {
+        keep_client: !client_connection_close && !connection_has_close(&headers),
+        status,
+    })
+}
+
+async fn send_iroh_response_h2(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    mut response: crate::iroh_proxy::IrohProxyResponse,
+    head_only: bool,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<()> {
+    let mut headers = response.headers;
+    strip_hop_headers(&mut headers, false);
+    headers.remove(::http::header::TRANSFER_ENCODING);
+    let hook_outcome = caddy::prepare_reverse_proxy_response_headers(
+        hook_state,
+        response.status,
+        None,
+        &mut headers,
+        None,
+        early_response_headers,
+        metadata,
+    )
+    .await;
+    let status = hook_outcome.status;
+    let send_body = status_allows_body(status) && !head_only;
+    if !send_body {
+        strip_no_body_headers(&mut headers);
+    }
+
+    let mut head = ::http::Response::builder()
+        .status(status)
+        .version(::http::Version::HTTP_2)
+        .body(())
+        .map_err(|err| anyhow!("failed to build h2 iroh response: {err}"))?;
+    *head.headers_mut() = headers;
+    let mut next = if send_body {
+        crate::iroh_proxy::next_response_body_chunk(&mut response.body).await?
+    } else {
+        drain_iroh_response_body(&mut response.body).await;
+        None
+    };
+    let end_stream = next.is_none();
+    let mut stream = respond.send_response(head, end_stream)?;
+    while let Some(chunk) = next {
+        next = crate::iroh_proxy::next_response_body_chunk(&mut response.body).await?;
+        send_h2_data(&mut stream, chunk, next.is_none()).await?;
+    }
+    Ok(())
+}
+
+async fn drain_iroh_response_body(body: &mut crate::iroh_proxy::ResponseBody) {
+    loop {
+        match crate::iroh_proxy::next_response_body_chunk(body).await {
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConnection> {
+    if matches!(target.scheme, BackendScheme::Iroh) {
+        return Err(anyhow!(
+            "iroh backends are request-stream transports and cannot use the HTTP/1 connection pool"
+        ));
+    }
     if matches!(target.scheme, BackendScheme::Unix) {
         return connect_unix_backend(&target.host).await;
     }
@@ -4855,6 +5310,7 @@ pub(crate) async fn connect_backend(target: &BackendTarget) -> Result<PooledConn
             Ok(PooledConnection::Https(h1::H1Connection::new(tls_stream)))
         }
         BackendScheme::Unix => unreachable!("unix backend targets are returned before DNS"),
+        BackendScheme::Iroh => unreachable!("iroh backend targets are returned before DNS"),
     }
 }
 
@@ -6084,6 +6540,7 @@ pub(crate) enum BackendScheme {
     Http,
     Https,
     Unix,
+    Iroh,
 }
 
 #[derive(Clone)]
@@ -6094,6 +6551,7 @@ pub(crate) struct BackendTarget {
     pub(crate) port: u16,
     pub(crate) base_path: String,
     pub(crate) base_query: Option<String>,
+    pub(crate) iroh: Option<IrohTarget>,
     pool_key: PoolKey,
 }
 
@@ -6134,10 +6592,58 @@ pub(crate) fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
             port: 0,
             base_path: String::new(),
             base_query: None,
+            iroh: None,
             pool_key: PoolKey::unix(path.to_string()),
         });
     }
     let url = Url::parse(raw).map_err(|err| anyhow!("invalid backend url: {err}"))?;
+    if url.scheme() == "iroh" {
+        let node_id = url
+            .host_str()
+            .ok_or_else(|| anyhow!("iroh backend url missing node id"))?
+            .to_string();
+        if node_id.is_empty() {
+            return Err(anyhow!("iroh backend node id is empty"));
+        }
+        let direct_addrs = url
+            .query_pairs()
+            .filter_map(|(key, value)| (key == "addr").then_some(value))
+            .map(|value| {
+                value
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|err| anyhow!("invalid iroh backend addr {value:?}: {err}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let base_query = url
+            .query_pairs()
+            .filter(|(key, _)| key != "addr")
+            .map(|(key, value)| {
+                if value.is_empty() {
+                    key.into_owned()
+                } else {
+                    format!("{key}={value}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let base_query = if base_query.is_empty() {
+            None
+        } else {
+            Some(base_query.join("&"))
+        };
+        return Ok(BackendTarget {
+            scheme: BackendScheme::Iroh,
+            host: node_id.clone(),
+            is_ipv6: false,
+            port: 0,
+            base_path: url.path().to_string(),
+            base_query,
+            iroh: Some(IrohTarget {
+                node_id: node_id.clone(),
+                direct_addrs,
+            }),
+            pool_key: PoolKey::new(format!("iroh:{node_id}"), 0, false),
+        });
+    }
     let scheme = match url.scheme() {
         "http" => BackendScheme::Http,
         "https" => BackendScheme::Https,
@@ -6166,6 +6672,7 @@ pub(crate) fn parse_backend_target(raw: &str) -> Result<BackendTarget> {
         port,
         base_path,
         base_query,
+        iroh: None,
         pool_key,
     })
 }

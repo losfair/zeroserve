@@ -41,6 +41,12 @@ pub struct StaticConfig {
     pub ebpf_require_static_region_analysis: bool,
     pub validate_hostnames: Vec<String>,
     pub ebpf_compiler: EbpfCompiler,
+    #[cfg(feature = "iroh-proxy")]
+    pub iroh_proxy: bool,
+    #[cfg(feature = "iroh-proxy")]
+    pub iroh_secret_key: Option<PathBuf>,
+    #[cfg(feature = "iroh-proxy")]
+    pub iroh_disable_networking: bool,
 }
 
 impl TryFrom<Cli> for StaticConfig {
@@ -150,6 +156,12 @@ impl TryFrom<Cli> for StaticConfig {
             ebpf_require_static_region_analysis: cli.ebpf_require_static_region_analysis,
             validate_hostnames: cli.validate_hostnames,
             ebpf_compiler: cli.ebpf_compiler,
+            #[cfg(feature = "iroh-proxy")]
+            iroh_proxy: cli.iroh_proxy,
+            #[cfg(feature = "iroh-proxy")]
+            iroh_secret_key: cli.iroh_secret_key,
+            #[cfg(feature = "iroh-proxy")]
+            iroh_disable_networking: cli.iroh_disable_networking,
         })
     }
 }

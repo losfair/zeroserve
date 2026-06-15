@@ -2636,6 +2636,15 @@ unix.example.com {
     }
 
     #[test]
+    fn reverse_proxy_accepts_iroh_upstream_with_direct_addr_query() {
+        let r = routes("example.com {\n  reverse_proxy iroh://abc123?addr=127.0.0.1:12345\n}");
+        assert_eq!(
+            r[0]["handle"][0]["routes"][0]["handle"][0]["upstreams"][0]["dial"],
+            json!("iroh://abc123?addr=127.0.0.1:12345")
+        );
+    }
+
+    #[test]
     fn reverse_proxy_lowers_dynamic_upstreams() {
         let r = routes(
             r#"example.com {

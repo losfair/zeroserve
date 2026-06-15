@@ -3755,7 +3755,7 @@ fn append_upstream(addr: &str, out: &mut Vec<Value>, common_scheme: &mut String)
     match parsed.scheme.as_str() {
         "wss" => bail!("the scheme wss:// is only supported in browsers; use https:// instead"),
         "ws" => bail!("the scheme ws:// is only supported in browsers; use http:// instead"),
-        "https" | "http" | "h2c" | "" => {}
+        "https" | "http" | "h2c" | "iroh" | "" => {}
         other => bail!("unsupported URL scheme {other}://"),
     }
     if !common_scheme.is_empty() && parsed.scheme != *common_scheme {
@@ -3795,6 +3795,9 @@ struct ParsedUpstreamAddr {
 
 impl ParsedUpstreamAddr {
     fn dial_addr(&self) -> String {
+        if self.scheme == "iroh" {
+            return self.host.clone();
+        }
         if !self.network.is_empty() {
             return join_network_address(&self.network, &self.host, &self.port);
         }
@@ -3826,6 +3829,14 @@ fn parse_upstream_dial_address(addr: &str) -> Result<ParsedUpstreamAddr> {
             );
         }
         let (url, port) = parse_upstream_url(addr)?;
+        if url.scheme() == "iroh" {
+            return Ok(ParsedUpstreamAddr {
+                network: String::new(),
+                scheme: "iroh".to_string(),
+                host: addr.to_string(),
+                port: String::new(),
+            });
+        }
         let after_scheme = addr.split_once("://").map(|(_, rest)| rest).unwrap_or(addr);
         if after_scheme.contains('/')
             || after_scheme.contains('?')
