@@ -33,8 +33,9 @@ impl Service<hyper::Request<Body>> for DelayedStreamingService {
 
     fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
         let path = req.uri().path().to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
         Box::pin(async move {
-            if path == "/warmup" {
+            if path == "/base/warmup" {
                 return Ok(hyper::Response::builder()
                     .status(204)
                     .body(Body::empty())
@@ -44,6 +45,7 @@ impl Service<hyper::Request<Body>> for DelayedStreamingService {
                 .status(209)
                 .header("content-type", "text/plain")
                 .header("x-iroh-path", path)
+                .header("x-iroh-query", query)
                 .body(Body::new(DelayedBody::default()))
                 .expect("static response is valid"))
         })
@@ -116,7 +118,7 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
     fs::write(
         &script,
         format!(
-            "#include <zeroserve.h>\n\nZS_ENTRY\nzs_u64 entry(void) {{\n  const char backend[] = \"iroh://{}?addr={}\";\n  zs_reverse_proxy(backend, sizeof(backend) - 1);\n  return 0;\n}}\n",
+            "#include <zeroserve.h>\n\nZS_ENTRY\nzs_u64 entry(void) {{\n  const char backend[] = \"iroh://{}/base?addr={}&fixed=1\";\n  zs_reverse_proxy(backend, sizeof(backend) - 1);\n  return 0;\n}}\n",
             node_id, direct_addr
         ),
     )
@@ -133,7 +135,9 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set short read timeout");
     stream
-        .write_all(b"GET /stream-check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET /stream-check?client=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
         .expect("write request");
 
     let mut first_window = Vec::new();
@@ -148,7 +152,11 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
     let first_text = String::from_utf8_lossy(&first_window);
     assert!(first_text.contains("209"), "response head: {first_text}");
     assert!(
-        first_text.contains("x-iroh-path"),
+        first_text.contains("x-iroh-path: /base/stream-check"),
+        "response head: {first_text}"
+    );
+    assert!(
+        first_text.contains("x-iroh-query: fixed=1&client=1"),
         "response head: {first_text}"
     );
 

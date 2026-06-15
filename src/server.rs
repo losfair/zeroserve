@@ -4291,6 +4291,7 @@ async fn reverse_proxy_request(
     }
 
     if matches!(target.scheme, BackendScheme::Iroh) {
+        head.uri = uri;
         return reverse_proxy_iroh_request(
             &target,
             head,
@@ -4744,6 +4745,7 @@ async fn reverse_proxy_request_h2(
     }
 
     if matches!(target.scheme, BackendScheme::Iroh) {
+        head.uri = uri;
         return reverse_proxy_iroh_request_h2(
             &target,
             head,
@@ -4881,7 +4883,7 @@ where
         drain_payload(reader, &mut body).await;
         let send = send_fixed(
             w,
-            bad_gateway(),
+            not_implemented(),
             early_response_headers,
             metadata,
             hook_state,
@@ -4916,7 +4918,7 @@ where
 
     prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
     head.headers = headers;
-    let (body_tx, request_body) = crate::iroh_proxy::request_body_channel();
+    let (mut body_tx, request_body) = crate::iroh_proxy::request_body_channel();
     let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
         target: target
             .iroh
@@ -4928,14 +4930,18 @@ where
         body: request_body,
     })?;
 
+    // This v1 transport streams without buffering, but it is not a full-duplex
+    // tunnel: responses are sent to the client after the request body finishes.
+    // Upgrade/WebSocket traffic is rejected above until the proxy path can drive
+    // both directions concurrently.
     if send_request_body {
-        match stream_h1_request_body_to_iroh(reader, &mut body, &body_tx, request_body_limit)
+        match stream_h1_request_body_to_iroh(reader, &mut body, &mut body_tx, request_body_limit)
             .await?
         {
             StreamRequestBodyOutcome::Complete => {}
             StreamRequestBodyOutcome::TooLarge => {
                 crate::iroh_proxy::send_request_body_error(
-                    &body_tx,
+                    &mut body_tx,
                     "request body exceeded configured limit".to_string(),
                 )
                 .await;
@@ -5012,7 +5018,7 @@ async fn reverse_proxy_iroh_request_h2(
 
     prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
     head.headers = headers;
-    let (body_tx, request_body) = crate::iroh_proxy::request_body_channel();
+    let (mut body_tx, request_body) = crate::iroh_proxy::request_body_channel();
     let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
         target: target
             .iroh
@@ -5024,12 +5030,14 @@ async fn reverse_proxy_iroh_request_h2(
         body: request_body,
     })?;
 
+    // See the HTTP/1 iroh path: v1 streams bodies without collecting them, but
+    // still completes request upload before sending the response downstream.
     if send_request_body {
-        match stream_h2_request_body_to_iroh(&mut body, &body_tx, request_body_limit).await? {
+        match stream_h2_request_body_to_iroh(&mut body, &mut body_tx, request_body_limit).await? {
             StreamRequestBodyOutcome::Complete => {}
             StreamRequestBodyOutcome::TooLarge => {
                 crate::iroh_proxy::send_request_body_error(
-                    &body_tx,
+                    &mut body_tx,
                     "request body exceeded configured limit".to_string(),
                 )
                 .await;
@@ -5079,7 +5087,7 @@ enum StreamRequestBodyOutcome {
 async fn stream_h1_request_body_to_iroh<R: AsyncReadRent>(
     reader: &mut h1::H1Connection<R>,
     body: &mut h1::Body,
-    sender: &crate::iroh_proxy::RequestBodySender,
+    sender: &mut crate::iroh_proxy::RequestBodySender,
     limit: Option<usize>,
 ) -> Result<StreamRequestBodyOutcome> {
     let mut bytes_seen = 0usize;
@@ -5097,7 +5105,7 @@ async fn stream_h1_request_body_to_iroh<R: AsyncReadRent>(
 
 async fn stream_h2_request_body_to_iroh(
     body: &mut h2::RecvStream,
-    sender: &crate::iroh_proxy::RequestBodySender,
+    sender: &mut crate::iroh_proxy::RequestBodySender,
     limit: Option<usize>,
 ) -> Result<StreamRequestBodyOutcome> {
     let mut bytes_seen = 0usize;
@@ -6739,6 +6747,10 @@ fn bad_gateway() -> ::http::Response<Bytes> {
         .header(::http::header::CONTENT_LENGTH, "0")
         .body(Bytes::new())
         .unwrap()
+}
+
+fn not_implemented() -> ::http::Response<Bytes> {
+    text_response(StatusCode::NOT_IMPLEMENTED, "Not Implemented")
 }
 
 fn method_not_allowed() -> ::http::Response<Bytes> {

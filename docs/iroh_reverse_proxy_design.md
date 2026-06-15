@@ -72,6 +72,8 @@ The URL grammar should allow:
 - `iroh://<endpoint-key>`: dial by key using configured address lookup.
 - `iroh://<endpoint-key>/<base-path>`: prepend a base path like existing HTTP
   upstream URLs.
+- `?addr=<socket-addr>`: provide one or more direct addresses for dialing. This
+  parameter is consumed by zeroserve and is not forwarded upstream.
 - `iroh+ticket://<endpoint-ticket>` or `iroh://ticket/<encoded-ticket>`:
   optional ticket form when the operator has full endpoint addressing material.
 - `?alpn=<name>`: optional override for advanced interop; default to a
@@ -119,6 +121,8 @@ Responsibilities:
 - Own the single process-wide iroh endpoint.
 - Persist or load an iroh secret key from a CLI-configured path, so the local
   zeroserve endpoint identity is stable across restarts.
+- Create new secret-key files with `0600` permissions and tighten existing
+  group/world-readable key files before reading them.
 - Configure iroh address lookup and relay defaults.
 - Dial a remote endpoint by key or ticket with the selected ALPN.
 - Cache iroh connections by `(endpoint key, ALPN)`.
@@ -163,6 +167,13 @@ The direct adapter is preferred for throughput and backpressure. The channel
 bridge is acceptable for the first implementation if it has bounded buffers,
 propagates cancellation, and is covered by streaming-body tests.
 
+The current implementation uses bounded runtime-neutral channels across the
+monoio/Tokio boundary. It is streaming and waker-driven, not poll/sleep driven,
+but it is still not a full-duplex tunnel: non-upgrade request bodies are
+uploaded before the response is sent to the client. WebSocket and other upgrade
+requests are rejected with `501 Not Implemented` until the server path can
+drive both directions concurrently.
+
 ## CLI And Configuration
 
 Add CLI flags in `src/cli.rs`:
@@ -203,6 +214,8 @@ no eBPF SDK change is required.
 - Preserve existing request-body limits and timeout behavior.
 - Add explicit dial and response-header timeouts for iroh, because relay-backed
   paths can fail differently than local TCP.
+- Bound queued iroh proxy commands and concurrent fetches so the background
+  Tokio runtime applies backpressure under load.
 - Log the authenticated remote key and whether the connection used relay or
   direct paths when iroh exposes that state.
 
@@ -221,6 +234,8 @@ Integration tests:
 
 - Start a test iroh HTTP service and proxy through zeroserve by key.
 - Stream request and response bodies larger than the in-memory body limit.
+- Confirm base path/query merging for `iroh://<key>/<base>?addr=...&x=...`
+  matches existing HTTP upstream behavior.
 - Exercise HTTP/1 clients and HTTP/2 clients against the same iroh upstream.
 - Verify WebSocket upgrade behavior or explicitly reject WebSocket over iroh in
   v1 if the stream adapter cannot tunnel full duplex safely.
@@ -244,6 +259,9 @@ Manual tests:
   separate release artifact/feature due to Tokio and dependency size?
 - How should access logs represent iroh upstream latency and relay/direct path
   state?
+- Should the v2 transport drive true full duplex for request body upload and
+  response body download, or should that remain limited to upgrade-capable
+  transports?
 
 ## Proposed Milestones
 

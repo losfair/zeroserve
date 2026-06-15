@@ -373,6 +373,8 @@ Current generated middleware support includes:
 - error routes and `handle_errors` for supported error status handling
 - reverse proxying to supported static or placeholder-expanded upstreams,
   including Unix socket upstream dials such as `unix//run/docker.sock`,
+  feature-gated zeroserve `iroh://<node-id>` upstream dials when built and run
+  with iroh proxy support,
   selected request rewrite/header mutation including upstream method/URI
   rewrite with Caddy-compatible `GET`/`HEAD` request-body suppression,
   response-header hooks, response status replacement, Caddy's default upstream
@@ -418,7 +420,7 @@ body rewriting/copying or Caddy's full server runtime. In particular:
   logs
 - no advanced reverse-proxy load balancing, retry, health-check, dynamic
   upstream, or transport/TLS customization semantics beyond supported Unix
-  socket upstream dials
+  socket upstream dials and feature-gated zeroserve `iroh://` upstream dials
 - no filesystem exposure unless `--expose-filesystem` is explicitly provided
 
 Unsupported surfaces should be rejected or warned about clearly. They should not
