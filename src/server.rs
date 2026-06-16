@@ -4880,7 +4880,6 @@ where
 {
     let is_ws_request = h1::is_websocket_upgrade_request(&head);
     if is_ws_request {
-        drain_payload(reader, &mut body).await;
         let send = send_fixed(
             w,
             not_implemented(),

@@ -233,12 +233,14 @@ Unit tests:
 Integration tests:
 
 - Start a test iroh HTTP service and proxy through zeroserve by key.
-- Stream request and response bodies larger than the in-memory body limit.
 - Confirm base path/query merging for `iroh://<key>/<base>?addr=...&x=...`
   matches existing HTTP upstream behavior.
-- Exercise HTTP/1 clients and HTTP/2 clients against the same iroh upstream.
-- Verify WebSocket upgrade behavior or explicitly reject WebSocket over iroh in
-  v1 if the stream adapter cannot tunnel full duplex safely.
+- Confirm response bodies stream incrementally through zeroserve instead of
+  being collected before forwarding.
+- Stream request bodies larger than the in-memory body limit.
+- Exercise the request-body TooLarge path.
+- Exercise HTTP/2 clients against the same iroh upstream.
+- Verify WebSocket upgrade requests return `501 Not Implemented`.
 - Kill the remote endpoint and verify zeroserve returns a gateway error without
   poisoning hot reload state.
 

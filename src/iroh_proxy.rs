@@ -59,7 +59,7 @@ mod enabled {
         io,
         path::Path,
         pin::Pin,
-        sync::{Arc, Mutex, OnceLock},
+        sync::{Arc, OnceLock, mpsc as std_mpsc},
         task::{Context, Poll},
         time::Duration,
     };
@@ -82,7 +82,7 @@ mod enabled {
     static CLIENT: OnceLock<IrohProxyClient> = OnceLock::new();
 
     struct IrohProxyClient {
-        tx: Mutex<mpsc::Sender<Command>>,
+        tx: std_mpsc::SyncSender<Command>,
     }
 
     struct Command {
@@ -134,7 +134,7 @@ mod enabled {
             };
         }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<Command>(COMMAND_CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
         std::thread::Builder::new()
             .name("zeroserve-iroh-proxy".to_string())
@@ -151,39 +151,38 @@ mod enabled {
                     }
                 };
 
-                runtime.block_on(async move {
-                    let endpoint = match IrohEndpoint::bind(node_options).await {
-                        Ok(endpoint) => endpoint,
-                        Err(err) => {
-                            let _ =
-                                ready_tx.send(Err(format!("failed to bind iroh endpoint: {err}")));
-                            return;
-                        }
-                    };
-                    let node_id = endpoint.node_id().to_string();
-                    let _ = ready_tx.send(Ok(node_id));
-                    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+                let endpoint = match runtime.block_on(IrohEndpoint::bind(node_options)) {
+                    Ok(endpoint) => endpoint,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(format!("failed to bind iroh endpoint: {err}")));
+                        return;
+                    }
+                };
+                let node_id = endpoint.node_id().to_string();
+                let _ = ready_tx.send(Ok(node_id));
+                let handle = runtime.handle().clone();
+                let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
 
-                    while let Some(command) = cmd_rx.next().await {
-                        let permit = match semaphore.clone().acquire_owned().await {
+                while let Ok(command) = cmd_rx.recv() {
+                    let endpoint = endpoint.clone();
+                    let semaphore = semaphore.clone();
+                    handle.spawn(async move {
+                        let permit = match semaphore.acquire_owned().await {
                             Ok(permit) => permit,
                             Err(_) => {
                                 let _ = command
                                     .tx
                                     .send(Err("iroh proxy concurrency limiter closed".to_string()));
-                                continue;
+                                return;
                             }
                         };
-                        let endpoint = endpoint.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let result = fetch_on_tokio(&endpoint, command.request)
-                                .await
-                                .map_err(|err| err.to_string());
-                            let _ = command.tx.send(result);
-                        });
-                    }
-                });
+                        let _permit = permit;
+                        let result = fetch_on_tokio(&endpoint, command.request)
+                            .await
+                            .map_err(|err| err.to_string());
+                        let _ = command.tx.send(result);
+                    });
+                }
             })
             .map_err(|err| anyhow!("failed to spawn iroh proxy thread: {err}"))?;
 
@@ -192,9 +191,7 @@ mod enabled {
             .map_err(|err| anyhow!("iroh proxy thread stopped during startup: {err}"))?
             .map_err(|err| anyhow!(err))?;
         CLIENT
-            .set(IrohProxyClient {
-                tx: Mutex::new(cmd_tx),
-            })
+            .set(IrohProxyClient { tx: cmd_tx })
             .map_err(|_| anyhow!("iroh proxy already initialized"))?;
         eprintln!("iroh proxy enabled: local node id {node_id}");
         Ok(())
@@ -225,16 +222,12 @@ mod enabled {
             .get()
             .ok_or_else(|| anyhow!("iroh proxy transport is not enabled"))?;
         let (tx, rx) = oneshot::channel();
-        let mut command_tx = client
+        client
             .tx
-            .lock()
-            .map_err(|_| anyhow!("iroh proxy command channel lock poisoned"))?;
-        command_tx
             .try_send(Command { request, tx })
-            .map_err(|err| {
-                if err.is_full() {
-                    anyhow!("too many queued iroh proxy requests")
-                } else {
+            .map_err(|err| match err {
+                std_mpsc::TrySendError::Full(_) => anyhow!("too many queued iroh proxy requests"),
+                std_mpsc::TrySendError::Disconnected(_) => {
                     anyhow!("iroh proxy thread is not running")
                 }
             })?;

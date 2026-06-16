@@ -3,7 +3,7 @@
 use std::{
     convert::Infallible,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     pin::Pin,
@@ -15,6 +15,7 @@ use std::{
 
 use bytes::Bytes;
 use http_body::Frame;
+use http_body_util::BodyExt;
 use iroh_http_core::{Body, IrohEndpoint, NetworkingOptions, NodeOptions, ServeOptions, serve};
 use tower::Service;
 
@@ -39,6 +40,24 @@ impl Service<hyper::Request<Body>> for DelayedStreamingService {
                 return Ok(hyper::Response::builder()
                     .status(204)
                     .body(Body::empty())
+                    .expect("static response is valid"));
+            }
+            if path == "/base/echo-body" {
+                let mut len = 0usize;
+                let mut body = req.into_body();
+                while let Some(frame) = body.frame().await {
+                    let frame = frame.expect("request body frame is readable");
+                    if let Ok(chunk) = frame.into_data() {
+                        len += chunk.len();
+                    }
+                }
+                return Ok(hyper::Response::builder()
+                    .status(211)
+                    .header("content-type", "text/plain")
+                    .header("x-iroh-path", path)
+                    .header("x-iroh-query", query)
+                    .header("x-iroh-body-len", len.to_string())
+                    .body(Body::full(Bytes::from(format!("len={len}\n"))))
                     .expect("static response is valid"));
             }
             Ok(hyper::Response::builder()
@@ -89,24 +108,7 @@ impl http_body::Body for DelayedBody {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response() {
-    let server_ep = IrohEndpoint::bind(NodeOptions {
-        networking: NetworkingOptions {
-            disabled: true,
-            bind_addrs: vec!["127.0.0.1:0".to_string()],
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .await
-    .expect("bind iroh endpoint");
-    let node_id = server_ep.node_id().to_string();
-    let direct_addr = server_ep
-        .raw()
-        .addr()
-        .ip_addrs()
-        .next()
-        .copied()
-        .expect("iroh endpoint has a direct address");
+    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
     let _serve = serve(
         server_ep.clone(),
         ServeOptions::default(),
@@ -115,14 +117,11 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
 
     let temp = TempDir::new("zeroserve-iroh-proxy-e2e");
     let script = temp.path().join("proxy.c");
-    fs::write(
+    write_proxy_script(
         &script,
-        format!(
-            "#include <zeroserve.h>\n\nZS_ENTRY\nzs_u64 entry(void) {{\n  const char backend[] = \"iroh://{}/base?addr={}&fixed=1\";\n  zs_reverse_proxy(backend, sizeof(backend) - 1);\n  return 0;\n}}\n",
-            node_id, direct_addr
-        ),
-    )
-    .expect("write proxy script");
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        None,
+    );
 
     let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
     let port = wait_for_http_port(zeroserve.child_mut());
@@ -169,6 +168,211 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
     assert!(full.contains("second\n"), "full response: {full}");
 
     zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_streams_request_bodies_to_real_iroh_http_server() {
+    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
+    let _serve = serve(
+        server_ep.clone(),
+        ServeOptions::default(),
+        DelayedStreamingService,
+    );
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-body-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let chunks = vec![vec![b'a'; 1024]; 64];
+    let response = http_post_chunked(
+        port,
+        "/echo-body?client=body",
+        &chunks,
+        Duration::from_secs(45),
+    );
+    assert!(response.contains("211"), "response: {response}");
+    assert!(
+        response.contains("x-iroh-path: /base/echo-body"),
+        "response: {response}"
+    );
+    assert!(
+        response.contains("x-iroh-query: fixed=1&client=body"),
+        "response: {response}"
+    );
+    assert!(
+        response.contains("x-iroh-body-len: 65536"),
+        "response: {response}"
+    );
+    assert!(response.contains("len=65536"), "response: {response}");
+
+    zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_reverse_proxies_h2_clients_to_real_iroh_http_server() {
+    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
+    let _serve = serve(
+        server_ep.clone(),
+        ServeOptions::default(),
+        DelayedStreamingService,
+    );
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-h2-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let response = h2_get(port, "/h2-check?client=h2").await;
+    assert_eq!(response.status(), http::StatusCode::from_u16(209).unwrap());
+    assert_eq!(
+        response.headers().get("x-iroh-path").unwrap(),
+        "/base/h2-check"
+    );
+    assert_eq!(
+        response.headers().get("x-iroh-query").unwrap(),
+        "fixed=1&client=h2"
+    );
+
+    zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_iroh_proxy_rejects_too_large_chunked_request_body() {
+    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
+    let _serve = serve(
+        server_ep.clone(),
+        ServeOptions::default(),
+        DelayedStreamingService,
+    );
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-limit-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        Some(4),
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let response = http_post_chunked(
+        port,
+        "/echo-body?client=limit",
+        &[b"abc".to_vec(), b"def".to_vec()],
+        Duration::from_secs(45),
+    );
+    assert!(
+        response.contains("413"),
+        "too-large response should be 413: {response}"
+    );
+
+    zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_iroh_proxy_rejects_upgrade_requests_with_501() {
+    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
+    let _serve = serve(
+        server_ep.clone(),
+        ServeOptions::default(),
+        DelayedStreamingService,
+    );
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-upgrade-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let response = http_request_all(
+        port,
+        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n",
+        Duration::from_secs(20),
+    );
+    assert!(
+        response.contains("501"),
+        "upgrade response should be 501: {response}"
+    );
+
+    zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_iroh_proxy_returns_gateway_error_for_dead_endpoint() {
+    let bogus_node_id = iroh::SecretKey::generate().public().to_string();
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-dead-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{bogus_node_id}/base?addr=127.0.0.1:1&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let response = http_get_all(port, "/dead", Duration::from_secs(45));
+    assert!(
+        response.contains("502"),
+        "dead endpoint response should be 502: {response}"
+    );
+
+    zeroserve.stop();
+}
+
+async fn bind_iroh_endpoint() -> (IrohEndpoint, String, std::net::SocketAddr) {
+    let server_ep = IrohEndpoint::bind(NodeOptions {
+        networking: NetworkingOptions {
+            disabled: true,
+            bind_addrs: vec!["127.0.0.1:0".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("bind iroh endpoint");
+    let node_id = server_ep.node_id().to_string();
+    let direct_addr = server_ep
+        .raw()
+        .addr()
+        .ip_addrs()
+        .next()
+        .copied()
+        .expect("iroh endpoint has a direct address");
+    (server_ep, node_id, direct_addr)
+}
+
+fn write_proxy_script(script: &Path, backend: &str, body_limit: Option<usize>) {
+    let limit = body_limit
+        .map(|limit| format!("  zs_req_body_limit({limit});\n"))
+        .unwrap_or_default();
+    fs::write(
+        script,
+        format!(
+            "#include <zeroserve.h>\n\nZS_ENTRY\nzs_u64 entry(void) {{\n{limit}  const char backend[] = \"{backend}\";\n  zs_reverse_proxy(backend, sizeof(backend) - 1);\n  return 0;\n}}\n"
+        ),
+    )
+    .expect("write proxy script");
 }
 
 fn spawn_zeroserve(script: &Path) -> Child {
@@ -240,18 +444,97 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 }
 
 fn http_get_all(port: u16, path: &str, timeout: Duration) -> String {
+    http_request_all(
+        port,
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+        timeout,
+    )
+}
+
+fn http_post_chunked(port: u16, path: &str, chunks: &[Vec<u8>], timeout: Duration) -> String {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    for chunk in chunks {
+        write!(&mut request, "{:x}\r\n", chunk.len()).expect("write chunk size");
+        request.extend_from_slice(chunk);
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"0\r\n\r\n");
+    http_request_all(port, &request, timeout)
+}
+
+fn http_request_all(port: u16, request: &[u8], timeout: Duration) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect zeroserve");
     stream
         .set_read_timeout(Some(timeout))
         .expect("set read timeout");
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .expect("write request");
-    let mut out = String::new();
-    stream.read_to_string(&mut out).expect("read response");
-    out
+    stream.write_all(request).expect("write request");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if response_is_complete(&out) {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock && !out.is_empty() => break,
+            Err(err) => panic!("read response: {err}"),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn response_is_complete(response: &[u8]) -> bool {
+    let Some(head_end) = find_subslice(response, b"\r\n\r\n") else {
+        return false;
+    };
+    let body_start = head_end + 4;
+    let head = String::from_utf8_lossy(&response[..head_end]);
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length")
+            && let Ok(len) = value.trim().parse::<usize>()
+        {
+            return response.len().saturating_sub(body_start) >= len;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        {
+            return response[body_start..].windows(5).any(|w| w == b"0\r\n\r\n");
+        }
+    }
+    false
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn h2_get(port: u16, path: &str) -> http::Response<h2::RecvStream> {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect zeroserve h2c");
+    let (mut client, connection) = h2::client::handshake(stream).await.expect("h2c handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", "localhost")
+        .body(())
+        .expect("build h2 request");
+    let (response, _) = client.send_request(request, true).expect("send h2 request");
+    response.await.expect("h2 response")
 }
 
 struct TempDir {
