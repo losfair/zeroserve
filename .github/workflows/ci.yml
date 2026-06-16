@@ -173,11 +173,12 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Release binaries for linux/amd64 and linux/arm64, linked against glibc 2.31
-  # via cargo-zigbuild. Runs on every push/PR to catch build breaks; artifacts
-  # are consumed by the `release` job on tags.
+  # via cargo-zigbuild. Builds both the default binary and an iroh-enabled
+  # variant. Runs on every push/PR to catch build breaks; artifacts are consumed
+  # by the `release` job on tags.
   # ---------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.asset }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -185,10 +186,20 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             zig_target: x86_64-unknown-linux-gnu.2.31
+            feature_flags: ""
             asset: zeroserve-x86_64-linux
           - target: aarch64-unknown-linux-gnu
             zig_target: aarch64-unknown-linux-gnu.2.31
+            feature_flags: ""
             asset: zeroserve-aarch64-linux
+          - target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.31
+            feature_flags: "--features iroh-proxy"
+            asset: zeroserve-x86_64-linux-iroh
+          - target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.31
+            feature_flags: "--features iroh-proxy"
+            asset: zeroserve-aarch64-linux-iroh
     steps:
       - uses: actions/checkout@v4
 
@@ -206,7 +217,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.asset }}
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -218,7 +229,7 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Build
-        run: cargo zigbuild --release --locked --target ${{ matrix.zig_target }}
+        run: cargo zigbuild --release --locked ${{ matrix.feature_flags }} --target ${{ matrix.zig_target }}
 
       # cargo-zigbuild strips the glibc suffix from the output directory.
       - name: Stage artifact

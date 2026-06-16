@@ -51,6 +51,9 @@ curl -fsSL "https://github.com/losfair/zeroserve/releases/download/v0.2.11/zeros
   -o zeroserve && chmod +x zeroserve
 ```
 
+Iroh-enabled release binaries are published with an `-iroh` suffix, for example
+`zeroserve-x86_64-linux-iroh` and `zeroserve-aarch64-linux-iroh`.
+
 From source (requires a recent stable Rust toolchain; Linux only):
 
 ```bash
