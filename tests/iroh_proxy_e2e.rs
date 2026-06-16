@@ -3,7 +3,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
-    net::TcpStream,
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use iroh::{
-    Endpoint, RelayMode,
+    Endpoint, RelayMode, SecretKey,
     endpoint::{RecvStream, SendStream, presets},
 };
 
@@ -301,6 +301,67 @@ async fn zeroserve_iroh_proxy_returns_gateway_error_for_dead_endpoint() {
     );
 
     zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_reverse_proxies_through_real_dumbpipe_listen_tcp() {
+    let Some(dumbpipe) = dumbpipe_bin() else {
+        eprintln!("skipping real dumbpipe e2e: set DUMBPIPE_BIN or install dumbpipe on PATH");
+        return;
+    };
+
+    let (backend_addr, backend_request_rx) = start_single_request_http_backend();
+    let secret = SecretKey::generate();
+    let secret_hex = hex_encode_32(&secret.to_bytes());
+    let node_id = secret.public().to_string();
+    let iroh_addr = format!("127.0.0.1:{}", unused_tcp_port());
+
+    let mut dumbpipe = ChildGuard::new(
+        Command::new(dumbpipe)
+            .arg("listen-tcp")
+            .arg("--host")
+            .arg(backend_addr.to_string())
+            .arg("--ipv4-addr")
+            .arg(&iroh_addr)
+            .env("IROH_SECRET", &secret_hex)
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn dumbpipe listen-tcp"),
+    );
+    wait_for_dumbpipe_listen_tcp(dumbpipe.child_mut());
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-real-dumbpipe-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/via-dumbpipe?addr={iroh_addr}&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let response = http_get_all(port, "/real?client=dumbpipe", Duration::from_secs(45));
+    assert!(response.contains("217"), "response: {response}");
+    assert!(
+        response.contains(
+            "dumbpipe backend saw GET /via-dumbpipe/real?fixed=1&client=dumbpipe HTTP/1.1"
+        ),
+        "response: {response}"
+    );
+    let backend_request = backend_request_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("backend received request through dumbpipe");
+    assert!(
+        backend_request.starts_with("GET /via-dumbpipe/real?fixed=1&client=dumbpipe HTTP/1.1"),
+        "backend request: {backend_request}"
+    );
+
+    zeroserve.stop();
+    dumbpipe.stop();
 }
 
 struct IrohHttpServer {
@@ -719,6 +780,108 @@ fn wait_for_http_port(child: &mut Child) -> u16 {
             return port;
         }
     }
+}
+
+fn wait_for_dumbpipe_listen_tcp(child: &mut Child) {
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        for line in reader.lines().map_while(Result::ok) {
+                            eprintln!("[dumbpipe] {line}");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut captured = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for dumbpipe listen-tcp ticket; stderr:\n{captured}"
+        );
+        let line = rx.recv_timeout(remaining).unwrap_or_else(|_| {
+            panic!("dumbpipe exited or stopped logging before ticket; stderr:\n{captured}")
+        });
+        let ready = line.contains("dumbpipe connect-tcp ");
+        captured.push_str(&line);
+        if ready {
+            return;
+        }
+    }
+}
+
+fn start_single_request_http_backend() -> (SocketAddr, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind dumbpipe backend");
+    let addr = listener.local_addr().expect("backend local addr");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept dumbpipe backend request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("set backend read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).expect("read backend request");
+            assert!(n > 0, "backend connection closed before request head");
+            request.extend_from_slice(&buf[..n]);
+        }
+        let request_text = String::from_utf8_lossy(&request).into_owned();
+        let request_line = request_text.lines().next().unwrap_or_default().to_string();
+        tx.send(request_text).expect("send backend request");
+        let body = format!("dumbpipe backend saw {request_line}\n");
+        let response = format!(
+            "HTTP/1.1 217 Dumbpipe\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write backend response");
+    });
+    (addr, rx)
+}
+
+fn dumbpipe_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("DUMBPIPE_BIN")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join("dumbpipe"))
+            .find(|path| path.is_file())
+    })
+}
+
+fn unused_tcp_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind unused tcp port")
+        .local_addr()
+        .expect("unused tcp local addr")
+        .port()
+}
+
+fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn parse_listen_port(line: &str) -> Option<u16> {
