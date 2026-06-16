@@ -26,10 +26,11 @@ pub(crate) struct IrohProxyResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) body: ResponseBody,
+    pub(crate) upgraded: bool,
 }
 
 #[cfg(feature = "iroh-proxy")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestBodySender(futures::channel::mpsc::Sender<Result<Bytes, String>>);
 
 #[cfg(feature = "iroh-proxy")]
@@ -41,7 +42,7 @@ pub(crate) struct RequestBody(futures::channel::mpsc::Receiver<Result<Bytes, Str
 pub(crate) struct ResponseBody(futures::channel::mpsc::Receiver<Result<Bytes, String>>);
 
 #[cfg(not(feature = "iroh-proxy"))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestBodySender;
 
 #[cfg(not(feature = "iroh-proxy"))]
@@ -240,12 +241,12 @@ mod enabled {
             .await
             .map_err(|_| anyhow!("iroh connect timed out"))?
             .map_err(|err| anyhow!("iroh connect failed: {err}"))?;
-        let (mut send, recv) = tokio::time::timeout(FETCH_TIMEOUT, conn.open_bi())
+        let (send, recv) = tokio::time::timeout(FETCH_TIMEOUT, conn.open_bi())
             .await
             .map_err(|_| anyhow!("iroh stream open timed out"))?
             .map_err(|err| anyhow!("iroh stream open failed: {err}"))?;
 
-        write_http1_request(&mut send, request)
+        let _request_writer = start_http1_request(send, request)
             .await
             .map_err(|err| anyhow!("failed to write dumbpipe HTTP/1 request: {err}"))?;
 
@@ -255,19 +256,23 @@ mod enabled {
             .map_err(|_| anyhow!("iroh response head timed out"))??;
         let content_length = response_content_length(&headers)?;
         let chunked = response_is_chunked(&headers);
-        let has_body = raw_status_allows_body(status);
+        let upgraded = status == StatusCode::SWITCHING_PROTOCOLS;
+        let has_body = upgraded || raw_status_allows_body(status);
         let (mut body_tx, body_rx) =
             mpsc::channel::<Result<Bytes, String>>(RESPONSE_BODY_CHANNEL_CAPACITY);
         let response = IrohProxyResponse {
             status,
             headers,
             body: ResponseBody(body_rx),
+            upgraded,
         };
         tokio::spawn(async move {
             if !has_body {
                 return;
             }
-            let result = if chunked {
+            let result = if upgraded {
+                reader.stream_until_eof(&mut body_tx).await
+            } else if chunked {
                 reader.stream_chunked_body(&mut body_tx).await
             } else if let Some(len) = content_length {
                 reader.stream_content_length_body(len, &mut body_tx).await
@@ -304,10 +309,10 @@ mod enabled {
             .map_err(|err| anyhow!("failed to bind iroh endpoint: {err}"))
     }
 
-    async fn write_http1_request(
-        send: &mut SendStream,
+    async fn start_http1_request(
+        mut send: SendStream,
         mut request: IrohProxyRequest,
-    ) -> Result<()> {
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
         send.write_all(DUMBPIPE_HANDSHAKE)
             .await
             .map_err(|err| anyhow!("failed to write dumbpipe handshake: {err}"))?;
@@ -337,7 +342,19 @@ mod enabled {
             .await
             .map_err(|err| anyhow!("failed to write HTTP/1 request head: {err}"))?;
 
-        while let Some(chunk) = request.body.0.next().await {
+        Ok(tokio::spawn(async move {
+            write_http1_request_body(&mut send, &mut request.body, chunk_request_body).await?;
+            send.finish()
+                .map_err(|err| anyhow!("failed to finish iroh request stream: {err}"))
+        }))
+    }
+
+    async fn write_http1_request_body(
+        send: &mut SendStream,
+        body: &mut RequestBody,
+        chunk_request_body: bool,
+    ) -> Result<()> {
+        while let Some(chunk) = body.0.next().await {
             let chunk = chunk.map_err(|err| anyhow!("request body stream failed: {err}"))?;
             if chunk_request_body {
                 let prefix = format!("{:x}\r\n", chunk.len());
@@ -361,8 +378,7 @@ mod enabled {
                 .await
                 .map_err(|err| anyhow!("failed to finish chunked request body: {err}"))?;
         }
-        send.finish()
-            .map_err(|err| anyhow!("failed to finish iroh request stream: {err}"))
+        Ok(())
     }
 
     struct IrohResponseReader {

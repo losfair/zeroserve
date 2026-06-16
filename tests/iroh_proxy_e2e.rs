@@ -119,6 +119,57 @@ async fn zeroserve_streams_request_bodies_to_real_iroh_http_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zeroserve_streams_iroh_response_before_request_body_finishes() {
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
+
+    let temp = TempDir::new("zeroserve-iroh-proxy-full-duplex-e2e");
+    let script = temp.path().join("proxy.c");
+    write_proxy_script(
+        &script,
+        &format!("iroh://{node_id}/base?addr={direct_addr}&fixed=1"),
+        None,
+    );
+
+    let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
+    let port = wait_for_http_port(zeroserve.child_mut());
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect zeroserve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .write_all(
+            b"POST /early-response?client=duplex HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n400\r\n",
+        )
+        .expect("write request head and first chunk size");
+    stream
+        .write_all(&vec![b'a'; 1024])
+        .expect("write first chunk body");
+    stream.write_all(b"\r\n").expect("finish first chunk");
+
+    let early = read_until(&mut stream, b"early\n");
+    assert!(early.contains("213"), "early response head: {early}");
+    assert!(
+        early.contains("early\n"),
+        "response should arrive before request body finishes: {early}"
+    );
+
+    stream
+        .write_all(b"400\r\n")
+        .expect("write second chunk size");
+    stream
+        .write_all(&vec![b'b'; 1024])
+        .expect("write second chunk body");
+    stream
+        .write_all(b"\r\n0\r\n\r\n")
+        .expect("finish chunked request");
+    let done = read_until(&mut stream, b"len=2048\n");
+    assert!(done.contains("len=2048\n"), "full response: {done}");
+
+    zeroserve.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_reverse_proxies_h2_clients_to_real_iroh_http_server() {
     let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
@@ -177,7 +228,7 @@ async fn zeroserve_iroh_proxy_rejects_too_large_chunked_request_body() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zeroserve_iroh_proxy_rejects_upgrade_requests_with_501() {
+async fn zeroserve_iroh_proxy_tunnels_websocket_upgrade_bytes() {
     let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-upgrade-e2e");
@@ -191,14 +242,35 @@ async fn zeroserve_iroh_proxy_rejects_upgrade_requests_with_501() {
     let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
     let port = wait_for_http_port(zeroserve.child_mut());
 
-    let response = http_request_all(
-        port,
-        b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n",
-        Duration::from_secs(20),
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect zeroserve");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("set read timeout");
+    stream
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .expect("write upgrade request");
+
+    let response_head = read_until(&mut stream, b"\r\n\r\n");
+    assert!(
+        response_head.contains("101"),
+        "upgrade response should be 101: {response_head}"
     );
     assert!(
-        response.contains("501"),
-        "upgrade response should be 501: {response}"
+        response_head
+            .to_ascii_lowercase()
+            .contains("upgrade: websocket"),
+        "upgrade response should preserve upgrade headers: {response_head}"
+    );
+
+    stream
+        .write_all(b"ping-over-iroh")
+        .expect("write websocket bytes");
+    let echoed = read_until(&mut stream, b"echo:ping-over-iroh");
+    assert!(
+        echoed.contains("echo:ping-over-iroh"),
+        "websocket echo: {echoed}"
     );
 
     zeroserve.stop();
@@ -302,6 +374,10 @@ async fn handle_dumbpipe_http_stream(
     let request = reader.read_request_head().await?;
     if request.path == "/base/warmup" {
         write_response(&mut send, 204, &[("content-length", "0")], &[]).await?;
+    } else if request.path == "/base/ws" {
+        write_websocket_echo_response(&mut send, &mut reader).await?;
+    } else if request.path == "/base/early-response" {
+        write_early_response_then_read_body(&mut send, &mut reader, &request.headers).await?;
     } else if request.path == "/base/echo-body" {
         let len = reader.read_request_body_len(&request.headers).await?;
         let body = format!("len={len}\n");
@@ -542,6 +618,37 @@ async fn write_chunked_streaming_response(
     Ok(())
 }
 
+async fn write_websocket_echo_response(
+    send: &mut SendStream,
+    reader: &mut TestHttpReader,
+) -> anyhow::Result<()> {
+    send.write_all(
+        b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+    )
+    .await?;
+    while let Some(chunk) = reader.next_chunk(8192).await? {
+        send.write_all(b"echo:").await?;
+        send.write_all(&chunk).await?;
+    }
+    Ok(())
+}
+
+async fn write_early_response_then_read_body(
+    send: &mut SendStream,
+    reader: &mut TestHttpReader,
+    headers: &[(String, String)],
+) -> anyhow::Result<()> {
+    send.write_all(
+        b"HTTP/1.1 213 test\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n6\r\nearly\n\r\n",
+    )
+    .await?;
+    let len = reader.read_request_body_len(headers).await?;
+    let body = format!("len={len}\n");
+    let chunk = format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+    send.write_all(chunk.as_bytes()).await?;
+    Ok(())
+}
+
 fn write_proxy_script(script: &Path, backend: &str, body_limit: Option<usize>) {
     let limit = body_limit
         .map(|limit| format!("  zs_req_body_limit({limit});\n"))
@@ -665,6 +772,17 @@ fn http_request_all(port: u16, request: &[u8], timeout: Duration) -> String {
             Err(err) if err.kind() == ErrorKind::WouldBlock && !out.is_empty() => break,
             Err(err) => panic!("read response: {err}"),
         }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn read_until(stream: &mut TcpStream, needle: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 512];
+    while !out.windows(needle.len()).any(|window| window == needle) {
+        let n = stream.read(&mut buf).expect("read from stream");
+        assert!(n > 0, "stream closed before delimiter");
+        out.extend_from_slice(&buf[..n]);
     }
     String::from_utf8_lossy(&out).into_owned()
 }

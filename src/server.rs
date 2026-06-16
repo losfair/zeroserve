@@ -4879,23 +4879,6 @@ where
     R: AsyncReadRent,
 {
     let is_ws_request = h1::is_websocket_upgrade_request(&head);
-    if is_ws_request {
-        let send = send_fixed(
-            w,
-            not_implemented(),
-            early_response_headers,
-            metadata,
-            hook_state,
-        )
-        .await;
-        return Ok(ProxyOutcome {
-            reuse_backend: false,
-            send,
-            continue_request: false,
-            preserved_body: None,
-        });
-    }
-
     let client_connection_close = connection_has_close(&head.headers);
     let send_request_body = !matches!(head.method, Method::GET | Method::HEAD);
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
@@ -4906,7 +4889,7 @@ where
         } else {
             &h1::Body::None
         },
-        false,
+        is_ws_request,
         peer,
         scheme,
         metadata,
@@ -4915,7 +4898,12 @@ where
         caddy_default_forwarded,
     );
 
-    prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
+    prepare_streaming_iroh_request_headers(
+        &mut headers,
+        send_request_body,
+        &target.host,
+        is_ws_request,
+    )?;
     head.headers = headers;
     let (mut body_tx, request_body) = crate::iroh_proxy::request_body_channel();
     let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
@@ -4929,30 +4917,69 @@ where
         body: request_body,
     })?;
 
-    // This v1 transport streams without buffering, but it is not a full-duplex
-    // tunnel: responses are sent to the client after the request body finishes.
-    // Upgrade/WebSocket traffic is rejected above until the proxy path can drive
-    // both directions concurrently.
-    if send_request_body {
-        match stream_h1_request_body_to_iroh(reader, &mut body, &mut body_tx, request_body_limit)
-            .await?
-        {
-            StreamRequestBodyOutcome::Complete => {}
-            StreamRequestBodyOutcome::TooLarge => {
-                crate::iroh_proxy::send_request_body_error(
-                    &mut body_tx,
-                    "request body exceeded configured limit".to_string(),
-                )
-                .await;
+    if is_ws_request {
+        let response = fetch.response().await?;
+        if response.upgraded {
+            return tunnel_iroh_websocket_h1(
+                reader,
+                w,
+                response,
+                body_tx,
+                early_response_headers,
+                metadata,
+                hook_state,
+            )
+            .await;
+        }
+        drop(body_tx);
+        let send = send_iroh_response_h1(
+            w,
+            response,
+            head_only,
+            client_connection_close,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await?;
+        return Ok(ProxyOutcome {
+            reuse_backend: false,
+            send,
+            continue_request: false,
+            preserved_body: None,
+        });
+    }
+
+    let mut upload_tx = body_tx.clone();
+    let upload = async move {
+        if send_request_body {
+            stream_h1_request_body_to_iroh(reader, &mut body, &mut upload_tx, request_body_limit)
+                .await
+        } else {
+            drain_payload(reader, &mut body).await;
+            Ok(StreamRequestBodyOutcome::Complete)
+        }
+    };
+    let response_send = async {
+        let response = fetch.response().await?;
+        send_iroh_response_h1(
+            w,
+            response,
+            head_only,
+            client_connection_close,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await
+    };
+    let body_too_large = {
+        match future::select(Box::pin(response_send), Box::pin(upload)).await {
+            future::Either::Left((send, upload)) => {
+                drop(upload);
                 drop(body_tx);
-                let send = send_fixed(
-                    w,
-                    payload_too_large(),
-                    early_response_headers,
-                    metadata,
-                    hook_state,
-                )
-                .await;
+                let mut send = send?;
+                send.keep_client = false;
                 return Ok(ProxyOutcome {
                     reuse_backend: false,
                     send,
@@ -4960,26 +4987,88 @@ where
                     preserved_body: None,
                 });
             }
+            future::Either::Right((upload, response_send)) => match upload? {
+                StreamRequestBodyOutcome::Complete => {
+                    drop(body_tx);
+                    let send = response_send.await?;
+                    return Ok(ProxyOutcome {
+                        reuse_backend: false,
+                        send,
+                        continue_request: false,
+                        preserved_body: None,
+                    });
+                }
+                StreamRequestBodyOutcome::TooLarge => {
+                    drop(response_send);
+                    crate::iroh_proxy::send_request_body_error(
+                        &mut body_tx,
+                        "request body exceeded configured limit".to_string(),
+                    )
+                    .await;
+                    drop(body_tx);
+                    true
+                }
+            },
         }
-    } else {
-        drain_payload(reader, &mut body).await;
+    };
+    if body_too_large {
+        let send = send_fixed(
+            w,
+            payload_too_large(),
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await;
+        return Ok(ProxyOutcome {
+            reuse_backend: false,
+            send,
+            continue_request: false,
+            preserved_body: None,
+        });
     }
-    drop(body_tx);
+    unreachable!("iroh proxy body race always returns or reports too-large")
+}
 
-    let response = fetch.response().await?;
-    let send = send_iroh_response_h1(
-        w,
-        response,
-        head_only,
-        client_connection_close,
+async fn tunnel_iroh_websocket_h1<R: AsyncReadRent>(
+    reader: &mut h1::H1Connection<R>,
+    w: &mut impl AsyncWriteRent,
+    mut response: crate::iroh_proxy::IrohProxyResponse,
+    body_tx: crate::iroh_proxy::RequestBodySender,
+    early_response_headers: Option<&::http::HeaderMap>,
+    metadata: &HashMap<String, String>,
+    hook_state: Option<&ResponseHookState<'_>>,
+) -> Result<ProxyOutcome> {
+    let mut headers = response.headers;
+    strip_hop_headers(&mut headers, true);
+    let hook_outcome = caddy::prepare_reverse_proxy_raw_h1_response_headers(
+        hook_state,
+        response.status,
+        None,
+        &mut headers,
+        None,
         early_response_headers,
         metadata,
-        hook_state,
     )
-    .await?;
+    .await;
+    let status = hook_outcome.status;
+    write_response_head_raw(w, status, &headers).await?;
+    let _ = w.flush().await;
+
+    let (client_io, client_leftover) = reader
+        .take_io()
+        .ok_or_else(|| anyhow!("client missing io for iroh websocket"))?;
+    let client_to_upstream = copy_client_raw_to_iroh(client_io, client_leftover, body_tx);
+    let upstream_to_client = copy_iroh_response_body_raw(w, &mut response.body);
+    let (res_a, res_b) = futures::future::join(client_to_upstream, upstream_to_client).await;
+    res_a?;
+    res_b?;
     Ok(ProxyOutcome {
         reuse_backend: false,
-        send,
+        send: H1SendOutcome {
+            keep_client: false,
+            status,
+        },
         continue_request: false,
         preserved_body: None,
     })
@@ -5015,7 +5104,7 @@ async fn reverse_proxy_iroh_request_h2(
         caddy_default_forwarded,
     );
 
-    prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host)?;
+    prepare_streaming_iroh_request_headers(&mut headers, send_request_body, &target.host, false)?;
     head.headers = headers;
     let (mut body_tx, request_body) = crate::iroh_proxy::request_body_channel();
     let fetch = crate::iroh_proxy::start_fetch(IrohProxyRequest {
@@ -5029,53 +5118,79 @@ async fn reverse_proxy_iroh_request_h2(
         body: request_body,
     })?;
 
-    // See the HTTP/1 iroh path: v1 streams bodies without collecting them, but
-    // still completes request upload before sending the response downstream.
-    if send_request_body {
-        match stream_h2_request_body_to_iroh(&mut body, &mut body_tx, request_body_limit).await? {
-            StreamRequestBodyOutcome::Complete => {}
-            StreamRequestBodyOutcome::TooLarge => {
-                crate::iroh_proxy::send_request_body_error(
-                    &mut body_tx,
-                    "request body exceeded configured limit".to_string(),
-                )
-                .await;
+    let mut upload_tx = body_tx.clone();
+    let upload = async move {
+        if send_request_body {
+            stream_h2_request_body_to_iroh(&mut body, &mut upload_tx, request_body_limit).await
+        } else {
+            Ok(StreamRequestBodyOutcome::Complete)
+        }
+    };
+    let response_send = async {
+        let response = fetch.response().await?;
+        let status = response.status.as_u16();
+        send_iroh_response_h2(
+            respond,
+            response,
+            head_only,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await?;
+        Ok::<u16, anyhow::Error>(status)
+    };
+    let body_too_large = {
+        match future::select(Box::pin(response_send), Box::pin(upload)).await {
+            future::Either::Left((status, upload)) => {
+                drop(upload);
                 drop(body_tx);
-                let status = send_h2_response(
-                    respond,
-                    payload_too_large(),
-                    head_only,
-                    early_response_headers,
-                    metadata,
-                    hook_state,
-                )
-                .await?;
                 return Ok(H2ProxyOutcome {
                     continue_request: false,
                     preserved_body: None,
-                    status: Some(status),
+                    status: Some(status?),
                 });
             }
+            future::Either::Right((upload, response_send)) => match upload? {
+                StreamRequestBodyOutcome::Complete => {
+                    drop(body_tx);
+                    let status = response_send.await?;
+                    return Ok(H2ProxyOutcome {
+                        continue_request: false,
+                        preserved_body: None,
+                        status: Some(status),
+                    });
+                }
+                StreamRequestBodyOutcome::TooLarge => {
+                    drop(response_send);
+                    crate::iroh_proxy::send_request_body_error(
+                        &mut body_tx,
+                        "request body exceeded configured limit".to_string(),
+                    )
+                    .await;
+                    drop(body_tx);
+                    true
+                }
+            },
         }
+    };
+    if body_too_large {
+        let status = send_h2_response(
+            respond,
+            payload_too_large(),
+            head_only,
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await?;
+        return Ok(H2ProxyOutcome {
+            continue_request: false,
+            preserved_body: None,
+            status: Some(status),
+        });
     }
-    drop(body_tx);
-
-    let response = fetch.response().await?;
-    let status = response.status.as_u16();
-    send_iroh_response_h2(
-        respond,
-        response,
-        head_only,
-        early_response_headers,
-        metadata,
-        hook_state,
-    )
-    .await?;
-    Ok(H2ProxyOutcome {
-        continue_request: false,
-        preserved_body: None,
-        status: Some(status),
-    })
+    unreachable!("iroh proxy body race always returns or reports too-large")
 }
 
 enum StreamRequestBodyOutcome {
@@ -5126,8 +5241,9 @@ fn prepare_streaming_iroh_request_headers(
     headers: &mut ::http::HeaderMap,
     has_body: bool,
     fallback_host: &str,
+    keep_upgrade: bool,
 ) -> Result<()> {
-    strip_hop_headers(headers, false);
+    strip_hop_headers(headers, keep_upgrade);
     headers.remove(::http::header::TRANSFER_ENCODING);
     if !has_body {
         headers.remove(::http::header::CONTENT_LENGTH);
@@ -5263,6 +5379,41 @@ async fn drain_iroh_response_body(body: &mut crate::iroh_proxy::ResponseBody) {
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return,
         }
+    }
+}
+
+async fn copy_iroh_response_body_raw(
+    w: &mut impl AsyncWriteRent,
+    body: &mut crate::iroh_proxy::ResponseBody,
+) -> Result<()> {
+    while let Some(chunk) = crate::iroh_proxy::next_response_body_chunk(body).await? {
+        let (res, _) = w.write_all(chunk.to_vec()).await;
+        res.map_err(|err| anyhow!("failed to write iroh tunnel bytes: {err}"))?;
+        let _ = w.flush().await;
+    }
+    Ok(())
+}
+
+async fn copy_client_raw_to_iroh<R: AsyncReadRent>(
+    mut reader: R,
+    pending: Vec<u8>,
+    mut sender: crate::iroh_proxy::RequestBodySender,
+) -> Result<()> {
+    if !pending.is_empty() {
+        crate::iroh_proxy::send_request_body_chunk(&mut sender, Bytes::from(pending)).await?;
+    }
+
+    let mut buf = vec![0u8; 8 * 1024];
+    loop {
+        let (res, next_buf) = reader.read(buf).await;
+        buf = next_buf;
+        let n = res.map_err(|err| anyhow!("failed to read websocket client bytes: {err}"))?;
+        if n == 0 {
+            drop(sender);
+            return Ok(());
+        }
+        crate::iroh_proxy::send_request_body_chunk(&mut sender, Bytes::copy_from_slice(&buf[..n]))
+            .await?;
     }
 }
 
@@ -6746,10 +6897,6 @@ fn bad_gateway() -> ::http::Response<Bytes> {
         .header(::http::header::CONTENT_LENGTH, "0")
         .body(Bytes::new())
         .unwrap()
-}
-
-fn not_implemented() -> ::http::Response<Bytes> {
-    text_response(StatusCode::NOT_IMPLEMENTED, "Not Implemented")
 }
 
 fn method_not_allowed() -> ::http::Response<Bytes> {

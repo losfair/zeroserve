@@ -161,10 +161,9 @@ propagates cancellation, and is covered by streaming-body tests.
 
 The current implementation uses bounded runtime-neutral channels across the
 monoio/Tokio boundary. It is streaming and waker-driven, not poll/sleep driven,
-but it is still not a full-duplex tunnel: non-upgrade request bodies are
-uploaded before the response is sent to the client. WebSocket and other upgrade
-requests are rejected with `501 Not Implemented` until the server path can
-drive both directions concurrently.
+and the request upload and response download paths run concurrently. HTTP/1
+WebSocket upgrades are tunneled as raw bytes after the upstream `101 Switching
+Protocols` response.
 
 ## CLI And Configuration
 
@@ -232,7 +231,7 @@ Integration tests:
 - Stream request bodies larger than the in-memory body limit.
 - Exercise the request-body TooLarge path.
 - Exercise HTTP/2 clients against the same iroh upstream.
-- Verify WebSocket upgrade requests return `501 Not Implemented`.
+- Verify WebSocket upgrade requests tunnel raw bytes after the `101` response.
 - Kill the remote endpoint and verify zeroserve returns a gateway error without
   poisoning hot reload state.
 
@@ -254,9 +253,8 @@ Manual tests:
   separate release artifact/feature due to Tokio and dependency size?
 - How should access logs represent iroh upstream latency and relay/direct path
   state?
-- Should the v2 transport drive true full duplex for request body upload and
-  response body download, or should that remain limited to upgrade-capable
-  transports?
+- Should future versions expose more generic HTTP/1 upgrade tunneling beyond
+  WebSocket-shaped upgrades?
 
 ## Proposed Milestones
 
@@ -267,5 +265,5 @@ Manual tests:
 4. Streaming body and HTTP/2 client coverage.
 5. Optional companion bridge/example for exposing a local HTTP service over the
    dumbpipe-compatible iroh ALPN.
-6. WebSocket/full-duplex support if tests show the stream adapter handles
-   cancellation and bidirectional flow cleanly.
+6. Broader upgrade/full-duplex coverage if tests show more protocol variants
+   are needed beyond WebSocket-shaped upgrades.

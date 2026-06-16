@@ -1127,11 +1127,10 @@ Zeroserve will:
   configured reverse-proxy request header operations to the upstream request
   only, then applies Caddy's server-level and handler `trusted_proxies` rules to
   either replace untrusted forwarded values or preserve trusted values.
-- For iroh upstreams, stream request and response bodies through bounded
-  runtime channels without collecting whole bodies. The v1 iroh transport is
-  not a full-duplex tunnel: upgrade/WebSocket requests are rejected with
-  `501 Not Implemented`, and request bodies complete before response bodies are
-  sent to the client.
+- For iroh upstreams, stream request and response bodies concurrently through
+  bounded runtime channels without collecting whole bodies. HTTP/1 WebSocket
+  upgrades tunnel raw bytes after the upstream `101 Switching Protocols`
+  response.
 - Generated Caddy reverse-proxy middleware preserves `TE: trailers` on upstream
   requests while stripping other hop-by-hop headers, matching Caddy's proxy
   request preparation.
