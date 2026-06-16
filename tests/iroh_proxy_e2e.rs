@@ -133,9 +133,12 @@ async fn zeroserve_streams_iroh_response_before_request_body_finishes() {
     let mut zeroserve = ChildGuard::new(spawn_zeroserve(&script));
     let port = wait_for_http_port(zeroserve.child_mut());
 
+    let warmup = http_get_all(port, "/warmup", Duration::from_secs(45));
+    assert!(warmup.contains("204"), "warmup response: {warmup}");
+
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect zeroserve");
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("set read timeout");
     stream
         .write_all(

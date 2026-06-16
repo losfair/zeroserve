@@ -79,6 +79,7 @@ mod enabled {
     const MAX_CONCURRENT_FETCHES: usize = 256;
     const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
     const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+    const IROH_SECRET_KEY_ENV: &str = "ZEROSERVE_IROH_SECRET_KEY";
     const DUMBPIPE_ALPN: &[u8] = b"DUMBPIPEV0";
     const DUMBPIPE_HANDSHAKE: &[u8] = b"hello";
 
@@ -101,10 +102,7 @@ mod enabled {
             return Ok(());
         }
 
-        let key = match config.iroh_secret_key.as_deref() {
-            Some(path) => Some(load_or_create_secret_key(path)?),
-            None => None,
-        };
+        let key = resolve_secret_key(config.iroh_secret_key.as_deref())?;
         let disable_networking = config.iroh_disable_networking;
 
         let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<Command>(COMMAND_CHANNEL_CAPACITY);
@@ -291,6 +289,7 @@ mod enabled {
     }
 
     async fn bind_endpoint(key: Option<SecretKey>, disable_networking: bool) -> Result<Endpoint> {
+        let key = key.unwrap_or_else(SecretKey::generate);
         let mut builder = if disable_networking {
             Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
@@ -299,9 +298,7 @@ mod enabled {
         } else {
             Endpoint::builder(presets::N0).relay_mode(RelayMode::Default)
         };
-        if let Some(key) = key {
-            builder = builder.secret_key(key);
-        }
+        builder = builder.secret_key(key);
         builder = builder.alpns(vec![DUMBPIPE_ALPN.to_vec()]);
         builder
             .bind()
@@ -640,6 +637,27 @@ mod enabled {
         iroh::EndpointId::from_bytes(&bytes).map_err(|err| anyhow!("invalid iroh node id: {err}"))
     }
 
+    fn resolve_secret_key(path: Option<&Path>) -> Result<Option<SecretKey>> {
+        let env_value = match std::env::var(IROH_SECRET_KEY_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("{IROH_SECRET_KEY_ENV} must be valid unicode")
+            }
+        };
+        resolve_secret_key_with_env(path, env_value.as_deref())
+    }
+
+    fn resolve_secret_key_with_env(
+        path: Option<&Path>,
+        env_value: Option<&str>,
+    ) -> Result<Option<SecretKey>> {
+        if let Some(path) = path {
+            return load_or_create_secret_key(path).map(Some);
+        }
+        env_value.map(parse_secret_key).transpose()
+    }
+
     fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
         if path.exists() {
             tighten_secret_key_permissions(path)?;
@@ -713,7 +731,7 @@ mod enabled {
     fn parse_secret_key(value: &str) -> Result<SecretKey> {
         let value = value.trim();
         if value.len() != 64 {
-            bail!("iroh secret key must be 64 lowercase hex characters");
+            bail!("iroh secret key must be 64 hex characters");
         }
         let mut out = [0u8; 32];
         let bytes = value.as_bytes();
@@ -786,6 +804,41 @@ mod enabled {
                 & 0o777;
             assert_eq!(mode, 0o600);
             let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn resolve_secret_key_uses_env_when_no_file_path_is_configured() {
+            let key = [9u8; 32];
+            let loaded =
+                resolve_secret_key_with_env(None, Some(&hex_encode(&key))).expect("load env key");
+            assert_eq!(loaded.expect("key exists").to_bytes(), key);
+        }
+
+        #[test]
+        fn resolve_secret_key_prefers_file_path_over_env() {
+            let dir = temp_dir("zeroserve-iroh-key-precedence");
+            let path = dir.join("secret.key");
+            let file_key = [11u8; 32];
+            let env_key = [12u8; 32];
+            std::fs::write(&path, format!("{}\n", hex_encode(&file_key))).expect("write key");
+
+            let loaded = resolve_secret_key_with_env(Some(&path), Some(&hex_encode(&env_key)))
+                .expect("load key")
+                .expect("key exists");
+            assert_eq!(loaded.to_bytes(), file_key);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn resolve_secret_key_returns_none_for_ephemeral_default() {
+            let loaded = resolve_secret_key_with_env(None, None).expect("resolve key");
+            assert!(loaded.is_none());
+        }
+
+        #[test]
+        fn parse_secret_key_rejects_non_hex_encodings() {
+            assert!(parse_secret_key(&"a".repeat(43)).is_err());
+            assert!(parse_secret_key(&"z".repeat(64)).is_err());
         }
 
         fn temp_dir(prefix: &str) -> std::path::PathBuf {

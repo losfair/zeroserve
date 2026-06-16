@@ -242,6 +242,8 @@ pub struct Cli {
     pub iroh_proxy: bool,
 
     /// Load or create the local iroh endpoint secret key at this path.
+    /// If omitted, ZEROSERVE_IROH_SECRET_KEY may provide a 64-hex key;
+    /// otherwise an ephemeral process key is generated.
     #[cfg(feature = "iroh-proxy")]
     #[arg(long, value_name = "FILE", requires = "iroh_proxy")]
     pub iroh_secret_key: Option<PathBuf>,

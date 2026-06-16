@@ -325,8 +325,11 @@ Key options:
   Matching is case-insensitive and port numbers are stripped before comparison.
 - `--iroh-proxy`: Enable the experimental iroh reverse-proxy transport
   (available only in binaries built with the `iroh-proxy` Cargo feature).
-- `--iroh-secret-key <FILE>`: Load or create the local iroh endpoint secret key.
-  Newly created files are written with owner-only `0600` permissions.
+- `--iroh-secret-key <FILE>`: Load or create the local iroh endpoint secret key
+  as 64 hex characters. Newly created files are written with owner-only `0600`
+  permissions. When this flag is omitted, `ZEROSERVE_IROH_SECRET_KEY` may
+  provide a 64-hex secret key; if neither is set, zeroserve generates an
+  ephemeral iroh endpoint key for the process.
 - `--iroh-disable-networking`: Disable iroh relay and DNS discovery for local
   direct-address testing.
 

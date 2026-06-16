@@ -112,8 +112,9 @@ Add a new module, `src/iroh_proxy.rs`, behind a Cargo feature such as
 Responsibilities:
 
 - Own the single process-wide iroh endpoint.
-- Persist or load an iroh secret key from a CLI-configured path, so the local
-  zeroserve endpoint identity is stable across restarts.
+- Persist or load an iroh secret key from a CLI-configured path, load a 64-hex
+  secret key from `ZEROSERVE_IROH_SECRET_KEY`, or generate an ephemeral key when
+  neither is configured.
 - Create new secret-key files with `0600` permissions and tighten existing
   group/world-readable key files before reading them.
 - Configure iroh address lookup and relay defaults.
@@ -170,7 +171,10 @@ Protocols` response.
 Add CLI flags in `src/cli.rs`:
 
 - `--iroh-proxy`: enable iroh reverse-proxy transport.
-- `--iroh-secret-key <path>`: load or create a stable local iroh endpoint key.
+- `--iroh-secret-key <path>`: load or create a stable local iroh endpoint key
+  containing 64 hex characters.
+- `ZEROSERVE_IROH_SECRET_KEY`: optional 64-hex local endpoint secret key used
+  when `--iroh-secret-key` is omitted.
 - `--iroh-relay <url>`: optional relay override; default to iroh/N0 defaults.
 - `--iroh-address-lookup <mode>`: default lookup mode for key-only dialing.
 - `--iroh-alpn <value>`: default ALPN for `iroh://` upstreams.
