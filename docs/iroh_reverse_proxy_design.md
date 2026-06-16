@@ -33,7 +33,7 @@ Relevant references:
 - Endpoint concepts: https://docs.iroh.computer/concepts/endpoints
 - Protocol and ALPN concepts: https://docs.iroh.computer/concepts/protocols
 - Rust `iroh` crate docs: https://docs.rs/iroh/latest/iroh/
-- `iroh-http-core` crate docs: https://docs.rs/iroh-http-core/latest/iroh_http_core/
+- Dumbpipe protocol source: https://github.com/n0-computer/dumbpipe
 
 ## Current Zeroserve Fit
 
@@ -76,8 +76,8 @@ The URL grammar should allow:
   parameter is consumed by zeroserve and is not forwarded upstream.
 - `iroh+ticket://<endpoint-ticket>` or `iroh://ticket/<encoded-ticket>`:
   optional ticket form when the operator has full endpoint addressing material.
-- `?alpn=<name>`: optional override for advanced interop; default to a
-  zeroserve-owned ALPN such as `/zeroserve/http-proxy/1`.
+- `?alpn=<name>`: optional future override for advanced interop; the first
+  implementation uses dumbpipe's default ALPN.
 
 The first implementation should require the remote endpoint to speak the chosen
 HTTP-over-iroh protocol. "Any remote service on iroh by key" therefore means
@@ -88,28 +88,21 @@ iroh protocols such as blobs, docs, or gossip.
 
 Use one iroh bidirectional stream per HTTP request. On each stream, zeroserve
 writes the same HTTP/1.1 request head and body that it currently writes to TCP
-backends, and reads an HTTP/1.1 response head and body back through the existing
-`h1::H1Connection` machinery.
+backends, and reads an HTTP/1.1 response head and body back through an
+incremental parser.
 
 Recommended default ALPN:
 
 ```text
-/zeroserve/http-proxy/1
+DUMBPIPEV0
 ```
 
-This keeps the runtime small and compatible with zeroserve's existing proxy
-hooks, compression, body limits, WebSocket handling, and response streaming.
-It also avoids pulling Caddy or script semantics into the iroh protocol.
-
-Interop option:
-
-- Evaluate `iroh-http-core` before implementation. It already defines an
-  HTTP/1.1-over-iroh protocol and client/server APIs.
-- If its ALPN and wire format are stable and do not force a large Tokio/hyper
-  integration into the monoio hot path, support it as an alternate `alpn=...`
-  mode.
-- Otherwise, document zeroserve's ALPN and provide a tiny companion bridge
-  binary or example that exposes a local HTTP service over iroh.
+Dumbpipe's default protocol requires the side that opens the bidirectional
+stream to send the fixed handshake bytes `hello` before arbitrary stream data.
+zeroserve then writes a normal HTTP/1.1 request and expects a normal HTTP/1.1
+response. This keeps the runtime small and compatible with zeroserve's existing
+proxy hooks, compression, body limits, WebSocket handling, and response
+streaming without adding a third-party HTTP-over-iroh protocol crate.
 
 ## Runtime Architecture
 
@@ -125,10 +118,9 @@ Responsibilities:
   group/world-readable key files before reading them.
 - Configure iroh address lookup and relay defaults.
 - Dial a remote endpoint by key or ticket with the selected ALPN.
-- Cache iroh connections by `(endpoint key, ALPN)`.
+- Cache iroh connections by endpoint key.
 - Open one bidirectional stream per proxied HTTP request.
-- Expose a stream wrapper that implements the traits needed by
-  `h1::H1Connection`.
+- Write and parse HTTP/1 incrementally over the dumbpipe stream.
 
 `src/server.rs` changes:
 
@@ -225,7 +217,7 @@ Unit tests:
 
 - Parse valid and invalid `iroh://` URLs.
 - Confirm base path/query merging matches HTTP upstream behavior.
-- Confirm pool keys and iroh connection-cache keys include ALPN and endpoint
+- Confirm pool keys and future iroh connection-cache keys include endpoint
   identity.
 - Confirm Caddy compile accepts the zeroserve extension and rejects unsupported
   iroh transport options.
@@ -252,7 +244,8 @@ Manual tests:
 
 ## Open Questions
 
-- Should the default wire protocol be zeroserve-owned, `iroh-http-core`, or both?
+- Should future versions add an ALPN override, or keep the transport strictly
+  dumbpipe-compatible?
 - Which iroh address lookup mechanism should be enabled by default for server
   deployments?
 - Should zeroserve also expose its own HTTP service over iroh, or only act as an
@@ -273,6 +266,6 @@ Manual tests:
 3. HTTP/1 request-per-bidirectional-stream proxying for non-upgrade requests.
 4. Streaming body and HTTP/2 client coverage.
 5. Optional companion bridge/example for exposing a local HTTP service over the
-   zeroserve iroh ALPN.
+   dumbpipe-compatible iroh ALPN.
 6. WebSocket/full-duplex support if tests show the stream adapter handles
    cancellation and bidirectional flow cleanly.

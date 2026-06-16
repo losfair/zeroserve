@@ -11,7 +11,7 @@ cc = "1"
 lalrpop = "0.23"
 
 [features]
-iroh-proxy = ["dep:base32", "dep:hyper", "dep:http-body", "dep:http-body-util", "dep:iroh", "dep:iroh-http-core", "dep:tokio", "dep:tower"]
+iroh-proxy = ["dep:base32", "dep:iroh", "dep:tokio"]
 
 [dependencies]
 lalrpop-util = "0.23"
@@ -27,11 +27,7 @@ caps = "0.5"
 faster-hex = "0.10"
 futures = "0.3"
 h2 = "0.4"
-http-body-util = { version = "0.1", optional = true }
-http-body = { version = "1", optional = true }
-hyper = { version = "1", features = ["client", "http1"], optional = true }
 iroh = { version = "0.98.1", optional = true }
-iroh-http-core = { version = "0.4.0", optional = true }
 monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros"] }
 monoio-compat = "0.2"
 boring = "5"
@@ -66,7 +62,6 @@ serde_vici = "0.1.5"
 flate2 = "1.1.9"
 zstd = "0.13.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
-tower = { version = "0.5", optional = true }
 
 [patch.crates-io]
 monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }

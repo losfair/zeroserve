@@ -56,28 +56,30 @@ pub(crate) struct ResponseBody;
 mod enabled {
     use super::*;
     use std::{
-        io,
         path::Path,
-        pin::Pin,
         sync::{Arc, OnceLock, mpsc as std_mpsc},
-        task::{Context, Poll},
         time::Duration,
     };
 
     use anyhow::{Context as AnyhowContext, bail};
     use futures::{
-        SinkExt, Stream, StreamExt,
+        SinkExt, StreamExt,
         channel::{mpsc, oneshot},
     };
-    use http_body::Frame;
-    use http_body_util::BodyExt;
-    use iroh_http_core::{Body, IrohEndpoint, NetworkingOptions, NodeOptions, StackConfig};
+    use iroh::{
+        Endpoint, RelayMode, SecretKey,
+        endpoint::{RecvStream, SendStream, presets},
+    };
     use tokio::sync::Semaphore;
 
     const REQUEST_BODY_CHANNEL_CAPACITY: usize = 32;
     const RESPONSE_BODY_CHANNEL_CAPACITY: usize = 32;
     const COMMAND_CHANNEL_CAPACITY: usize = 1024;
     const MAX_CONCURRENT_FETCHES: usize = 256;
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+    const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+    const DUMBPIPE_ALPN: &[u8] = b"DUMBPIPEV0";
+    const DUMBPIPE_HANDSHAKE: &[u8] = b"hello";
 
     static CLIENT: OnceLock<IrohProxyClient> = OnceLock::new();
 
@@ -88,27 +90,6 @@ mod enabled {
     struct Command {
         request: IrohProxyRequest,
         tx: oneshot::Sender<Result<IrohProxyResponse, String>>,
-    }
-
-    struct RequestChannelBody {
-        rx: mpsc::Receiver<Result<Bytes, String>>,
-    }
-
-    impl http_body::Body for RequestChannelBody {
-        type Data = Bytes;
-        type Error = io::Error;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            match Stream::poll_next(Pin::new(&mut self.rx), cx) {
-                Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
-                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(io::Error::other(err)))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        }
     }
 
     pub(crate) fn init(config: &StaticConfig) -> Result<()> {
@@ -123,16 +104,7 @@ mod enabled {
             Some(path) => Some(load_or_create_secret_key(path)?),
             None => None,
         };
-
-        let mut node_options = NodeOptions::default();
-        node_options.key = key;
-        if config.iroh_disable_networking {
-            node_options.networking = NetworkingOptions {
-                disabled: true,
-                bind_addrs: vec!["127.0.0.1:0".to_string()],
-                ..Default::default()
-            };
-        }
+        let disable_networking = config.iroh_disable_networking;
 
         let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<Command>(COMMAND_CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
@@ -151,14 +123,14 @@ mod enabled {
                     }
                 };
 
-                let endpoint = match runtime.block_on(IrohEndpoint::bind(node_options)) {
+                let endpoint = match runtime.block_on(bind_endpoint(key, disable_networking)) {
                     Ok(endpoint) => endpoint,
                     Err(err) => {
                         let _ = ready_tx.send(Err(format!("failed to bind iroh endpoint: {err}")));
                         return;
                     }
                 };
-                let node_id = endpoint.node_id().to_string();
+                let node_id = endpoint.id().to_string();
                 let _ = ready_tx.send(Ok(node_id));
                 let handle = runtime.handle().clone();
                 let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
@@ -256,60 +228,388 @@ mod enabled {
     }
 
     async fn fetch_on_tokio(
-        endpoint: &IrohEndpoint,
+        endpoint: &Endpoint,
         request: IrohProxyRequest,
     ) -> Result<IrohProxyResponse> {
         let mut addr = iroh::EndpointAddr::new(parse_node_id(&request.target.node_id)?);
-        for direct_addr in request.target.direct_addrs {
-            addr = addr.with_ip_addr(direct_addr);
+        for direct_addr in &request.target.direct_addrs {
+            addr = addr.with_ip_addr(*direct_addr);
         }
 
-        let mut hyper_request = hyper::Request::builder()
-            .method(request.method.as_str())
-            .uri(request.uri.as_str())
-            .body(Body::new(RequestChannelBody { rx: request.body.0 }))
-            .map_err(|err| anyhow!("failed to build iroh HTTP request: {err}"))?;
-        *hyper_request.headers_mut() = request.headers;
-
-        let cfg = StackConfig::default().with_timeout(Some(Duration::from_secs(30)));
-        let response = iroh_http_core::fetch_request(endpoint, &addr, hyper_request, &cfg)
+        let conn = tokio::time::timeout(FETCH_TIMEOUT, endpoint.connect(addr, DUMBPIPE_ALPN))
             .await
-            .map_err(|err| anyhow!("iroh fetch failed: {err}"))?;
-        let (parts, body) = response.into_parts();
+            .map_err(|_| anyhow!("iroh connect timed out"))?
+            .map_err(|err| anyhow!("iroh connect failed: {err}"))?;
+        let (mut send, recv) = tokio::time::timeout(FETCH_TIMEOUT, conn.open_bi())
+            .await
+            .map_err(|_| anyhow!("iroh stream open timed out"))?
+            .map_err(|err| anyhow!("iroh stream open failed: {err}"))?;
+
+        write_http1_request(&mut send, request)
+            .await
+            .map_err(|err| anyhow!("failed to write dumbpipe HTTP/1 request: {err}"))?;
+
+        let mut reader = IrohResponseReader::new(recv);
+        let (status, headers) = tokio::time::timeout(FETCH_TIMEOUT, reader.read_response_head())
+            .await
+            .map_err(|_| anyhow!("iroh response head timed out"))??;
+        let content_length = response_content_length(&headers)?;
+        let chunked = response_is_chunked(&headers);
+        let has_body = raw_status_allows_body(status);
         let (mut body_tx, body_rx) =
             mpsc::channel::<Result<Bytes, String>>(RESPONSE_BODY_CHANNEL_CAPACITY);
         let response = IrohProxyResponse {
-            status: parts.status,
-            headers: parts.headers,
+            status,
+            headers,
             body: ResponseBody(body_rx),
         };
         tokio::spawn(async move {
-            let mut body = body;
-            loop {
-                match body.frame().await {
-                    Some(Ok(frame)) => {
-                        match frame.into_data() {
-                            Ok(chunk) => {
-                                if body_tx.send(Ok(chunk)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(_) => {
-                                // Trailer frames are intentionally ignored for the v1 iroh proxy.
-                            }
-                        }
-                    }
-                    Some(Err(err)) => {
-                        let _ = body_tx
-                            .send(Err(format!("failed to read iroh response body: {err}")))
-                            .await;
-                        return;
-                    }
-                    None => return,
-                }
+            if !has_body {
+                return;
+            }
+            let result = if chunked {
+                reader.stream_chunked_body(&mut body_tx).await
+            } else if let Some(len) = content_length {
+                reader.stream_content_length_body(len, &mut body_tx).await
+            } else {
+                reader.stream_until_eof(&mut body_tx).await
+            };
+            if let Err(err) = result {
+                let _ = body_tx
+                    .send(Err(format!(
+                        "failed to read dumbpipe HTTP/1 response body: {err}"
+                    )))
+                    .await;
             }
         });
         Ok(response)
+    }
+
+    async fn bind_endpoint(key: Option<SecretKey>, disable_networking: bool) -> Result<Endpoint> {
+        let mut builder = if disable_networking {
+            Endpoint::builder(presets::Minimal)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .map_err(|err| anyhow!("failed to configure iroh loopback bind: {err}"))?
+        } else {
+            Endpoint::builder(presets::N0).relay_mode(RelayMode::Default)
+        };
+        if let Some(key) = key {
+            builder = builder.secret_key(key);
+        }
+        builder = builder.alpns(vec![DUMBPIPE_ALPN.to_vec()]);
+        builder
+            .bind()
+            .await
+            .map_err(|err| anyhow!("failed to bind iroh endpoint: {err}"))
+    }
+
+    async fn write_http1_request(
+        send: &mut SendStream,
+        mut request: IrohProxyRequest,
+    ) -> Result<()> {
+        send.write_all(DUMBPIPE_HANDSHAKE)
+            .await
+            .map_err(|err| anyhow!("failed to write dumbpipe handshake: {err}"))?;
+
+        let method_allows_body = !matches!(request.method.as_str(), "GET" | "HEAD");
+        let chunk_request_body =
+            method_allows_body && !request.headers.contains_key(::http::header::CONTENT_LENGTH);
+        let mut head = Vec::with_capacity(1024);
+        head.extend_from_slice(request.method.as_bytes());
+        head.extend_from_slice(b" ");
+        head.extend_from_slice(request.uri.as_bytes());
+        head.extend_from_slice(b" HTTP/1.1\r\n");
+        for (name, value) in request.headers.iter() {
+            if chunk_request_body && name == ::http::header::TRANSFER_ENCODING {
+                continue;
+            }
+            head.extend_from_slice(name.as_str().as_bytes());
+            head.extend_from_slice(b": ");
+            head.extend_from_slice(value.as_bytes());
+            head.extend_from_slice(b"\r\n");
+        }
+        if chunk_request_body {
+            head.extend_from_slice(b"transfer-encoding: chunked\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        send.write_all(&head)
+            .await
+            .map_err(|err| anyhow!("failed to write HTTP/1 request head: {err}"))?;
+
+        while let Some(chunk) = request.body.0.next().await {
+            let chunk = chunk.map_err(|err| anyhow!("request body stream failed: {err}"))?;
+            if chunk_request_body {
+                let prefix = format!("{:x}\r\n", chunk.len());
+                send.write_all(prefix.as_bytes())
+                    .await
+                    .map_err(|err| anyhow!("failed to write request chunk size: {err}"))?;
+                send.write_all(&chunk)
+                    .await
+                    .map_err(|err| anyhow!("failed to write request chunk: {err}"))?;
+                send.write_all(b"\r\n")
+                    .await
+                    .map_err(|err| anyhow!("failed to finish request chunk: {err}"))?;
+            } else {
+                send.write_all(&chunk)
+                    .await
+                    .map_err(|err| anyhow!("failed to write request body: {err}"))?;
+            }
+        }
+        if chunk_request_body {
+            send.write_all(b"0\r\n\r\n")
+                .await
+                .map_err(|err| anyhow!("failed to finish chunked request body: {err}"))?;
+        }
+        send.finish()
+            .map_err(|err| anyhow!("failed to finish iroh request stream: {err}"))
+    }
+
+    struct IrohResponseReader {
+        recv: RecvStream,
+        buffer: Vec<u8>,
+        eof: bool,
+    }
+
+    impl IrohResponseReader {
+        fn new(recv: RecvStream) -> Self {
+            Self {
+                recv,
+                buffer: Vec::new(),
+                eof: false,
+            }
+        }
+
+        async fn read_response_head(&mut self) -> Result<(StatusCode, HeaderMap)> {
+            loop {
+                if let Some(head_end) = find_subslice(&self.buffer, b"\r\n\r\n") {
+                    let rest = self.buffer.split_off(head_end + 4);
+                    let mut head = std::mem::replace(&mut self.buffer, rest);
+                    head.truncate(head_end);
+                    return parse_response_head(&head);
+                }
+                if self.buffer.len() >= MAX_RESPONSE_HEAD_BYTES {
+                    bail!("iroh response head exceeded {MAX_RESPONSE_HEAD_BYTES} bytes");
+                }
+                if !self.read_more().await? {
+                    bail!("iroh response ended before response head completed");
+                }
+            }
+        }
+
+        async fn stream_content_length_body(
+            &mut self,
+            mut remaining: usize,
+            tx: &mut mpsc::Sender<Result<Bytes, String>>,
+        ) -> Result<()> {
+            while remaining > 0 {
+                let chunk = self.next_body_chunk(remaining.min(16 * 1024)).await?;
+                let Some(chunk) = chunk else {
+                    bail!("iroh response ended before content-length body completed");
+                };
+                remaining = remaining.saturating_sub(chunk.len());
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+
+        async fn stream_until_eof(
+            &mut self,
+            tx: &mut mpsc::Sender<Result<Bytes, String>>,
+        ) -> Result<()> {
+            while let Some(chunk) = self.next_body_chunk(16 * 1024).await? {
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+
+        async fn stream_chunked_body(
+            &mut self,
+            tx: &mut mpsc::Sender<Result<Bytes, String>>,
+        ) -> Result<()> {
+            loop {
+                let line = self.read_line(8192).await?;
+                let size = parse_chunk_size(&line)?;
+                if size == 0 {
+                    self.consume_trailers().await?;
+                    return Ok(());
+                }
+                let mut remaining = size;
+                while remaining > 0 {
+                    let chunk = self.next_body_chunk(remaining.min(16 * 1024)).await?;
+                    let Some(chunk) = chunk else {
+                        bail!("iroh response ended in chunk body");
+                    };
+                    remaining = remaining.saturating_sub(chunk.len());
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                self.consume_exact(2).await?;
+            }
+        }
+
+        async fn read_line(&mut self, max_len: usize) -> Result<Vec<u8>> {
+            loop {
+                if let Some(end) = find_subslice(&self.buffer, b"\r\n") {
+                    let rest = self.buffer.split_off(end + 2);
+                    let mut line = std::mem::replace(&mut self.buffer, rest);
+                    line.truncate(end);
+                    return Ok(line);
+                }
+                if self.buffer.len() >= max_len {
+                    bail!("HTTP/1 line exceeded {max_len} bytes");
+                }
+                if !self.read_more().await? {
+                    bail!("iroh response ended in HTTP/1 line");
+                }
+            }
+        }
+
+        async fn consume_trailers(&mut self) -> Result<()> {
+            loop {
+                let line = self.read_line(MAX_RESPONSE_HEAD_BYTES).await?;
+                if line.is_empty() {
+                    return Ok(());
+                }
+                // Trailer fields are intentionally ignored for the v1 iroh proxy.
+            }
+        }
+
+        async fn consume_exact(&mut self, mut len: usize) -> Result<()> {
+            while len > 0 {
+                if !self.buffer.is_empty() {
+                    let take = len.min(self.buffer.len());
+                    self.buffer.drain(..take);
+                    len -= take;
+                    continue;
+                }
+                if !self.read_more().await? {
+                    bail!("iroh response ended early");
+                }
+            }
+            Ok(())
+        }
+
+        async fn next_body_chunk(&mut self, max_len: usize) -> Result<Option<Bytes>> {
+            if !self.buffer.is_empty() {
+                let take = max_len.min(self.buffer.len());
+                let chunk = Bytes::copy_from_slice(&self.buffer[..take]);
+                self.buffer.drain(..take);
+                return Ok(Some(chunk));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            match self.recv.read_chunk(max_len).await {
+                Ok(Some(chunk)) => Ok(Some(chunk.bytes)),
+                Ok(None) => {
+                    self.eof = true;
+                    Ok(None)
+                }
+                Err(err) => Err(anyhow!("iroh stream read failed: {err}")),
+            }
+        }
+
+        async fn read_more(&mut self) -> Result<bool> {
+            if self.eof {
+                return Ok(false);
+            }
+            let mut chunk = [0u8; 8192];
+            match self.recv.read(&mut chunk).await {
+                Ok(Some(n)) => {
+                    self.buffer.extend_from_slice(&chunk[..n]);
+                    Ok(true)
+                }
+                Ok(None) => {
+                    self.eof = true;
+                    Ok(false)
+                }
+                Err(err) => Err(anyhow!("iroh stream read failed: {err}")),
+            }
+        }
+    }
+
+    fn parse_response_head(head: &[u8]) -> Result<(StatusCode, HeaderMap)> {
+        let head = std::str::from_utf8(head)
+            .map_err(|err| anyhow!("iroh response head is not valid utf-8: {err}"))?;
+        let mut lines = head.split("\r\n");
+        let status_line = lines
+            .next()
+            .ok_or_else(|| anyhow!("iroh response missing status line"))?;
+        let mut parts = status_line.splitn(3, ' ');
+        let version = parts
+            .next()
+            .ok_or_else(|| anyhow!("iroh response missing HTTP version"))?;
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+            bail!("iroh response used unsupported HTTP version {version}");
+        }
+        let status = parts
+            .next()
+            .ok_or_else(|| anyhow!("iroh response missing status code"))?
+            .parse::<u16>()
+            .map_err(|err| anyhow!("iroh response status is invalid: {err}"))?;
+        let status = StatusCode::from_u16(status)
+            .map_err(|err| anyhow!("iroh response status is invalid: {err}"))?;
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                bail!("iroh response contains malformed header line");
+            };
+            let name = ::http::header::HeaderName::from_bytes(name.trim().as_bytes())
+                .map_err(|err| anyhow!("iroh response header name is invalid: {err}"))?;
+            let value = ::http::HeaderValue::from_bytes(value.trim_start().as_bytes())
+                .map_err(|err| anyhow!("iroh response header value is invalid: {err}"))?;
+            headers.append(name, value);
+        }
+        Ok((status, headers))
+    }
+
+    fn response_content_length(headers: &HeaderMap) -> Result<Option<usize>> {
+        let Some(value) = headers.get(::http::header::CONTENT_LENGTH) else {
+            return Ok(None);
+        };
+        let value = value
+            .to_str()
+            .map_err(|err| anyhow!("iroh response content-length is invalid: {err}"))?;
+        value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|err| anyhow!("iroh response content-length is invalid: {err}"))
+    }
+
+    fn response_is_chunked(headers: &HeaderMap) -> bool {
+        headers
+            .get(::http::header::TRANSFER_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+            })
+    }
+
+    fn raw_status_allows_body(status: StatusCode) -> bool {
+        !(status.is_informational()
+            || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED))
+    }
+
+    fn parse_chunk_size(line: &[u8]) -> Result<usize> {
+        let line = std::str::from_utf8(line)
+            .map_err(|err| anyhow!("chunk size line is not valid utf-8: {err}"))?;
+        let size = line.split_once(';').map_or(line, |(size, _)| size).trim();
+        usize::from_str_radix(size, 16).map_err(|err| anyhow!("chunk size line is invalid: {err}"))
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
     }
 
     fn parse_node_id(value: &str) -> Result<iroh::EndpointId> {
@@ -324,7 +624,7 @@ mod enabled {
         iroh::EndpointId::from_bytes(&bytes).map_err(|err| anyhow!("invalid iroh node id: {err}"))
     }
 
-    fn load_or_create_secret_key(path: &Path) -> Result<[u8; 32]> {
+    fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
         if path.exists() {
             tighten_secret_key_permissions(path)?;
             let raw = std::fs::read_to_string(path).map_err(|err| {
@@ -341,9 +641,8 @@ mod enabled {
                 )
             })?;
         }
-        let key = iroh_http_core::generate_secret_key()
-            .map_err(|err| anyhow!("failed to generate iroh secret key: {err}"))?;
-        match write_secret_key(path, &key) {
+        let key = SecretKey::generate();
+        match write_secret_key(path, &key.to_bytes()) {
             Ok(key) => Ok(key),
             Err(err)
                 if err
@@ -356,7 +655,7 @@ mod enabled {
         }
     }
 
-    fn write_secret_key(path: &Path, key: &[u8; 32]) -> Result<[u8; 32]> {
+    fn write_secret_key(path: &Path, key: &[u8; 32]) -> Result<SecretKey> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -369,7 +668,7 @@ mod enabled {
             .with_context(|| format!("failed to create iroh secret key {}", path.display()))?;
         file.write_all(format!("{encoded}\n").as_bytes())
             .map_err(|err| anyhow!("failed to write iroh secret key {}: {err}", path.display()))?;
-        Ok(*key)
+        Ok(SecretKey::from_bytes(key))
     }
 
     fn tighten_secret_key_permissions(path: &Path) -> Result<()> {
@@ -395,7 +694,7 @@ mod enabled {
         Ok(())
     }
 
-    fn parse_secret_key(value: &str) -> Result<[u8; 32]> {
+    fn parse_secret_key(value: &str) -> Result<SecretKey> {
         let value = value.trim();
         if value.len() != 64 {
             bail!("iroh secret key must be 64 lowercase hex characters");
@@ -408,7 +707,7 @@ mod enabled {
                 hex_value(bytes[index * 2 + 1]).ok_or_else(|| anyhow!("invalid hex digit"))?;
             out[index] = (high << 4) | low;
         }
-        Ok(out)
+        Ok(SecretKey::from_bytes(&out))
     }
 
     fn hex_encode(bytes: &[u8; 32]) -> String {
@@ -443,7 +742,7 @@ mod enabled {
             let dir = temp_dir("zeroserve-iroh-key-create");
             let path = dir.join("secret.key");
             let key = load_or_create_secret_key(&path).expect("create key");
-            assert_eq!(key.len(), 32);
+            assert_eq!(key.to_bytes().len(), 32);
             let mode = std::fs::metadata(&path)
                 .expect("metadata")
                 .permissions()
@@ -463,7 +762,7 @@ mod enabled {
                 .expect("loosen permissions");
 
             let loaded = load_or_create_secret_key(&path).expect("load key");
-            assert_eq!(loaded, key);
+            assert_eq!(loaded.to_bytes(), key);
             let mode = std::fs::metadata(&path)
                 .expect("metadata")
                 .permissions()

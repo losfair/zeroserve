@@ -1,119 +1,27 @@
 #![cfg(feature = "iroh-proxy")]
 
 use std::{
-    convert::Infallible,
     fs,
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    pin::Pin,
     process::{Child, Command, Stdio},
     sync::mpsc,
-    task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use http_body::Frame;
-use http_body_util::BodyExt;
-use iroh_http_core::{Body, IrohEndpoint, NetworkingOptions, NodeOptions, ServeOptions, serve};
-use tower::Service;
+use iroh::{
+    Endpoint, RelayMode,
+    endpoint::{RecvStream, SendStream, presets},
+};
 
-#[derive(Clone)]
-struct DelayedStreamingService;
-
-impl Service<hyper::Request<Body>> for DelayedStreamingService {
-    type Response = hyper::Response<Body>;
-    type Error = Infallible;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
-        let path = req.uri().path().to_string();
-        let query = req.uri().query().unwrap_or("").to_string();
-        Box::pin(async move {
-            if path == "/base/warmup" {
-                return Ok(hyper::Response::builder()
-                    .status(204)
-                    .body(Body::empty())
-                    .expect("static response is valid"));
-            }
-            if path == "/base/echo-body" {
-                let mut len = 0usize;
-                let mut body = req.into_body();
-                while let Some(frame) = body.frame().await {
-                    let frame = frame.expect("request body frame is readable");
-                    if let Ok(chunk) = frame.into_data() {
-                        len += chunk.len();
-                    }
-                }
-                return Ok(hyper::Response::builder()
-                    .status(211)
-                    .header("content-type", "text/plain")
-                    .header("x-iroh-path", path)
-                    .header("x-iroh-query", query)
-                    .header("x-iroh-body-len", len.to_string())
-                    .body(Body::full(Bytes::from(format!("len={len}\n"))))
-                    .expect("static response is valid"));
-            }
-            Ok(hyper::Response::builder()
-                .status(209)
-                .header("content-type", "text/plain")
-                .header("x-iroh-path", path)
-                .header("x-iroh-query", query)
-                .body(Body::new(DelayedBody::default()))
-                .expect("static response is valid"))
-        })
-    }
-}
-
-#[derive(Default)]
-struct DelayedBody {
-    state: u8,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl http_body::Body for DelayedBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        loop {
-            match self.state {
-                0 => {
-                    self.state = 1;
-                    self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
-                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"first\n")))));
-                }
-                1 => {
-                    let sleep = self.sleep.as_mut().expect("sleep exists in state 1");
-                    if sleep.as_mut().poll(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    self.state = 2;
-                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"second\n")))));
-                }
-                _ => return Poll::Ready(None),
-            }
-        }
-    }
-}
+const DUMBPIPE_ALPN: &[u8] = b"DUMBPIPEV0";
+const DUMBPIPE_HANDSHAKE: &[u8] = b"hello";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response() {
-    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
-    let _serve = serve(
-        server_ep.clone(),
-        ServeOptions::default(),
-        DelayedStreamingService,
-    );
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-e2e");
     let script = temp.path().join("proxy.c");
@@ -172,12 +80,7 @@ async fn zeroserve_reverse_proxies_to_real_iroh_http_server_streaming_response()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_streams_request_bodies_to_real_iroh_http_server() {
-    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
-    let _serve = serve(
-        server_ep.clone(),
-        ServeOptions::default(),
-        DelayedStreamingService,
-    );
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-body-e2e");
     let script = temp.path().join("proxy.c");
@@ -217,12 +120,7 @@ async fn zeroserve_streams_request_bodies_to_real_iroh_http_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_reverse_proxies_h2_clients_to_real_iroh_http_server() {
-    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
-    let _serve = serve(
-        server_ep.clone(),
-        ServeOptions::default(),
-        DelayedStreamingService,
-    );
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-h2-e2e");
     let script = temp.path().join("proxy.c");
@@ -251,12 +149,7 @@ async fn zeroserve_reverse_proxies_h2_clients_to_real_iroh_http_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_iroh_proxy_rejects_too_large_chunked_request_body() {
-    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
-    let _serve = serve(
-        server_ep.clone(),
-        ServeOptions::default(),
-        DelayedStreamingService,
-    );
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-limit-e2e");
     let script = temp.path().join("proxy.c");
@@ -285,12 +178,7 @@ async fn zeroserve_iroh_proxy_rejects_too_large_chunked_request_body() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zeroserve_iroh_proxy_rejects_upgrade_requests_with_501() {
-    let (server_ep, node_id, direct_addr) = bind_iroh_endpoint().await;
-    let _serve = serve(
-        server_ep.clone(),
-        ServeOptions::default(),
-        DelayedStreamingService,
-    );
+    let (_server, node_id, direct_addr) = start_iroh_http_server().await;
 
     let temp = TempDir::new("zeroserve-iroh-proxy-upgrade-e2e");
     let script = temp.path().join("proxy.c");
@@ -340,26 +228,318 @@ async fn zeroserve_iroh_proxy_returns_gateway_error_for_dead_endpoint() {
     zeroserve.stop();
 }
 
-async fn bind_iroh_endpoint() -> (IrohEndpoint, String, std::net::SocketAddr) {
-    let server_ep = IrohEndpoint::bind(NodeOptions {
-        networking: NetworkingOptions {
-            disabled: true,
-            bind_addrs: vec!["127.0.0.1:0".to_string()],
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .await
-    .expect("bind iroh endpoint");
-    let node_id = server_ep.node_id().to_string();
-    let direct_addr = server_ep
-        .raw()
+struct IrohHttpServer {
+    _endpoint: Endpoint,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for IrohHttpServer {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+async fn start_iroh_http_server() -> (IrohHttpServer, String, std::net::SocketAddr) {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .expect("configure iroh loopback bind")
+        .alpns(vec![DUMBPIPE_ALPN.to_vec()])
+        .bind()
+        .await
+        .expect("bind iroh endpoint");
+    let node_id = endpoint.id().to_string();
+    let direct_addr = endpoint
         .addr()
         .ip_addrs()
         .next()
         .copied()
         .expect("iroh endpoint has a direct address");
-    (server_ep, node_id, direct_addr)
+    let accept_endpoint = endpoint.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let accepting = match incoming.accept() {
+                Ok(accepting) => accepting,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let Ok(conn) = accepting.await else {
+                    return;
+                };
+                while let Ok((send, recv)) = conn.accept_bi().await {
+                    tokio::spawn(async move {
+                        let _ = handle_dumbpipe_http_stream(send, recv).await;
+                    });
+                }
+            });
+        }
+    });
+    (
+        IrohHttpServer {
+            _endpoint: endpoint,
+            accept_task,
+        },
+        node_id,
+        direct_addr,
+    )
+}
+
+async fn handle_dumbpipe_http_stream(
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> anyhow::Result<()> {
+    let mut handshake = [0u8; 5];
+    recv.read_exact(&mut handshake)
+        .await
+        .map_err(|err| anyhow::anyhow!("read dumbpipe handshake: {err}"))?;
+    anyhow::ensure!(
+        handshake == DUMBPIPE_HANDSHAKE,
+        "invalid dumbpipe handshake"
+    );
+
+    let mut reader = TestHttpReader::new(recv);
+    let request = reader.read_request_head().await?;
+    if request.path == "/base/warmup" {
+        write_response(&mut send, 204, &[("content-length", "0")], &[]).await?;
+    } else if request.path == "/base/echo-body" {
+        let len = reader.read_request_body_len(&request.headers).await?;
+        let body = format!("len={len}\n");
+        let len_header = len.to_string();
+        let content_length = body.len().to_string();
+        write_response(
+            &mut send,
+            211,
+            &[
+                ("content-type", "text/plain"),
+                ("x-iroh-path", &request.path),
+                ("x-iroh-query", &request.query),
+                ("x-iroh-body-len", &len_header),
+                ("content-length", &content_length),
+            ],
+            body.as_bytes(),
+        )
+        .await?;
+    } else {
+        write_chunked_streaming_response(&mut send, &request.path, &request.query).await?;
+    }
+    send.finish().expect("finish iroh response stream");
+    Ok(())
+}
+
+struct TestRequest {
+    path: String,
+    query: String,
+    headers: Vec<(String, String)>,
+}
+
+struct TestHttpReader {
+    recv: RecvStream,
+    buffer: Vec<u8>,
+    eof: bool,
+}
+
+impl TestHttpReader {
+    fn new(recv: RecvStream) -> Self {
+        Self {
+            recv,
+            buffer: Vec::new(),
+            eof: false,
+        }
+    }
+
+    async fn read_request_head(&mut self) -> anyhow::Result<TestRequest> {
+        loop {
+            if let Some(head_end) = find_subslice(&self.buffer, b"\r\n\r\n") {
+                let rest = self.buffer.split_off(head_end + 4);
+                let mut head = std::mem::replace(&mut self.buffer, rest);
+                head.truncate(head_end);
+                let head = std::str::from_utf8(&head)?;
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().expect("request line exists");
+                let mut request_parts = request_line.split_whitespace();
+                let _method = request_parts.next().expect("request method exists");
+                let target = request_parts.next().expect("request target exists");
+                let (path, query) = target
+                    .split_once('?')
+                    .map(|(path, query)| (path.to_string(), query.to_string()))
+                    .unwrap_or_else(|| (target.to_string(), String::new()));
+                let mut headers = Vec::new();
+                for line in lines {
+                    if let Some((name, value)) = line.split_once(':') {
+                        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+                    }
+                }
+                return Ok(TestRequest {
+                    path,
+                    query,
+                    headers,
+                });
+            }
+            anyhow::ensure!(self.buffer.len() < 64 * 1024, "request head too large");
+            anyhow::ensure!(self.read_more().await?, "request ended before head");
+        }
+    }
+
+    async fn read_request_body_len(
+        &mut self,
+        headers: &[(String, String)],
+    ) -> anyhow::Result<usize> {
+        if headers.iter().any(|(name, value)| {
+            name == "transfer-encoding"
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        }) {
+            self.read_chunked_body_len().await
+        } else if let Some((_, value)) = headers.iter().find(|(name, _)| name == "content-length") {
+            self.read_fixed_body_len(value.parse()?).await
+        } else {
+            self.read_until_eof_len().await
+        }
+    }
+
+    async fn read_fixed_body_len(&mut self, mut remaining: usize) -> anyhow::Result<usize> {
+        let mut len = 0usize;
+        while remaining > 0 {
+            let chunk = self.next_chunk(remaining.min(8192)).await?;
+            let Some(chunk) = chunk else {
+                anyhow::bail!("request body ended early");
+            };
+            remaining -= chunk.len();
+            len += chunk.len();
+        }
+        Ok(len)
+    }
+
+    async fn read_chunked_body_len(&mut self) -> anyhow::Result<usize> {
+        let mut len = 0usize;
+        loop {
+            let line = self.read_line().await?;
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&line)?
+                    .split_once(';')
+                    .map_or(std::str::from_utf8(&line)?, |(size, _)| size)
+                    .trim(),
+                16,
+            )?;
+            if size == 0 {
+                loop {
+                    if self.read_line().await?.is_empty() {
+                        return Ok(len);
+                    }
+                }
+            }
+            len += self.read_fixed_body_len(size).await?;
+            self.consume_exact(2).await?;
+        }
+    }
+
+    async fn read_until_eof_len(&mut self) -> anyhow::Result<usize> {
+        let mut len = 0usize;
+        while let Some(chunk) = self.next_chunk(8192).await? {
+            len += chunk.len();
+        }
+        Ok(len)
+    }
+
+    async fn read_line(&mut self) -> anyhow::Result<Vec<u8>> {
+        loop {
+            if let Some(end) = find_subslice(&self.buffer, b"\r\n") {
+                let rest = self.buffer.split_off(end + 2);
+                let mut line = std::mem::replace(&mut self.buffer, rest);
+                line.truncate(end);
+                return Ok(line);
+            }
+            anyhow::ensure!(self.buffer.len() < 8192, "line too large");
+            anyhow::ensure!(self.read_more().await?, "request ended in line");
+        }
+    }
+
+    async fn consume_exact(&mut self, mut len: usize) -> anyhow::Result<()> {
+        while len > 0 {
+            if !self.buffer.is_empty() {
+                let take = len.min(self.buffer.len());
+                self.buffer.drain(..take);
+                len -= take;
+            } else {
+                anyhow::ensure!(self.read_more().await?, "request ended early");
+            }
+        }
+        Ok(())
+    }
+
+    async fn next_chunk(&mut self, max_len: usize) -> anyhow::Result<Option<Bytes>> {
+        if !self.buffer.is_empty() {
+            let take = max_len.min(self.buffer.len());
+            let chunk = Bytes::copy_from_slice(&self.buffer[..take]);
+            self.buffer.drain(..take);
+            return Ok(Some(chunk));
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        match self.recv.read_chunk(max_len).await {
+            Ok(Some(chunk)) => Ok(Some(chunk.bytes)),
+            Ok(None) => {
+                self.eof = true;
+                Ok(None)
+            }
+            Err(err) => Err(anyhow::anyhow!("read iroh request chunk: {err}")),
+        }
+    }
+
+    async fn read_more(&mut self) -> anyhow::Result<bool> {
+        if self.eof {
+            return Ok(false);
+        }
+        let mut buf = [0u8; 8192];
+        match self.recv.read(&mut buf).await {
+            Ok(Some(n)) => {
+                self.buffer.extend_from_slice(&buf[..n]);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.eof = true;
+                Ok(false)
+            }
+            Err(err) => Err(anyhow::anyhow!("read iroh request: {err}")),
+        }
+    }
+}
+
+async fn write_response(
+    send: &mut SendStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let mut head = format!("HTTP/1.1 {status} test\r\n");
+    for (name, value) in headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    send.write_all(head.as_bytes()).await?;
+    send.write_all(body).await?;
+    Ok(())
+}
+
+async fn write_chunked_streaming_response(
+    send: &mut SendStream,
+    path: &str,
+    query: &str,
+) -> anyhow::Result<()> {
+    let head = format!(
+        "HTTP/1.1 209 test\r\ncontent-type: text/plain\r\nx-iroh-path: {path}\r\nx-iroh-query: {query}\r\ntransfer-encoding: chunked\r\n\r\n"
+    );
+    send.write_all(head.as_bytes()).await?;
+    send.write_all(b"6\r\nfirst\n\r\n").await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    send.write_all(b"7\r\nsecond\n\r\n0\r\n\r\n").await?;
+    Ok(())
 }
 
 fn write_proxy_script(script: &Path, backend: &str, body_limit: Option<usize>) {
