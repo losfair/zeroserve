@@ -618,9 +618,10 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if let [arg] = first_line.as_slice()
         && arg != "internal"
         && arg != "force_automate"
+        && arg != "off"
         && !arg.contains('@')
     {
-        bail!("single argument must either be 'internal', 'force_automate', or an email address");
+        bail!("single argument must be 'internal', 'force_automate', 'off', or an email address");
     }
     if let [cert, key] = first_line.as_slice() {
         cert_policies.push(tls_certificate_policy(cert, key));
@@ -629,6 +630,7 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     // `zeroserve.init.acme_config` section (see caddy_compile.rs).
     let mut acme_internal = false;
     let mut acme_issuer = false;
+    let mut acme_skip = false;
     let mut acme_email: Option<String> = None;
     let mut acme_ca: Option<String> = None;
     let mut acme_eab: Option<(String, String)> = None;
@@ -636,6 +638,9 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
         match arg.as_str() {
             "internal" => acme_internal = true,
             "force_automate" => acme_issuer = true,
+            // `tls off`: exclude this site from automatic HTTPS (ACME). It is
+            // served from a `--cert`/`--key` default identity or `--cert-dir`.
+            "off" => acme_skip = true,
             // Guarded above to be an email address.
             _ => acme_email = Some(arg.clone()),
         }
@@ -778,7 +783,9 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     }
     policies.extend(cert_policies);
     let mut out: Vec<ConfigValue> = Vec::new();
-    if policies.is_empty() {
+    if acme_skip {
+        h.warn("site 'tls off': excluded from automatic HTTPS (ACME)");
+    } else if policies.is_empty() {
         h.warn(
             "site tls directive is accepted but configured outside zeroserve's eBPF request-processing surface",
         );
@@ -819,6 +826,14 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
             class: "acme_automation".into(),
             directive: "tls".into(),
             value: RouteOrSub::Json(Value::Object(obj)),
+        });
+    }
+    // `tls off`: mark the site's hostnames to be skipped by automatic HTTPS.
+    if acme_skip {
+        out.push(ConfigValue {
+            class: "acme_automation".into(),
+            directive: "tls".into(),
+            value: RouteOrSub::Json(json!({ "skip": true })),
         });
     }
     Ok(out)

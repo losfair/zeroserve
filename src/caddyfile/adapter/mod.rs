@@ -372,6 +372,11 @@ fn build_tls_automation(
             .map(|a| a.host.clone())
             .collect();
         for entry in &block.acme_automation {
+            // `tls off` skip markers are handled in build_servers (emitted as
+            // automatic_https.skip), not here.
+            if entry.get("skip").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if entry.get("internal").and_then(Value::as_bool) == Some(true) {
                 for host in &hosts {
                     if !internal_subjects.contains(host) {
@@ -643,6 +648,7 @@ fn build_servers(
         let mut routes: Vec<Value> = Vec::new();
         let mut error_routes: Vec<Value> = Vec::new();
         let mut tls_connection_policies: Vec<Value> = Vec::new();
+        let mut skip_hosts: Vec<String> = Vec::new();
 
         for &placement_idx in &placement_idxs {
             let placement = &placements[placement_idx];
@@ -651,6 +657,19 @@ fn build_servers(
             let tls_policies = blocks[placement.block_idx].tls_policies.clone();
             let matcher_sets = compile_encoded_matcher_sets(&placement.matcher_keys)?;
             let sni = tls_policy_sni_hosts(&placement.matcher_keys);
+
+            // `tls off`: exclude this site's hostnames from automatic HTTPS.
+            let skipped = blocks[placement.block_idx]
+                .acme_automation
+                .iter()
+                .any(|e| e.get("skip").and_then(Value::as_bool) == Some(true));
+            if skipped {
+                for host in &sni {
+                    if !skip_hosts.contains(host) {
+                        skip_hosts.push(host.clone());
+                    }
+                }
+            }
 
             let site_subroute =
                 handlers::build_subroute(block, counter, true, &options.directive_order)?;
@@ -689,6 +708,10 @@ fn build_servers(
                 "tls_connection_policies".into(),
                 Value::Array(tls_connection_policies),
             );
+        }
+        if !skip_hosts.is_empty() {
+            skip_hosts.sort();
+            srv.insert("automatic_https".into(), json!({ "skip": skip_hosts }));
         }
         if !named_routes.is_empty() {
             srv.insert("named_routes".into(), Value::Object(named_routes.clone()));
@@ -4867,6 +4890,33 @@ a.example {
     }
 
     #[test]
+    fn site_tls_off_emits_automatic_https_skip() {
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+}
+a.example {
+  respond ok
+}
+b.example {
+  tls off
+  respond ok
+}"#,
+        );
+        let skip = &v["apps"]["http"]["servers"]["srv0"]["automatic_https"]["skip"];
+        assert_eq!(skip, &json!(["b.example"]));
+        // `tls off` must not contribute an ACME issuer.
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        assert!(policies.iter().all(|p| {
+            p["issuers"]
+                .as_array()
+                .is_none_or(|is| is.iter().all(|i| i["module"] != "internal"))
+        }));
+    }
+
+    #[test]
     fn no_tls_app_without_acme_config() {
         let (v, _) = adapt_full(
             r#"example.com {
@@ -4884,7 +4934,7 @@ a.example {
         let bad_single_arg = adapt_err("example.com {\n  tls not-an-email\n}");
         assert!(
             bad_single_arg.contains(
-                "single argument must either be 'internal', 'force_automate', or an email address"
+                "single argument must be 'internal', 'force_automate', 'off', or an email address"
             ),
             "{bad_single_arg}"
         );

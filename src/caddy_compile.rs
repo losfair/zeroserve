@@ -257,11 +257,24 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     }
     let mut routes = Vec::new();
     let mut tls_connection_policies = Vec::new();
+    let mut acme_skip_hosts: Vec<String> = Vec::new();
     let mut access_log_config = AccessLogConfig::default();
     for (server_name, server) in http.servers {
         let server_access_log_config = access_log_config_for_server(logging_config, &server.extra)?;
         access_log_config.merge(server_access_log_config);
         validate_http_server_fields(&server, &server_name, &mut warnings)?;
+        // `automatic_https.skip` hostnames (e.g. from Caddyfile `tls off`) are
+        // excluded from the generated acme_config.
+        if let Some(skip) = server
+            .extra
+            .get("automatic_https")
+            .and_then(|a| a.get("skip"))
+            .and_then(Value::as_array)
+        {
+            for host in skip.iter().filter_map(Value::as_str) {
+                acme_skip_hosts.push(host.to_ascii_lowercase());
+            }
+        }
         for (idx, policy) in server.tls_connection_policies.iter().enumerate() {
             validate_tls_connection_policy(
                 policy,
@@ -301,6 +314,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     generator.acme = parse_acme_automation(
         config.apps.extra.get("tls"),
         &generator.tls_connection_policies,
+        &acme_skip_hosts,
     )?;
     generator.emit_preamble();
     generator.line(HOST_TABLE_MARKER);
@@ -631,6 +645,8 @@ struct AcmeAutomationRaw {
     internal_subjects: Vec<String>,
     /// Domains with an explicit `tls <cert> <key>` — excluded (lowercased).
     explicit_cert_snis: Vec<String>,
+    /// Domains in `automatic_https.skip` (Caddyfile `tls off`) — excluded.
+    skip_subjects: Vec<String>,
 }
 
 /// Whether `host` is eligible for ACME TLS-ALPN-01 issuance: a public domain
@@ -677,8 +693,10 @@ fn set_unique_acme(field: &str, slot: &mut Option<String>, value: Option<&str>) 
 fn parse_acme_automation(
     tls_app: Option<&Value>,
     tls_policies: &[TlsConnectionPolicy],
+    skip_hosts: &[String],
 ) -> Result<Option<AcmeAutomationRaw>> {
     let mut raw = AcmeAutomationRaw::default();
+    raw.skip_subjects = skip_hosts.to_vec();
     for policy in tls_policies {
         if policy.certificate_selection.is_some()
             && let Some(m) = &policy.match_
@@ -826,6 +844,7 @@ impl Generator {
             .filter(|h| is_public_acme_domain(h))
             .filter(|h| !acme.internal_subjects.contains(h))
             .filter(|h| !acme.explicit_cert_snis.contains(h))
+            .filter(|h| !acme.skip_subjects.contains(h))
             .filter(|h| acme.manage_all || acme.acme_subjects.contains(h))
             .cloned()
             .collect();
@@ -6505,6 +6524,15 @@ fn validate_http_server_fields(
         if key == "logs" {
             continue;
         }
+        // `automatic_https` carrying only `skip` (Caddyfile `tls off`) is honored
+        // by the acme_config generator, not ignored — don't warn for it.
+        if key == "automatic_https"
+            && let Some(obj) = server.extra.get(key).and_then(Value::as_object)
+            && !obj.is_empty()
+            && obj.keys().all(|k| k == "skip")
+        {
+            continue;
+        }
         if ignorable_http_server_field(key) {
             warnings.push(format!(
                 "ignoring apps.http.servers.{server_name} field {key:?}: configured outside zeroserve's eBPF request-processing surface"
@@ -8186,6 +8214,32 @@ mod tests {
         }"#;
         let err = compile_caddy_json(source).unwrap_err().to_string();
         assert!(err.contains("conflicting ACME ca"), "{err}");
+    }
+
+    #[test]
+    fn acme_config_excludes_automatic_https_skip_hosts() {
+        let source = r#"{
+          "apps": {
+            "tls": { "automation": { "policies": [
+              { "issuers": [ { "module": "acme", "email": "a@b.c" } ] }
+            ] } },
+            "http": { "servers": { "srv0": {
+              "automatic_https": { "skip": ["b.example"] },
+              "routes": [
+                { "match": [{"host": ["a.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] },
+                { "match": [{"host": ["b.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+              ]
+            } } }
+          }
+        }"#;
+        let (c, warnings) = compile_caddy_json_collecting(source).unwrap();
+        assert!(c.contains("zs_json_set_string(d, \"a.example\""), "{c}");
+        assert!(!c.contains("zs_json_set_string(d, \"b.example\""), "{c}");
+        // automatic_https with only `skip` is honored, not warned about.
+        assert!(
+            !warnings.iter().any(|w| w.contains("automatic_https")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

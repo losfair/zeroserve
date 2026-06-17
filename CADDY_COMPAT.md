@@ -356,7 +356,10 @@ Current generated middleware support includes:
   routed public domains to manage (excluding `localhost`, IP literals,
   wildcards, `tls internal` sites, and sites with an explicit `tls <cert> <key>`).
   Certificates are obtained and renewed over ACME (TLS-ALPN-01) when the server
-  runs with `--acme-dir`; wildcard subjects and DNS-01 are not supported.
+  runs with `--acme-dir`; wildcard subjects and DNS-01 are not supported. A
+  single site opts out with `tls off` (compiled to `automatic_https.skip`): it is
+  excluded from ACME and served from a `--cert`/`--key` default identity or a
+  `--cert-dir` certificate instead.
 - file serving from packed tarball content and from configured filesystem roots
   only when zeroserve is started with `--expose-filesystem`
 - Caddyfile/Caddy JSON access logging to `output file ...` targets, written by
