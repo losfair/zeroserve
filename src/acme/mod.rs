@@ -27,11 +27,15 @@ pub use config::AcmeConfig;
 
 use challenge::{build_challenge_context, context_from_pem};
 use client::AcmeClient;
+use jose::AccountKey;
 use store::Store;
 
 /// How often to attempt provisioning / renewal (a failed domain is retried at
 /// this cadence, not the faster sync one).
 const RENEWAL_INTERVAL: Duration = Duration::from_secs(12 * 3600);
+/// Backoff between attempts to take a contended ACME lock. The wait yields to
+/// the monoio event loop (cooperative) instead of blocking the thread.
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// How often to reload the live store from `--acme-dir`, so certificates issued
 /// by a sibling process are picked up promptly.
 const CERT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
@@ -217,6 +221,28 @@ impl AcmeRuntime {
         }
     }
 
+    /// Read the ACME account key, generating one on first use. The brief
+    /// cross-process lock guarding creation is taken cooperatively — a
+    /// non-blocking `try_lock` plus an async sleep between attempts — so a
+    /// sibling generating the key never stalls the monoio event loop.
+    async fn account_key(&self, store: &Store) -> Result<AccountKey> {
+        if let Some(key) = store.read_account_key()? {
+            return Ok(key);
+        }
+        let lock_path = store.account_key_lock_path();
+        let _guard = loop {
+            match store.try_lock(&lock_path)? {
+                Some(guard) => break guard,
+                None => monoio::time::sleep(LOCK_RETRY_INTERVAL).await,
+            }
+        };
+        // A sibling may have created the key before we acquired the lock.
+        if let Some(key) = store.read_account_key()? {
+            return Ok(key);
+        }
+        store.create_account_key()
+    }
+
     async fn provision_cycle(&self, store: &Store, config: &AcmeConfig) -> Result<()> {
         let pending: Vec<String> = config
             .domains
@@ -228,7 +254,7 @@ impl AcmeRuntime {
             return Ok(());
         }
 
-        let key = store.load_or_create_account_key()?;
+        let key = self.account_key(store).await?;
         let client = AcmeClient::connect(
             key,
             &config.directory_url,
@@ -253,7 +279,7 @@ impl AcmeRuntime {
     ) -> Result<()> {
         // Single-flight across processes: if a sibling holds the per-domain lock
         // it is already provisioning, so skip and let `sync_live_certs` adopt its
-        // certificate.
+        // certificate. The lock is non-blocking, so this never stalls the loop.
         let Some(_lock) = store.try_lock_domain(domain)? else {
             return Ok(());
         };

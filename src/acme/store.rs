@@ -30,25 +30,6 @@ pub(crate) fn challenge_file_name(name: &str) -> String {
     dir_name(&name.to_ascii_lowercase())
 }
 
-/// Acquire an exclusive advisory (`flock`) lock on `lock_path`, creating the
-/// lock file if needed. The lock is held until the returned guard is dropped
-/// and is released automatically if the process exits, making account-key and
-/// per-domain certificate writes safe across multiple zeroserve processes that
-/// share one `--acme-dir` (e.g. replicas on shared storage). The lock is
-/// fine-grained — a separate lock file per resource (the account key, and each
-/// domain) — so unrelated writes never contend.
-fn lock_exclusive(lock_path: &Path) -> Result<Flock<fs::File>> {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
-        .with_context(|| format!("opening ACME lock file {}", lock_path.display()))?;
-    Flock::lock(file, FlockArg::LockExclusive)
-        .map_err(|(_, errno)| anyhow!("locking {}: {errno}", lock_path.display()))
-}
-
 /// Read and parse the account key at `path`, or `Ok(None)` if it does not exist.
 fn read_account_key(path: &Path) -> Result<Option<AccountKey>> {
     match fs::read(path) {
@@ -86,26 +67,40 @@ impl Store {
             .ok()
     }
 
-    /// Try to take the per-domain provisioning lock without blocking. `Some`
-    /// guard means we may provision `domain`; `None` means another process holds
-    /// it (and is provisioning), so we should skip. Released on guard drop / exit.
-    pub fn try_lock_domain(&self, domain: &str) -> Result<Option<Flock<fs::File>>> {
-        let dir = self.cert_dir(domain);
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("creating cert directory {}", dir.display()))?;
+    /// Try to take an exclusive advisory (`flock`) lock on `path` without
+    /// blocking, creating the lock file if needed. `Some` guard means it was
+    /// acquired (released on guard drop or process exit); `None` means another
+    /// process holds it. Non-blocking so callers can retry cooperatively (yield
+    /// to the event loop) instead of stalling the thread in the syscall.
+    pub fn try_lock(&self, path: &Path) -> Result<Option<Flock<fs::File>>> {
         let file = fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(dir.join(".provision.lock"))
-            .with_context(|| format!("opening provision lock for {domain}"))?;
+            .open(path)
+            .with_context(|| format!("opening lock file {}", path.display()))?;
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(guard) => Ok(Some(guard)),
             // EAGAIN (== EWOULDBLOCK on Linux): another process holds the lock.
             Err((_, Errno::EAGAIN)) => Ok(None),
-            Err((_, errno)) => Err(anyhow!("locking provision lock for {domain}: {errno}")),
+            Err((_, errno)) => Err(anyhow!("locking {}: {errno}", path.display())),
         }
+    }
+
+    /// Try to take the per-domain provisioning lock without blocking. `Some`
+    /// guard means we may provision `domain`; `None` means another process holds
+    /// it (and is provisioning), so we should skip.
+    pub fn try_lock_domain(&self, domain: &str) -> Result<Option<Flock<fs::File>>> {
+        let dir = self.cert_dir(domain);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating cert directory {}", dir.display()))?;
+        self.try_lock(&dir.join(".provision.lock"))
+    }
+
+    /// The exclusive lock guarding first-time account-key creation.
+    pub fn account_key_lock_path(&self) -> PathBuf {
+        self.root.join("account.key.lock")
     }
 
     fn challenges_dir(&self) -> PathBuf {
@@ -130,19 +125,16 @@ impl Store {
         let _ = fs::remove_file(self.challenges_dir().join(challenge_file_name(identifier)));
     }
 
-    /// Load the ACME account key, generating and persisting one on first use.
-    /// Creation is serialized across processes by an exclusive lock and a
-    /// re-check, so racing instances converge on a single account key.
-    pub fn load_or_create_account_key(&self) -> Result<AccountKey> {
+    /// The persisted ACME account key, or `Ok(None)` if none exists yet.
+    pub fn read_account_key(&self) -> Result<Option<AccountKey>> {
+        read_account_key(&self.account_key_path())
+    }
+
+    /// Generate and persist a new account key. The caller must hold the
+    /// account-key lock and have re-checked that none exists, so racing
+    /// processes converge on a single account key.
+    pub fn create_account_key(&self) -> Result<AccountKey> {
         let path = self.account_key_path();
-        if let Some(key) = read_account_key(&path)? {
-            return Ok(key);
-        }
-        let _lock = lock_exclusive(&self.root.join("account.key.lock"))?;
-        // Another process may have created the key before we took the lock.
-        if let Some(key) = read_account_key(&path)? {
-            return Ok(key);
-        }
         let key = AccountKey::generate()?;
         write_atomic(&path, &key.to_pem()?, 0o600)?;
         eprintln!("acme: generated new account key at {}", path.display());
@@ -157,14 +149,14 @@ impl Store {
         Some((cert, key))
     }
 
+    /// Persist `domain`'s certificate and key. The caller holds the per-domain
+    /// provisioning lock (so no other process writes concurrently), and the
+    /// atomic temp-then-rename keeps any concurrent reader from seeing a partial
+    /// file — so no separate write lock is needed here.
     pub fn save_cert(&self, domain: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
         let dir = self.cert_dir(domain);
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating cert directory {}", dir.display()))?;
-        // Per-domain lock: concurrent writers for the same domain serialize;
-        // different domains never contend.
-        let _lock = lock_exclusive(&dir.join(".lock"))?;
-        // Atomic writes so a concurrent reader never sees a partial cert/key.
         write_atomic(&dir.join("cert.pem"), cert_pem, 0o644)
             .with_context(|| format!("writing certificate for {domain}"))?;
         write_atomic(&dir.join("key.pem"), key_pem, 0o600)
@@ -269,17 +261,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zs-acme-store-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = Store::open(&dir).unwrap();
-        let k1 = store.load_or_create_account_key().unwrap();
-        let k2 = store.load_or_create_account_key().unwrap();
+        assert!(store.read_account_key().unwrap().is_none());
+        let k1 = store.create_account_key().unwrap();
+        let k2 = store.read_account_key().unwrap().unwrap();
         assert_eq!(k1.thumbprint().unwrap(), k2.thumbprint().unwrap());
         assert!(store.needs_renewal("example.com"), "no cert yet");
-        // The account-key lock file was created alongside the key.
-        assert!(dir.join("account.key.lock").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn save_cert_round_trips_and_holds_a_per_domain_lock() {
+    fn save_cert_round_trips_atomically() {
         let dir =
             std::env::temp_dir().join(format!("zs-acme-cert-{}-{:?}", std::process::id(), "x"));
         let _ = fs::remove_dir_all(&dir);
@@ -290,9 +281,7 @@ mod tests {
         let (cert, key) = store.load_cert("example.com").unwrap();
         assert_eq!(cert, b"cert-bytes");
         assert_eq!(key, b"key-bytes");
-        // A fine-grained per-domain lock file lives in the domain directory.
         let domain_dir = dir.join("certs").join("example.com");
-        assert!(domain_dir.join(".lock").exists());
 
         // Atomic writes leave no temp files behind, and apply the right modes.
         #[cfg(unix)]
@@ -319,9 +308,6 @@ mod tests {
             assert_eq!(cert_mode, 0o644);
         }
 
-        // Re-acquiring the same lock after the guard drops succeeds (the lock is
-        // released when the guard is dropped), and a second domain is independent.
-        drop(lock_exclusive(&dir.join("certs").join("example.com").join(".lock")).unwrap());
         store.save_cert("other.example", b"c2", b"k2").unwrap();
         assert_eq!(store.load_cert("other.example").unwrap().0, b"c2");
         fs::remove_dir_all(&dir).unwrap();
