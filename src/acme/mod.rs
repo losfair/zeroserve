@@ -114,6 +114,10 @@ impl SharedCerts {
             return Some(ctx);
         }
         // Cross-process fallback: a sibling published the key authorization.
+        // This runs inside the synchronous BoringSSL select-certificate callback
+        // (it returns an `SslContext` directly), so it must use blocking
+        // `std::fs` rather than monoio's async read. The read is a single small
+        // file and only happens for the rare `acme-tls/1` validation handshake.
         let dir = self.challenge_dir.as_ref()?;
         let path = dir.join(store::challenge_file_name(&sni));
         let key_authorization = std::fs::read_to_string(path).ok()?;
@@ -157,7 +161,7 @@ impl AcmeRuntime {
     /// share it), and provision/renew certificates this process is responsible
     /// for. Loops forever. Intended to be spawned once.
     pub async fn run(self: Arc<Self>, config: AcmeConfig) {
-        let store = match Store::open(&self.acme_dir) {
+        let store = match Store::open(&self.acme_dir).await {
             Ok(store) => store,
             Err(e) => {
                 eprintln!(
@@ -174,7 +178,7 @@ impl AcmeRuntime {
         let mut next_provision = std::time::Instant::now();
         loop {
             // Pick up certificates (re)issued by any process, including siblings.
-            self.sync_live_certs(&store, &config, &mut loaded);
+            self.sync_live_certs(&store, &config, &mut loaded).await;
 
             if std::time::Instant::now() >= next_provision {
                 if let Err(e) = self.provision_cycle(&store, &config).await {
@@ -189,7 +193,7 @@ impl AcmeRuntime {
     /// Reload into the live store any certificate whose file changed since we
     /// last loaded it (initial load, local renewal, or a sibling process's
     /// issuance/renewal). Skips `--cert-dir`-covered domains.
-    fn sync_live_certs(
+    async fn sync_live_certs(
         &self,
         store: &Store,
         config: &AcmeConfig,
@@ -199,13 +203,13 @@ impl AcmeRuntime {
             if self.covered_by_cert_dir(domain) {
                 continue;
             }
-            let Some(mtime) = store.cert_mtime(domain) else {
+            let Some(mtime) = store.cert_mtime(domain).await else {
                 continue;
             };
             if loaded.get(domain) == Some(&mtime) {
                 continue;
             }
-            if let Some((cert_pem, key_pem)) = store.load_cert(domain) {
+            if let Some((cert_pem, key_pem)) = store.load_cert(domain).await {
                 match context_from_pem(&cert_pem, &key_pem) {
                     Ok(ctx) => {
                         self.certs.insert_live(domain, ctx);
@@ -226,7 +230,7 @@ impl AcmeRuntime {
     /// non-blocking `try_lock` plus an async sleep between attempts — so a
     /// sibling generating the key never stalls the monoio event loop.
     async fn account_key(&self, store: &Store) -> Result<AccountKey> {
-        if let Some(key) = store.read_account_key()? {
+        if let Some(key) = store.read_account_key().await? {
             return Ok(key);
         }
         let lock_path = store.account_key_lock_path();
@@ -237,19 +241,19 @@ impl AcmeRuntime {
             }
         };
         // A sibling may have created the key before we acquired the lock.
-        if let Some(key) = store.read_account_key()? {
+        if let Some(key) = store.read_account_key().await? {
             return Ok(key);
         }
-        store.create_account_key()
+        store.create_account_key().await
     }
 
     async fn provision_cycle(&self, store: &Store, config: &AcmeConfig) -> Result<()> {
-        let pending: Vec<String> = config
-            .domains
-            .iter()
-            .filter(|d| !self.covered_by_cert_dir(d) && store.needs_renewal(d))
-            .cloned()
-            .collect();
+        let mut pending: Vec<String> = Vec::new();
+        for domain in &config.domains {
+            if !self.covered_by_cert_dir(domain) && store.needs_renewal(domain).await {
+                pending.push(domain.clone());
+            }
+        }
         if pending.is_empty() {
             return Ok(());
         }
@@ -280,11 +284,11 @@ impl AcmeRuntime {
         // Single-flight across processes: if a sibling holds the per-domain lock
         // it is already provisioning, so skip and let `sync_live_certs` adopt its
         // certificate. The lock is non-blocking, so this never stalls the loop.
-        let Some(_lock) = store.try_lock_domain(domain)? else {
+        let Some(_lock) = store.try_lock_domain(domain).await? else {
             return Ok(());
         };
         // Re-check under the lock: a sibling may have finished just before us.
-        if !store.needs_renewal(domain) {
+        if !store.needs_renewal(domain).await {
             return Ok(());
         }
         eprintln!("acme: provisioning certificate for {domain}");
@@ -298,7 +302,9 @@ impl AcmeRuntime {
             self.certs.insert_challenge(&challenge.identifier, ctx);
             // Publish the key authorization so any process (the CA's validation
             // handshake may land on a sibling via SO_REUSEPORT) can answer it.
-            store.write_challenge(&challenge.identifier, &challenge.key_authorization)?;
+            store
+                .write_challenge(&challenge.identifier, &challenge.key_authorization)
+                .await?;
 
             // Always tear the challenge down, whether validation succeeds or not.
             let result = async {
@@ -309,14 +315,14 @@ impl AcmeRuntime {
             }
             .await;
             self.certs.remove_challenge(&challenge.identifier);
-            store.remove_challenge(&challenge.identifier);
+            store.remove_challenge(&challenge.identifier).await;
             result?;
         }
 
         let key_pem = client.finalize(&order, &domains).await?;
         let cert_url = client.poll_order_certificate(&order).await?;
         let cert_pem = client.download_certificate(&cert_url).await?;
-        store.save_cert(domain, &cert_pem, &key_pem)?;
+        store.save_cert(domain, &cert_pem, &key_pem).await?;
 
         let ctx = context_from_pem(&cert_pem, &key_pem)?;
         self.certs.insert_live(domain, ctx);
@@ -331,25 +337,36 @@ mod tests {
 
     #[test]
     fn challenge_served_from_sibling_published_on_disk() {
-        let dir = std::env::temp_dir().join(format!("zs-acme-xchal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
+        // `#[monoio::test]` can't be used (it cfg-gates on the crate's `iouring`
+        // feature, which zeroserve doesn't define), so build the runtime directly.
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir =
+                    std::env::temp_dir().join(format!("zs-acme-xchal-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                let store = Store::open(&dir).await.unwrap();
 
-        // A process whose SharedCerts has no in-memory challenge still serves the
-        // TLS-ALPN-01 cert when a sibling published the key authorization on disk.
-        let certs = SharedCerts::new(Some(dir.join("challenges")));
-        assert!(certs.challenge_for_sni("acme.example").is_none());
-        store
-            .write_challenge("acme.example", "token.thumbprint")
-            .unwrap();
-        assert!(
-            certs.challenge_for_sni("acme.example").is_some(),
-            "should serve the on-disk challenge"
-        );
+                // A process whose SharedCerts has no in-memory challenge still
+                // serves the TLS-ALPN-01 cert when a sibling published the key
+                // authorization on disk.
+                let certs = SharedCerts::new(Some(dir.join("challenges")));
+                assert!(certs.challenge_for_sni("acme.example").is_none());
+                store
+                    .write_challenge("acme.example", "token.thumbprint")
+                    .await
+                    .unwrap();
+                assert!(
+                    certs.challenge_for_sni("acme.example").is_some(),
+                    "should serve the on-disk challenge"
+                );
 
-        store.remove_challenge("acme.example");
-        assert!(certs.challenge_for_sni("acme.example").is_none());
-        std::fs::remove_dir_all(&dir).unwrap();
+                store.remove_challenge("acme.example").await;
+                assert!(certs.challenge_for_sni("acme.example").is_none());
+                std::fs::remove_dir_all(&dir).unwrap();
+            });
     }
 
     #[test]

@@ -23,7 +23,7 @@ caps = "0.5"
 faster-hex = "0.10"
 futures = "0.3"
 h2 = "0.4"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros"] }
+monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros", "mkdirat", "unlinkat", "renameat"] }
 monoio-compat = "0.2"
 boring = "5"
 clap = { version = "4", features = ["derive"] }
