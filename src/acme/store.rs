@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use boring::asn1::Asn1Time;
 use boring::x509::X509;
+use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 
 use super::jose::AccountKey;
@@ -22,6 +23,11 @@ pub struct Store {
 /// Map a domain (possibly a wildcard) to a safe single path component.
 fn dir_name(domain: &str) -> String {
     domain.replace('*', "_wildcard_")
+}
+
+/// Lowercased, path-safe file name for a published challenge key authorization.
+pub(crate) fn challenge_file_name(name: &str) -> String {
+    dir_name(&name.to_ascii_lowercase())
 }
 
 /// Acquire an exclusive advisory (`flock`) lock on `lock_path`, creating the
@@ -69,6 +75,59 @@ impl Store {
 
     fn cert_dir(&self, domain: &str) -> PathBuf {
         self.root.join("certs").join(dir_name(domain))
+    }
+
+    /// Last-modified time of `domain`'s stored certificate, if present. Used to
+    /// detect certificates (re)issued by another process sharing this directory.
+    pub fn cert_mtime(&self, domain: &str) -> Option<std::time::SystemTime> {
+        fs::metadata(self.cert_dir(domain).join("cert.pem"))
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    /// Try to take the per-domain provisioning lock without blocking. `Some`
+    /// guard means we may provision `domain`; `None` means another process holds
+    /// it (and is provisioning), so we should skip. Released on guard drop / exit.
+    pub fn try_lock_domain(&self, domain: &str) -> Result<Option<Flock<fs::File>>> {
+        let dir = self.cert_dir(domain);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating cert directory {}", dir.display()))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(".provision.lock"))
+            .with_context(|| format!("opening provision lock for {domain}"))?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(guard) => Ok(Some(guard)),
+            // EAGAIN (== EWOULDBLOCK on Linux): another process holds the lock.
+            Err((_, Errno::EAGAIN)) => Ok(None),
+            Err((_, errno)) => Err(anyhow!("locking provision lock for {domain}: {errno}")),
+        }
+    }
+
+    fn challenges_dir(&self) -> PathBuf {
+        self.root.join("challenges")
+    }
+
+    /// Publish the TLS-ALPN-01 key authorization for `identifier` so any process
+    /// sharing this `--acme-dir` can answer the CA's validation handshake (which,
+    /// with SO_REUSEPORT, may land on a process other than the one provisioning).
+    pub fn write_challenge(&self, identifier: &str, key_authorization: &str) -> Result<()> {
+        let dir = self.challenges_dir();
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating challenges directory {}", dir.display()))?;
+        write_atomic(
+            &dir.join(challenge_file_name(identifier)),
+            key_authorization.as_bytes(),
+            0o644,
+        )
+    }
+
+    pub fn remove_challenge(&self, identifier: &str) {
+        let _ = fs::remove_file(self.challenges_dir().join(challenge_file_name(identifier)));
     }
 
     /// Load the ACME account key, generating and persisting one on first use.
@@ -265,6 +324,52 @@ mod tests {
         drop(lock_exclusive(&dir.join("certs").join("example.com").join(".lock")).unwrap());
         store.save_cert("other.example", b"c2", b"k2").unwrap();
         assert_eq!(store.load_cert("other.example").unwrap().0, b"c2");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn try_lock_domain_is_single_flight() {
+        let dir = std::env::temp_dir().join(format!("zs-acme-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+
+        let g1 = store.try_lock_domain("a.example").unwrap();
+        assert!(g1.is_some(), "first acquire");
+        // A second acquire of the same domain (separate fd) is denied.
+        assert!(store.try_lock_domain("a.example").unwrap().is_none());
+        // A different domain is independent.
+        assert!(store.try_lock_domain("b.example").unwrap().is_some());
+        drop(g1);
+        // Released after the guard drops.
+        assert!(store.try_lock_domain("a.example").unwrap().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn challenge_published_and_removed() {
+        let dir = std::env::temp_dir().join(format!("zs-acme-chal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+
+        let file = dir
+            .join("challenges")
+            .join(challenge_file_name("Ch.Example"));
+        store.write_challenge("Ch.Example", "tok.thumb").unwrap();
+        // Stored under the lowercased name with the exact key authorization.
+        assert_eq!(fs::read_to_string(&file).unwrap(), "tok.thumb");
+        store.remove_challenge("ch.example");
+        assert!(!file.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cert_mtime_tracks_writes() {
+        let dir = std::env::temp_dir().join(format!("zs-acme-mtime-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        assert!(store.cert_mtime("example.com").is_none());
+        store.save_cert("example.com", b"c", b"k").unwrap();
+        assert!(store.cert_mtime("example.com").is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
