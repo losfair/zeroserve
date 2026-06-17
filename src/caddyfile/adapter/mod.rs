@@ -295,7 +295,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     }
 
     // Build the TLS automation app (ACME issuers) before `compiled` is consumed.
-    let tls_app = build_tls_automation(&options, &compiled, &warnings);
+    let tls_app = build_tls_automation(&options, &compiled)?;
 
     let servers = build_servers(compiled, &options, &counter, &warnings, &named_routes)?;
 
@@ -324,18 +324,37 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     Ok((config, warns))
 }
 
+/// Set `slot` to `value`, rejecting a different already-set value. The generated
+/// `acme_config` is global (one CA/contact/EAB), so divergent per-site ACME
+/// settings cannot be represented and are a hard error.
+fn set_unique_acme_field(
+    field: &str,
+    slot: &mut Option<String>,
+    value: Option<&str>,
+) -> Result<()> {
+    if let Some(v) = value {
+        if let Some(existing) = slot
+            && existing != v
+        {
+            bail!(
+                "conflicting ACME {field} across sites ({existing:?} vs {v:?}); zeroserve issues all domains from a single ACME account, so {field} must be consistent"
+            );
+        }
+        *slot = Some(v.to_string());
+    }
+    Ok(())
+}
+
 /// Build the `apps.tls` app holding ACME `automation.policies`, translating the
 /// global `email`/`acme_ca`/`acme_eab` options and per-site `tls <email>` /
-/// `tls internal` / `tls { ca/eab }` directives. Returns `None` when the config
-/// configures no ACME automation and no `internal` issuer. The Caddy compiler
-/// reads this to emit `zeroserve.init.acme_config`.
+/// `tls internal` / `tls { ca/eab }` directives. Returns `Ok(None)` when the
+/// config configures no ACME automation and no `internal` issuer. Errors when
+/// sites set conflicting ACME settings. The Caddy compiler reads this to emit
+/// `zeroserve.init.acme_config`.
 fn build_tls_automation(
     options: &options::Options,
     compiled: &[CompiledBlock],
-    warnings: &Rc<RefCell<Vec<String>>>,
-) -> Option<Value> {
-    // Merged ACME issuer fields (a single global `acme_config` collapses
-    // per-site differences; last value wins with a warning).
+) -> Result<Option<Value>> {
     let mut acme_present = false;
     let mut email = options.acme_email.clone();
     let mut ca = options.acme_ca.clone();
@@ -343,18 +362,6 @@ fn build_tls_automation(
     if email.is_some() || ca.is_some() || eab.is_some() {
         acme_present = true;
     }
-    let mut merge = |field: &str, slot: &mut Option<String>, value: Option<&str>| {
-        if let Some(v) = value {
-            if let Some(existing) = slot {
-                if existing != v {
-                    warnings.borrow_mut().push(format!(
-                        "tls {field} {existing:?} overridden by {v:?}; the generated acme_config uses a single {field}"
-                    ));
-                }
-            }
-            *slot = Some(v.to_string());
-        }
-    };
 
     let mut internal_subjects: Vec<String> = Vec::new();
     for block in compiled {
@@ -374,17 +381,25 @@ fn build_tls_automation(
                 continue;
             }
             acme_present = true;
-            merge(
+            set_unique_acme_field(
                 "email",
                 &mut email,
                 entry.get("email").and_then(Value::as_str),
-            );
-            merge("ca", &mut ca, entry.get("ca").and_then(Value::as_str));
+            )?;
+            set_unique_acme_field("ca", &mut ca, entry.get("ca").and_then(Value::as_str))?;
             if let Some(e) = entry.get("eab") {
                 let kid = e.get("key_id").and_then(Value::as_str);
                 let mac = e.get("mac_key").and_then(Value::as_str);
                 if let (Some(kid), Some(mac)) = (kid, mac) {
-                    eab = Some((kid.to_string(), mac.to_string()));
+                    let new = (kid.to_string(), mac.to_string());
+                    if let Some(existing) = &eab
+                        && *existing != new
+                    {
+                        bail!(
+                            "conflicting ACME external account binding across sites; zeroserve issues all domains from a single ACME account, so the EAB must be consistent"
+                        );
+                    }
+                    eab = Some(new);
                 }
             }
         }
@@ -416,9 +431,9 @@ fn build_tls_automation(
     }
 
     if policies.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(json!({ "automation": { "policies": policies } }))
+    Ok(Some(json!({ "automation": { "policies": policies } })))
 }
 
 fn is_registered_directive_name(name: &str) -> bool {
@@ -4821,6 +4836,34 @@ internal.example {
                     .any(|i| i["module"] == "acme" && i["email"] == "me@example.com")
             })
         }));
+    }
+
+    #[test]
+    fn conflicting_site_acme_settings_are_rejected() {
+        let err = adapt_err(
+            r#"a.example {
+  tls a@example.com
+  respond ok
+}
+b.example {
+  tls b@example.com
+  respond ok
+}"#,
+        );
+        assert!(err.contains("conflicting ACME email"), "{err}");
+
+        let ca_conflict = adapt_err(
+            r#"{
+  acme_ca https://ca-one.example/dir
+}
+a.example {
+  tls {
+    ca https://ca-two.example/dir
+  }
+  respond ok
+}"#,
+        );
+        assert!(ca_conflict.contains("conflicting ACME ca"), "{ca_conflict}");
     }
 
     #[test]

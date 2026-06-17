@@ -301,7 +301,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     generator.acme = parse_acme_automation(
         config.apps.extra.get("tls"),
         &generator.tls_connection_policies,
-    );
+    )?;
     generator.emit_preamble();
     generator.line(HOST_TABLE_MARKER);
     generator.blank();
@@ -653,13 +653,31 @@ fn is_public_acme_domain(host: &str) -> bool {
     })
 }
 
+/// Set `slot` to `value`, rejecting a different already-set value. zeroserve's
+/// `acme_config` is global (one CA/contact/EAB), so divergent ACME issuers
+/// cannot be represented.
+fn set_unique_acme(field: &str, slot: &mut Option<String>, value: Option<&str>) -> Result<()> {
+    if let Some(v) = value {
+        if let Some(existing) = slot
+            && existing != v
+        {
+            bail!(
+                "conflicting ACME {field} ({existing:?} vs {v:?}); zeroserve issues all domains from a single ACME account, so {field} must be consistent"
+            );
+        }
+        *slot = Some(v.to_string());
+    }
+    Ok(())
+}
+
 /// Parse ACME automation from the `apps.tls` app and explicit-cert SNIs from the
-/// HTTP server's TLS connection policies. Returns `None` when no ACME issuer is
-/// configured (so no `acme_config` section is emitted).
+/// HTTP server's TLS connection policies. Returns `Ok(None)` when no ACME issuer
+/// is configured (so no `acme_config` section is emitted); errors when issuers
+/// disagree on the CA, contact, or EAB.
 fn parse_acme_automation(
     tls_app: Option<&Value>,
     tls_policies: &[TlsConnectionPolicy],
-) -> Option<AcmeAutomationRaw> {
+) -> Result<Option<AcmeAutomationRaw>> {
     let mut raw = AcmeAutomationRaw::default();
     for policy in tls_policies {
         if policy.certificate_selection.is_some()
@@ -696,19 +714,27 @@ fn parse_acme_automation(
             match issuer.get("module").and_then(Value::as_str) {
                 Some("acme") => {
                     acme_present = true;
-                    if let Some(e) = issuer.get("email").and_then(Value::as_str) {
-                        email = Some(e.to_string());
-                    }
-                    if let Some(c) = issuer.get("ca").and_then(Value::as_str) {
-                        ca = Some(c.to_string());
-                    }
+                    set_unique_acme(
+                        "email",
+                        &mut email,
+                        issuer.get("email").and_then(Value::as_str),
+                    )?;
+                    set_unique_acme("ca", &mut ca, issuer.get("ca").and_then(Value::as_str))?;
                     if let Some(ea) = issuer.get("external_account")
                         && let (Some(kid), Some(mac)) = (
                             ea.get("key_id").and_then(Value::as_str),
                             ea.get("mac_key").and_then(Value::as_str),
                         )
                     {
-                        raw.eab = Some((kid.to_string(), mac.to_string()));
+                        let new = (kid.to_string(), mac.to_string());
+                        if let Some(existing) = &raw.eab
+                            && *existing != new
+                        {
+                            bail!(
+                                "conflicting ACME external account binding; zeroserve issues all domains from a single ACME account, so the EAB must be consistent"
+                            );
+                        }
+                        raw.eab = Some(new);
                     }
                     if subjects.is_empty() {
                         raw.manage_all = true;
@@ -733,7 +759,7 @@ fn parse_acme_automation(
     }
 
     if !acme_present {
-        return None;
+        return Ok(None);
     }
     // The acme_config `contact` is a URL; Caddy's email is a bare address.
     raw.contact = email.map(|e| {
@@ -744,7 +770,7 @@ fn parse_acme_automation(
         }
     });
     raw.directory_url = ca;
-    Some(raw)
+    Ok(Some(raw))
 }
 
 impl Generator {
@@ -8143,6 +8169,23 @@ mod tests {
         assert!(c.contains("https://acme.example/dir"), "{c}");
         assert!(c.contains("\"kid\""), "{c}");
         assert!(c.contains("\"hmac_key\""), "{c}");
+    }
+
+    #[test]
+    fn conflicting_acme_issuers_are_rejected() {
+        let source = r#"{
+          "apps": {
+            "tls": { "automation": { "policies": [
+              { "issuers": [ { "module": "acme", "ca": "https://ca-one.example/dir" } ] },
+              { "subjects": ["b.example"], "issuers": [ { "module": "acme", "ca": "https://ca-two.example/dir" } ] }
+            ] } },
+            "http": { "servers": { "srv0": { "routes": [
+              { "match": [{"host": ["a.example"]}], "handle": [{"handler": "static_response", "status_code": 200}] }
+            ] } } }
+          }
+        }"#;
+        let err = compile_caddy_json(source).unwrap_err().to_string();
+        assert!(err.contains("conflicting ACME ca"), "{err}");
     }
 
     #[test]
