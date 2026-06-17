@@ -97,14 +97,17 @@ fn cert_expires_within(cert_pem: &[u8], days: u32) -> Result<bool> {
         .context("stored certificate chain is empty")?;
     let threshold = Asn1Time::days_from_now(days).context("computing renewal threshold")?;
     // notAfter < now+days  =>  expires within the window.
-    Ok(leaf.not_after().compare(&threshold).context("comparing certificate expiry")?
+    Ok(leaf
+        .not_after()
+        .compare(&threshold)
+        .context("comparing certificate expiry")?
         == std::cmp::Ordering::Less)
 }
 
 #[cfg(unix)]
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)

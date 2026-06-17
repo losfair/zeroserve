@@ -71,8 +71,8 @@ impl AcmeClient {
         if !resp.is_success() {
             bail!("ACME directory fetch failed: HTTP {}", resp.status);
         }
-        let directory: Directory = serde_json::from_slice(&resp.body)
-            .context("parsing ACME directory")?;
+        let directory: Directory =
+            serde_json::from_slice(&resp.body).context("parsing ACME directory")?;
 
         let mut client = AcmeClient {
             key,
@@ -132,8 +132,9 @@ impl AcmeClient {
             payload["contact"] = json!([c]);
         }
         if let Some(eab) = eab {
-            payload["externalAccountBinding"] =
-                self.key.external_account_binding(eab, &self.directory.new_account)?;
+            payload["externalAccountBinding"] = self
+                .key
+                .external_account_binding(eab, &self.directory.new_account)?;
         }
 
         // newAccount is signed with an embedded JWK (no kid yet).
@@ -144,7 +145,9 @@ impl AcmeClient {
             "nonce": nonce,
             "url": self.directory.new_account,
         });
-        let jws = self.key.sign_jws(protected, &serde_json::to_string(&payload)?)?;
+        let jws = self
+            .key
+            .sign_jws(protected, &serde_json::to_string(&payload)?)?;
         let body = serde_json::to_vec(&jws)?;
         let resp = http::request(
             "POST",
@@ -156,7 +159,11 @@ impl AcmeClient {
         .context("registering ACME account")?;
         self.store_nonce(&resp);
         if !resp.is_success() {
-            bail!("ACME newAccount failed: HTTP {} {}", resp.status, problem(&resp));
+            bail!(
+                "ACME newAccount failed: HTTP {} {}",
+                resp.status,
+                problem(&resp)
+            );
         }
         self.account_url = resp
             .header("location")
@@ -176,7 +183,11 @@ impl AcmeClient {
             .post(&self.directory.new_order, &serde_json::to_string(&payload)?)
             .await?;
         if !resp.is_success() {
-            bail!("ACME newOrder failed: HTTP {} {}", resp.status, problem(&resp));
+            bail!(
+                "ACME newOrder failed: HTTP {} {}",
+                resp.status,
+                problem(&resp)
+            );
         }
         let url = resp
             .header("location")
@@ -221,7 +232,9 @@ impl AcmeClient {
                 cs.iter()
                     .find(|c| c["type"].as_str() == Some("tls-alpn-01"))
             })
-            .ok_or_else(|| anyhow!("authorization for {identifier} has no tls-alpn-01 challenge"))?;
+            .ok_or_else(|| {
+                anyhow!("authorization for {identifier} has no tls-alpn-01 challenge")
+            })?;
         let challenge_url = challenge["url"]
             .as_str()
             .ok_or_else(|| anyhow!("tls-alpn-01 challenge missing url"))?
@@ -277,7 +290,11 @@ impl AcmeClient {
             .post(&order.finalize, &serde_json::to_string(&payload)?)
             .await?;
         if !resp.is_success() {
-            bail!("ACME finalize failed: HTTP {} {}", resp.status, problem(&resp));
+            bail!(
+                "ACME finalize failed: HTTP {} {}",
+                resp.status,
+                problem(&resp)
+            );
         }
         Ok(key_pem)
     }
@@ -329,7 +346,10 @@ fn acme_error_type(resp: &http::HttpResponse) -> Option<&'static str> {
 
 fn problem(resp: &http::HttpResponse) -> String {
     resp.json().map(|b| problem_body(&b)).unwrap_or_else(|_| {
-        String::from_utf8_lossy(&resp.body).chars().take(200).collect()
+        String::from_utf8_lossy(&resp.body)
+            .chars()
+            .take(200)
+            .collect()
     })
 }
 

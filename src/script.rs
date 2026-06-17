@@ -1633,11 +1633,7 @@ impl ScriptRuntime {
             }
         }
 
-        let chosen = select
-            .chosen
-            .borrow_mut()
-            .take()
-            .or_else(acme_fallback);
+        let chosen = select.chosen.borrow_mut().take().or_else(acme_fallback);
         Ok((chosen, select.request_client_cert.get()))
     }
 

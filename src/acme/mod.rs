@@ -112,7 +112,10 @@ impl AcmeRuntime {
         let store = match Store::open(&self.acme_dir) {
             Ok(store) => store,
             Err(e) => {
-                eprintln!("acme: cannot open --acme-dir {}: {e:#}", self.acme_dir.display());
+                eprintln!(
+                    "acme: cannot open --acme-dir {}: {e:#}",
+                    self.acme_dir.display()
+                );
                 return;
             }
         };
@@ -123,7 +126,9 @@ impl AcmeRuntime {
                 match context_from_pem(&cert_pem, &key_pem) {
                     Ok(ctx) => self.certs.insert_live(domain, ctx),
                     Err(e) => {
-                        eprintln!("acme: ignoring unreadable stored certificate for {domain}: {e:#}")
+                        eprintln!(
+                            "acme: ignoring unreadable stored certificate for {domain}: {e:#}"
+                        )
                     }
                 }
             }
@@ -178,13 +183,14 @@ impl AcmeRuntime {
 
         for authz_url in &order.authorizations {
             let challenge = client.tls_alpn_challenge(authz_url).await?;
-            let ctx =
-                build_challenge_context(&challenge.identifier, &challenge.key_authorization)?;
+            let ctx = build_challenge_context(&challenge.identifier, &challenge.key_authorization)?;
             self.certs.insert_challenge(&challenge.identifier, ctx);
 
             // Always remove the challenge cert, whether validation succeeds or not.
             let result = async {
-                client.signal_challenge_ready(&challenge.challenge_url).await?;
+                client
+                    .signal_challenge_ready(&challenge.challenge_url)
+                    .await?;
                 client.poll_authorization(authz_url).await
             }
             .await;

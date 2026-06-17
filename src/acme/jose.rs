@@ -50,8 +50,8 @@ pub struct AccountKey {
 
 impl AccountKey {
     pub fn generate() -> Result<Self> {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-            .context("creating P-256 group")?;
+        let group =
+            EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).context("creating P-256 group")?;
         let ec = EcKey::generate(&group).context("generating EC account key")?;
         let pkey = PKey::from_ec_key(ec).context("wrapping account key")?;
         Ok(Self { pkey })
@@ -187,7 +187,9 @@ mod tests {
     #[test]
     fn es256_signature_is_64_bytes_and_verifies() {
         let key = AccountKey::generate().unwrap();
-        let jws = key.sign_jws(json!({ "alg": "ES256", "url": "u", "nonce": "n" }), "{}").unwrap();
+        let jws = key
+            .sign_jws(json!({ "alg": "ES256", "url": "u", "nonce": "n" }), "{}")
+            .unwrap();
         let sig = b64url_decode(jws["signature"].as_str().unwrap()).unwrap();
         assert_eq!(sig.len(), 64);
 

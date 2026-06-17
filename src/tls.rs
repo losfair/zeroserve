@@ -132,8 +132,7 @@ pub fn load_tls_if_configured(
             // site's eBPF TLS section drives certificate selection per
             // connection; certificates referenced by the Caddyfile are loaded
             // lazily at handshake time, not preloaded here.
-            let script_certificates = (config.caddy_tarball.is_some()
-                || config.acme_dir.is_some())
+            let script_certificates = (config.caddy_tarball.is_some() || config.acme_dir.is_some())
                 && config.cert_dir_path.is_none();
 
             let acceptor = if let Some(cert_dir) = &config.cert_dir_path {

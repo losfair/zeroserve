@@ -97,8 +97,14 @@ pub async fn request(
         .await
         .with_context(|| format!("TLS handshake with ACME host {host}"))?;
 
+    // The Host header must carry the port for non-default ports: ACME servers
+    // (e.g. Pebble) build the directory's resource URLs from it.
+    let host_header = match parsed.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.clone(),
+    };
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\nConnection: close\r\n"
     );
     if let Some(ct) = content_type {
         req.push_str(&format!("Content-Type: {ct}\r\n"));

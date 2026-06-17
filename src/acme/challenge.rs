@@ -8,7 +8,9 @@ use boring::ec::{EcGroup, EcKey};
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::PKey;
-use boring::ssl::{AlpnError, SslContext, SslContextBuilder, SslMethod, SslVersion, select_next_proto};
+use boring::ssl::{
+    AlpnError, SslContext, SslContextBuilder, SslMethod, SslVersion, select_next_proto,
+};
 use boring::x509::extension::SubjectAlternativeName;
 use boring::x509::{X509, X509Extension, X509NameBuilder};
 

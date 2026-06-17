@@ -82,6 +82,18 @@ jobs:
           go install "github.com/caddyserver/caddy/v2/cmd/caddy@${CADDY_COMMIT}"
           echo "CADDY_BIN=$(go env GOPATH)/bin/caddy" >> "$GITHUB_ENV"
 
+      # Pebble is Let's Encrypt's test ACME server; the e2e suite uses it (with
+      # pebble-challtestsrv as a mock DNS resolver) to exercise automatic
+      # TLS-ALPN-01 certificate issuance. Pin a known-good release.
+      - name: Install Pebble (for the ACME e2e test)
+        env:
+          PEBBLE_VERSION: v2.10.1
+        run: |
+          go install "github.com/letsencrypt/pebble/v2/cmd/pebble@${PEBBLE_VERSION}"
+          go install "github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@${PEBBLE_VERSION}"
+          echo "PEBBLE_BIN=$(go env GOPATH)/bin/pebble" >> "$GITHUB_ENV"
+          echo "PEBBLE_CHALLTESTSRV_BIN=$(go env GOPATH)/bin/pebble-challtestsrv" >> "$GITHUB_ENV"
+
       # The server isolates itself with unprivileged user namespaces by default.
       # Ubuntu 24.04 runners restrict these via AppArmor; relax it so the server
       # can start during the e2e tests (otherwise `--disable-ns-isolation` would

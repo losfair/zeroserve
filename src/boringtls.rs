@@ -716,16 +716,29 @@ const CA_BUNDLE_PATHS: &[&str] = &[
 /// `/etc` is a tmpfs). Reverse-proxying to HTTPS upstreams fails if this wasn't
 /// initialized.
 pub fn init_client_from_system_roots() -> Result<()> {
-    let bundle = CA_BUNDLE_PATHS
-        .iter()
-        .map(std::path::Path::new)
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            anyhow!(
-                "no system CA bundle found (looked in {:?}); HTTPS reverse-proxy upstreams will fail",
-                CA_BUNDLE_PATHS
-            )
-        })?;
+    // Honor the conventional `SSL_CERT_FILE` override (used to trust a private
+    // or test CA, e.g. a local ACME server). Falls back to probing the common
+    // system bundle locations.
+    let ssl_cert_file = std::env::var_os("SSL_CERT_FILE").map(std::path::PathBuf::from);
+    let bundle: &std::path::Path = match &ssl_cert_file {
+        Some(path) if path.exists() => path.as_path(),
+        Some(path) => {
+            return Err(anyhow!(
+                "SSL_CERT_FILE points at {}, which does not exist",
+                path.display()
+            ));
+        }
+        None => CA_BUNDLE_PATHS
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no system CA bundle found (looked in {:?}); HTTPS reverse-proxy upstreams will fail",
+                    CA_BUNDLE_PATHS
+                )
+            })?,
+    };
     let mut builder =
         SslConnector::builder(SslMethod::tls()).context("creating BoringSSL client context")?;
     builder

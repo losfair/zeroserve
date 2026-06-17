@@ -88,8 +88,7 @@ impl AcmeConfig {
 
             for domain in parsed.domains {
                 let domain = domain.trim().to_ascii_lowercase();
-                validate_domain(&domain)
-                    .map_err(|e| anyhow::anyhow!("script '{script}': {e}"))?;
+                validate_domain(&domain).map_err(|e| anyhow::anyhow!("script '{script}': {e}"))?;
                 if !domains.contains(&domain) {
                     domains.push(domain);
                 }
@@ -119,7 +118,9 @@ impl AcmeConfig {
 
             if let Some(e) = parsed.eab {
                 if eab.as_ref().is_some_and(|existing| existing != &e) {
-                    eprintln!("acme: script '{script}' overrides external account binding (last wins)");
+                    eprintln!(
+                        "acme: script '{script}' overrides external account binding (last wins)"
+                    );
                 }
                 eab = Some(e);
             }
@@ -187,10 +188,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_domain() {
-        let entries = vec![(
-            "01.o".to_string(),
-            json!({ "domains": ["bad domain.com"] }),
-        )];
+        let entries = vec![("01.o".to_string(), json!({ "domains": ["bad domain.com"] }))];
         assert!(AcmeConfig::merge(&entries).is_err());
     }
 
