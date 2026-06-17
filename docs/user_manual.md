@@ -269,6 +269,12 @@ Key options:
 - `--cert-dir <DIR>`: Directory of TLS certificate PEMs and private key PEMs.
   Zeroserve matches keys to certificates automatically and selects certificates
   by SNI.
+- `--acme-dir <DIR>`: Enable automatic certificate provisioning over ACME
+  (TLS-ALPN-01) and persist the ACME account key and obtained certificates in
+  this directory. Requires `--tls-addr`. The set of domains is read from the
+  site's `zeroserve.init.acme_config` script section (see "Automatic HTTPS"
+  below). Mutually exclusive with `--cert-dir`; an optional `--cert`/`--key`
+  pair becomes the default identity for SNIs not yet covered by an ACME cert.
 - `--ech-key <PATH>`: Path to an ECH key PEM file or directory of files.
   Requires TLS to be configured. See the ECH section below.
 - `--gen-ech-key`: Generate a new ECH keypair and ECHConfig. Writes the PEM
@@ -529,6 +535,53 @@ llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj out.bc -o out.o
 
 Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
 `.c`/`.o` directly as a plugin or site path.
+
+### Automatic HTTPS (ACME)
+
+With `--acme-dir <DIR>`, zeroserve obtains and renews TLS certificates
+automatically over ACME (RFC 8555) using the TLS-ALPN-01 challenge (RFC 8737)
+on the existing `--tls-addr` listener — no separate port or plaintext path is
+required. The CA's validation handshake (ALPN `acme-tls/1`) is answered with a
+challenge certificate served entirely inside the TLS layer.
+
+The set of domains is declared by the site itself: a script exposes a
+`zeroserve.init.acme_config` section via `ZS_INIT_ENTRY(acme_config)`, run once
+at load time, returning a JSON handle:
+
+```c
+#include <zeroserve.h>
+
+ZS_INIT_ENTRY(acme_config) {
+  zs_s64 cfg = zs_json_new_object();
+  zs_s64 domains = zs_json_new_array();
+  zs_s64 d = zs_json_new_object();
+  zs_json_set_string(d, ZS_STR("example.com"));
+  zs_json_array_push(domains, d);
+  zs_object_free(d);
+  zs_json_set(cfg, ZS_STR("domains"), domains);
+  zs_object_free(domains);
+  return cfg;   // negative return signals failure
+}
+```
+
+Returned object fields:
+
+- `domains` (array of strings, required): names to obtain certificates for.
+  Values from every script's `acme_config` are merged and de-duplicated.
+- `contact` (string, optional): ACME account contact, e.g. `mailto:a@b.c`.
+- `directory_url` (string, optional): ACME directory URL. Defaults to Let's
+  Encrypt production.
+- `eab` (object, optional): External Account Binding `{ "kid", "hmac_key" }`
+  (`hmac_key` base64url) for CAs that require it.
+
+The account key and certificates are persisted under `--acme-dir` and reused
+across restarts; certificates are renewed automatically before expiry. The
+storage location is set only by `--acme-dir`, never by the script. See
+`examples/acme.c`.
+
+```bash
+zeroserve --tls-addr 0.0.0.0:443 --acme-dir ./acme site.tar
+```
 
 ### Plugin tarballs
 

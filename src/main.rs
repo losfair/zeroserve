@@ -1,3 +1,4 @@
+mod acme;
 mod boringtls;
 mod bpf_compiler;
 mod caddy_compile;
@@ -253,9 +254,21 @@ fn main() -> Result<()> {
         site.total_entries, site_origin, site.total_bytes
     );
 
-    let tls_runtime = load_tls_if_configured(&config)?;
+    // When `--acme-dir` is set, create the ACME runtime first so its shared
+    // certificate registry can be wired into the TLS acceptor (TLS-ALPN-01
+    // challenges and per-SNI live certificates are resolved through it).
+    let acme_runtime = config
+        .acme_dir
+        .as_ref()
+        .map(|dir| acme::AcmeRuntime::new(dir.clone()));
+    let acme_certs = acme_runtime.as_ref().map(|a| a.certs());
+
+    let tls_runtime = load_tls_if_configured(&config, acme_certs)?;
     if tls_runtime.is_some() {
         eprintln!("TLS enabled");
+    }
+    if acme_runtime.is_some() {
+        eprintln!("ACME enabled (TLS-ALPN-01)");
     }
 
     eprintln!(
@@ -269,6 +282,7 @@ fn main() -> Result<()> {
         site,
         plugin_sites,
         tls_runtime,
+        acme_runtime,
         file_logger,
     ));
 
@@ -402,6 +416,30 @@ fn run_worker(
             };
             script_runtime.install_scripts(scripts);
             let _ = startup_tx.send((worker_id, Ok(())));
+
+            // ACME provisioning is process-wide: run it once, on worker 0. Read
+            // the domain set from the site's `zeroserve.init.acme_config`
+            // section and spawn the provisioning/renewal task.
+            if worker_id == 0 {
+                if let Some(acme) = shared.acme.clone() {
+                    let site = shared.site.load_full();
+                    match script_runtime.run_init_section(site, "acme_config").await {
+                        Ok(entries) => match acme::AcmeConfig::merge(&entries) {
+                            Ok(Some(cfg)) => {
+                                eprintln!("acme: managing {} domain(s)", cfg.domains.len());
+                                monoio::spawn(acme.run(cfg));
+                            }
+                            Ok(None) => eprintln!(
+                                "acme: acme_config requested no domains; nothing to provision"
+                            ),
+                            Err(err) => eprintln!("acme: invalid acme_config: {err:#}"),
+                        },
+                        Err(err) => {
+                            eprintln!("acme: running acme_config init section failed: {err:#}")
+                        }
+                    }
+                }
+            }
 
             monoio::spawn(worker_reload_loop(script_runtime.clone(), reload_rx));
 

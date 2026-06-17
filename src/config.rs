@@ -20,6 +20,10 @@ pub struct StaticConfig {
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub cert_dir_path: Option<PathBuf>,
+    /// When set (`--acme-dir`), certificates are provisioned automatically over
+    /// ACME (TLS-ALPN-01) and persisted here. Domains come from the site's
+    /// `zeroserve.init.acme_config` section.
+    pub acme_dir: Option<PathBuf>,
     pub ech_key_path: Option<PathBuf>,
     pub reload_signal_file: Option<PathBuf>,
     pub index_file: String,
@@ -62,7 +66,8 @@ impl TryFrom<Cli> for StaticConfig {
         let tls_requested = cli.tls_addr.is_some()
             || cli.cert.is_some()
             || cli.key.is_some()
-            || cli.cert_dir.is_some();
+            || cli.cert_dir.is_some()
+            || cli.acme_dir.is_some();
         let (tls_addr, cert_path, key_path, cert_dir_path) = if tls_requested {
             let tls_addr = cli
                 .tls_addr
@@ -70,6 +75,16 @@ impl TryFrom<Cli> for StaticConfig {
 
             if let Some(cert_dir) = cli.cert_dir.clone() {
                 (Some(tls_addr), None, None, Some(cert_dir))
+            } else if cli.acme_dir.is_some() {
+                // ACME-managed certificates: the domain set comes from the
+                // site's `zeroserve.init.acme_config` section. An explicit
+                // --cert/--key pair, if given, is the default identity for SNIs
+                // not yet covered by an ACME-obtained certificate.
+                match (cli.cert.clone(), cli.key.clone()) {
+                    (Some(cert), Some(key)) => (Some(tls_addr), Some(cert), Some(key), None),
+                    (None, None) => (Some(tls_addr), None, None, None),
+                    _ => bail!("--cert and --key must be provided together"),
+                }
             } else if cli.caddy.is_some() && cli.cert.is_none() && cli.key.is_none() {
                 // `--caddy` without explicit cert flags: certificates come from
                 // the Caddyfile's TLS policies, selected per connection by the
@@ -125,6 +140,7 @@ impl TryFrom<Cli> for StaticConfig {
             cert_path,
             key_path,
             cert_dir_path,
+            acme_dir: cli.acme_dir,
             ech_key_path,
             reload_signal_file: cli.reload_signal_file,
             index_file,

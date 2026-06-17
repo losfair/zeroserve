@@ -12,6 +12,7 @@ use boring::pkey::{PKey, Private};
 use boring::ssl::{SslContext, SslEchKeys};
 use boring::x509::X509;
 
+use crate::acme::SharedCerts;
 use crate::boringtls::{BoringAcceptor, ServerIdentity, build_identity_context};
 use crate::config::StaticConfig;
 use crate::ech::key::EchKeySet;
@@ -27,6 +28,10 @@ pub struct TlsRuntime {
     /// True in the `--caddy` flow: the site's eBPF TLS section selects the
     /// certificate per connection via `zs_caddy_tls_certificate`.
     pub script_certificates: bool,
+    /// Shared ACME certificate registry (`--acme-dir`). The handshake serves
+    /// TLS-ALPN-01 challenge certificates from here and falls back to a live
+    /// ACME certificate by SNI when no script selects one.
+    pub acme_certs: Option<Arc<SharedCerts>>,
     /// ECH keys to install on lazily built per-certificate contexts so they
     /// mirror the acceptor's own configuration.
     ssl_ech_keys: Option<SslEchKeys>,
@@ -70,7 +75,10 @@ pub struct TlsCertSelect {
     pub request_client_cert: Cell<bool>,
 }
 
-pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRuntime>> {
+pub fn load_tls_if_configured(
+    config: &Arc<StaticConfig>,
+    acme_certs: Option<Arc<SharedCerts>>,
+) -> Result<Option<TlsRuntime>> {
     match &config.tls_addr {
         Some(_addr) => {
             // Load ECH keys first (if configured) so we can install them on the
@@ -124,8 +132,9 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
             // site's eBPF TLS section drives certificate selection per
             // connection; certificates referenced by the Caddyfile are loaded
             // lazily at handshake time, not preloaded here.
-            let script_certificates =
-                config.caddy_tarball.is_some() && config.cert_dir_path.is_none();
+            let script_certificates = (config.caddy_tarball.is_some()
+                || config.acme_dir.is_some())
+                && config.cert_dir_path.is_none();
 
             let acceptor = if let Some(cert_dir) = &config.cert_dir_path {
                 let identities = load_cert_dir(cert_dir).with_context(|| {
@@ -152,6 +161,7 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 BoringAcceptor::build_script_selected(
                     default_identity,
                     relay_public_names.clone(),
+                    acme_certs.clone(),
                     configure,
                 )?
             } else {
@@ -198,6 +208,7 @@ pub fn load_tls_if_configured(config: &Arc<StaticConfig>) -> Result<Option<TlsRu
                 ech_enabled,
                 ech_public_name,
                 script_certificates,
+                acme_certs,
                 ssl_ech_keys,
                 cert_contexts: Mutex::new(HashMap::new()),
             }))

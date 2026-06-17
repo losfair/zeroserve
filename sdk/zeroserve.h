@@ -42,6 +42,27 @@ typedef long ssize_t;
     return zs__call_body_##name(*zs__call_input);                              \
   }                                                                            \
   static zs_s64 zs__call_body_##name(zs_s64 input)
+
+/* Define an init hook placed in the "zeroserve.init.<name>" code section. It is
+ * run once at load time (not per request), receives no input, and returns a
+ * JSON handle describing configuration that the host reads back. A negative
+ * return signals failure. Used, e.g., for ACME configuration:
+ *
+ *   ZS_INIT_ENTRY(acme_config) {
+ *     zs_s64 cfg = zs_json_new_object();
+ *     zs_s64 domains = zs_json_new_array();
+ *     zs_s64 d = zs_json_new_object();
+ *     zs_json_set_string(d, ZS_STR("example.com"));
+ *     zs_json_array_push(domains, d);
+ *     zs_json_set(cfg, ZS_STR("domains"), domains);
+ *     return cfg;
+ *   }
+ */
+#define ZS_INIT_ENTRY(name)                                                    \
+  static zs_s64 zs__init_body_##name(void);                                    \
+  ZS_SECTION("zeroserve.init." #name)                                          \
+  zs_s64 zs__init_entry_##name(void) { return zs__init_body_##name(); }        \
+  static zs_s64 zs__init_body_##name(void)
 #define ZS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define ZS_MAX(a, b) ((a) > (b) ? (a) : (b))
 

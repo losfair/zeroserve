@@ -162,7 +162,10 @@ fn perform_reload(
     let site = Arc::new(
         crate::caddy_run::reload_site(&shared.config).with_context(|| "failed to reload site")?,
     );
-    let tls_result = load_tls_if_configured(&shared.config);
+    // Rebuild the TLS runtime against the *existing* ACME certificate registry
+    // so already-issued certificates keep being served across the reload.
+    let acme_certs = shared.acme.as_ref().map(|a| a.certs());
+    let tls_result = load_tls_if_configured(&shared.config, acme_certs);
 
     // The ordered sites every worker compiles: plugins first, then the main site.
     let sites: Vec<Arc<Site>> = plugin_sites

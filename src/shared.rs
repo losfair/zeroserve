@@ -14,6 +14,7 @@ use monoio::{
 };
 
 use crate::{
+    acme::AcmeRuntime,
     config::StaticConfig,
     logging::FileLogSender,
     site::{Site, TarEntry},
@@ -31,6 +32,10 @@ pub struct SharedState {
     /// each worker can recompile them on reload without re-reading the CLI.
     pub plugin_sites: ArcSwap<Vec<Arc<Site>>>,
     pub tls: ArcSwapOption<TlsRuntime>,
+    /// Automatic-certificate (ACME) state, present only with `--acme-dir`. Holds
+    /// the shared certificate registry the TLS accept path consults and is
+    /// driven by a provisioning task on worker 0.
+    pub acme: Option<Arc<AcmeRuntime>>,
     pub file_logger: FileLogSender,
 }
 
@@ -40,6 +45,7 @@ impl SharedState {
         site: Arc<Site>,
         plugin_sites: Vec<Arc<Site>>,
         tls: Option<TlsRuntime>,
+        acme: Option<Arc<AcmeRuntime>>,
         file_logger: FileLogSender,
     ) -> Self {
         Self {
@@ -47,6 +53,7 @@ impl SharedState {
             site: ArcSwap::new(site),
             plugin_sites: ArcSwap::new(Arc::new(plugin_sites)),
             tls: ArcSwapOption::from(tls.map(Arc::new)),
+            acme,
             file_logger,
         }
     }

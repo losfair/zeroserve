@@ -45,6 +45,10 @@ const SCRIPT_TLS_ENTRYPOINT: &str = "zeroserve.tls";
 /// calls. A callee exports `zeroserve.call.<name>` sections; `zs_call` resolves
 /// `<name>` against this prefix.
 pub(crate) const SCRIPT_CALL_SECTION_PREFIX: &str = "zeroserve.call.";
+/// Prefix for the load-time init sections. A script exports
+/// `zeroserve.init.<name>` sections that the host runs once at load time to read
+/// back a JSON configuration handle (e.g. `zeroserve.init.acme_config`).
+pub(crate) const SCRIPT_INIT_SECTION_PREFIX: &str = "zeroserve.init.";
 const MAX_EXTERNAL_OBJECTS: usize = 32;
 /// Maximum depth of nested `zs_call` invocations. Bounds runaway recursion
 /// (script A calling B calling A …) and the total memory a single request can
@@ -1281,6 +1285,56 @@ impl ScriptExecutionContext {
         }
     }
 
+    /// Build the execution context for a load-time `zeroserve.init.<name>`
+    /// section. There is no live request, so a synthetic one is installed and
+    /// the object table starts empty (init sections take no input handle).
+    pub(crate) fn for_init(
+        script_name: String,
+        site: Arc<Site>,
+        scripts: Rc<Vec<(String, Program)>>,
+        t: ThreadEnv,
+        max_memory_footprint: u64,
+        expose_filesystem: bool,
+        caddy_file_cache: Rc<RefCell<HashMap<String, Vec<u8>>>>,
+    ) -> Self {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+        ScriptExecutionContext {
+            request: Rc::new(RefCell::new(ScriptRequest::for_tls_handshake(
+                addr, addr, None,
+            ))),
+            body_source: BodySource::empty(),
+            metadata: Rc::new(RefCell::new(HashMap::new())),
+            caddy_maps: Rc::new(RefCell::new(Vec::new())),
+            early_response_headers: Rc::new(RefCell::new(::http::HeaderMap::new())),
+            response_hooks: Rc::new(RefCell::new(Vec::new())),
+            response_context: None,
+            abort: false,
+            response: None,
+            request_body_limit: Rc::new(Cell::new(None)),
+            reverse_proxy: None,
+            caddy_reverse_proxy: false,
+            caddy_default_forwarded: false,
+            file_server: None,
+            encode: None,
+            script_name,
+            log_buffer: vec![],
+            external_objects: ObjectRegistry {
+                next_idx: 1,
+                objects: HashMap::new(),
+            },
+            error: String::new(),
+            memory_footprint_bytes: 0,
+            max_memory_footprint,
+            expose_filesystem,
+            site,
+            scripts,
+            t,
+            call_depth: 0,
+            caddy_file_cache,
+            tls_select: None,
+        }
+    }
+
     pub fn extobj<T: Any>(&mut self, idx: u64) -> Result<&mut T, ()> {
         self.external_objects
             .objects
@@ -1481,11 +1535,21 @@ impl ScriptRuntime {
         local: std::net::SocketAddr,
     ) -> anyhow::Result<(Option<SslContext>, bool)> {
         let scripts = (*self.scripts.borrow()).clone();
+        // ACME (`--acme-dir`) provides a per-SNI live certificate fallback used
+        // whenever the site's TLS scripts (if any) select nothing.
+        let acme_certs = tls.acme_certs.clone();
+        let acme_sni = sni.clone();
+        let acme_fallback = move || {
+            acme_certs
+                .as_ref()
+                .zip(acme_sni.as_ref())
+                .and_then(|(certs, sni)| certs.live_for_sni(sni))
+        };
         if !scripts
             .iter()
             .any(|(_, program)| program.has_section(SCRIPT_TLS_ENTRYPOINT))
         {
-            return Ok((None, false));
+            return Ok((acme_fallback(), false));
         }
 
         let select = Rc::new(TlsCertSelect {
@@ -1569,8 +1633,96 @@ impl ScriptRuntime {
             }
         }
 
-        let chosen = select.chosen.borrow_mut().take();
+        let chosen = select
+            .chosen
+            .borrow_mut()
+            .take()
+            .or_else(acme_fallback);
         Ok((chosen, select.request_client_cert.get()))
+    }
+
+    /// Run every loaded script's `zeroserve.init.<name>` section once and
+    /// collect the JSON value each returns. Used at load time to read
+    /// configuration back from the site's scripts (e.g. `acme_config`). The run
+    /// uses a synthetic context with no live request, so request-bound helpers
+    /// are inert; JSON, env, log, and crypto helpers work normally.
+    pub(crate) async fn run_init_section(
+        &self,
+        site: Arc<Site>,
+        name: &str,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let section = format!("{}{}", SCRIPT_INIT_SECTION_PREFIX, name);
+        let scripts = (*self.scripts.borrow()).clone();
+        let timeslice = default_timeslice();
+        let preemption = PreemptionEnabled::new(self.t);
+        let mut out = Vec::new();
+        for (script_name, program) in scripts.iter() {
+            if !program.has_section(&section) {
+                continue;
+            }
+            let mut ctx = ScriptExecutionContext::for_init(
+                script_name.clone(),
+                site.clone(),
+                scripts.clone(),
+                self.t,
+                self.max_memory_footprint,
+                self.expose_filesystem,
+                self.caddy_file_cache.clone(),
+            );
+            let ret = {
+                let mut resources: [&mut dyn Any; 1] = [&mut ctx];
+                program
+                    .run(
+                        &timeslice,
+                        &MonoioTimeslicer,
+                        &section,
+                        &mut resources,
+                        &[],
+                        &preemption,
+                    )
+                    .await
+            };
+            let ret = ret.map_err(|err| {
+                anyhow::anyhow!(
+                    "script '{}' init section '{}' failed: {:?} ({})",
+                    script_name,
+                    section,
+                    err,
+                    if ctx.error.is_empty() {
+                        "no details"
+                    } else {
+                        ctx.error.as_str()
+                    }
+                )
+            })?;
+            if ret < 0 {
+                bail!(
+                    "script '{}' init section '{}' returned error {}",
+                    script_name,
+                    section,
+                    ret
+                );
+            }
+            let value = ctx
+                .extobj::<JsonRef>(ret as u64)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "script '{}' init section '{}' returned an invalid JSON handle",
+                        script_name,
+                        section
+                    )
+                })?
+                .view(|v| v.clone())
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "script '{}' init section '{}' returned an unreadable JSON handle",
+                        script_name,
+                        section
+                    )
+                })?;
+            out.push((script_name.clone(), value));
+        }
+        Ok(out)
     }
 
     pub async fn run_request(
