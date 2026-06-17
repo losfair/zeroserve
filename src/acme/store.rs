@@ -85,7 +85,7 @@ impl Store {
             return Ok(key);
         }
         let key = AccountKey::generate()?;
-        write_private(&path, &key.to_pem()?)?;
+        write_atomic(&path, &key.to_pem()?, 0o600)?;
         eprintln!("acme: generated new account key at {}", path.display());
         Ok(key)
     }
@@ -105,9 +105,11 @@ impl Store {
         // Per-domain lock: concurrent writers for the same domain serialize;
         // different domains never contend.
         let _lock = lock_exclusive(&dir.join(".lock"))?;
-        fs::write(dir.join("cert.pem"), cert_pem)
+        // Atomic writes so a concurrent reader never sees a partial cert/key.
+        write_atomic(&dir.join("cert.pem"), cert_pem, 0o644)
             .with_context(|| format!("writing certificate for {domain}"))?;
-        write_private(&dir.join("key.pem"), key_pem)?;
+        write_atomic(&dir.join("key.pem"), key_pem, 0o600)
+            .with_context(|| format!("writing private key for {domain}"))?;
         Ok(())
     }
 
@@ -143,25 +145,60 @@ fn cert_expires_within(cert_pem: &[u8], days: u32) -> Result<bool> {
         == std::cmp::Ordering::Less)
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+/// Atomically write `data` to `path` with permission `mode`: write a temp file
+/// in the same directory, flush it to disk, then `rename` it over `path`.
+/// `rename` is atomic on a single filesystem, so a concurrent reader (which does
+/// not take the write lock) sees either the old or the new *complete* file,
+/// never a partially written one — important on shared storage.
+fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(data)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    fs::write(path, data).with_context(|| format!("writing {}", path.display()))
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("invalid path {}", path.display()))?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    let result = (|| {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("creating temp file {}", tmp.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        // Flush data to disk before the rename so a crash can't leave the
+        // renamed file pointing at unwritten blocks.
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    } else {
+        // Best-effort: persist the directory entry for the rename.
+        if let Ok(dir_file) = fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -195,7 +232,33 @@ mod tests {
         assert_eq!(cert, b"cert-bytes");
         assert_eq!(key, b"key-bytes");
         // A fine-grained per-domain lock file lives in the domain directory.
-        assert!(dir.join("certs").join("example.com").join(".lock").exists());
+        let domain_dir = dir.join("certs").join("example.com");
+        assert!(domain_dir.join(".lock").exists());
+
+        // Atomic writes leave no temp files behind, and apply the right modes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in fs::read_dir(&domain_dir).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().contains(".tmp."),
+                    "leftover temp file {name:?}"
+                );
+            }
+            let key_mode = fs::metadata(domain_dir.join("key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(key_mode, 0o600, "key.pem must be private");
+            let cert_mode = fs::metadata(domain_dir.join("cert.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(cert_mode, 0o644);
+        }
 
         // Re-acquiring the same lock after the guard drops succeeds (the lock is
         // released when the guard is dropped), and a second domain is independent.
