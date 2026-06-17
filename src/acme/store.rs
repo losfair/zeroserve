@@ -348,7 +348,10 @@ mod tests {
                 assert_eq!(cert_mode, 0o644);
             }
 
-            store.save_cert("other.example", b"c2", b"k2").await.unwrap();
+            store
+                .save_cert("other.example", b"c2", b"k2")
+                .await
+                .unwrap();
             assert_eq!(store.load_cert("other.example").await.unwrap().0, b"c2");
             fs::remove_dir_all(&dir).unwrap();
         });
@@ -384,7 +387,10 @@ mod tests {
             let file = dir
                 .join("challenges")
                 .join(challenge_file_name("Ch.Example"));
-            store.write_challenge("Ch.Example", "tok.thumb").await.unwrap();
+            store
+                .write_challenge("Ch.Example", "tok.thumb")
+                .await
+                .unwrap();
             // Stored under the lowercased name with the exact key authorization.
             assert_eq!(fs::read_to_string(&file).unwrap(), "tok.thumb");
             store.remove_challenge("ch.example").await;
