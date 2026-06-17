@@ -25,6 +25,12 @@ pub struct Options {
     pub server_names: BTreeMap<String, String>,
     /// Extra top-level apps produced by global options.
     pub extra_apps: Map<String, Value>,
+    /// ACME account contact from the global `email` option.
+    pub acme_email: Option<String>,
+    /// ACME directory URL from the global `acme_ca` option.
+    pub acme_ca: Option<String>,
+    /// External account binding `(key_id, mac_key)` from the global `acme_eab`.
+    pub acme_eab: Option<(String, String)>,
 }
 
 impl Default for Options {
@@ -40,6 +46,9 @@ impl Default for Options {
             server_fields: Map::new(),
             server_names: BTreeMap::new(),
             extra_apps: Map::new(),
+            acme_email: None,
+            acme_ca: None,
+            acme_eab: None,
         }
     }
 }
@@ -87,7 +96,19 @@ pub fn evaluate_global_options(
             "debug" | "local_certs" | "skip_install_trust" => {
                 warn_unsupported_global_option(&name, warnings);
             }
-            "email" | "default_sni" | "fallback_sni" | "acme_ca" | "acme_ca_root" | "key_type" => {
+            // ACME account contact and directory URL: captured so the Caddy
+            // compiler can emit a `zeroserve.init.acme_config` section.
+            "email" => {
+                let value = required_arg(&mut d, &name)?;
+                reject_extra_args(&mut d)?;
+                opts.acme_email = Some(value);
+            }
+            "acme_ca" => {
+                let value = required_arg(&mut d, &name)?;
+                reject_extra_args(&mut d)?;
+                opts.acme_ca = Some(value);
+            }
+            "default_sni" | "fallback_sni" | "acme_ca_root" | "key_type" => {
                 parse_unsupported_single_string_option(&mut d, &name)?;
                 warn_unsupported_global_option(&name, warnings);
             }
@@ -171,8 +192,7 @@ pub fn evaluate_global_options(
                 warn_unsupported_global_option(&name, warnings);
             }
             "acme_eab" => {
-                parse_unsupported_acme_eab_option(&mut d)?;
-                warn_unsupported_global_option(&name, warnings);
+                opts.acme_eab = parse_acme_eab_option(&mut d)?;
             }
             "on_demand_tls" => {
                 parse_unsupported_on_demand_tls_option(&mut d)?;
@@ -504,22 +524,35 @@ fn consume_unsupported_module_config(d: &mut Dispenser, _label: &str) {
     }
 }
 
-fn parse_unsupported_acme_eab_option(d: &mut Dispenser) -> Result<()> {
+/// Parse `acme_eab { key_id <kid>  mac_key <key> }`, returning the pair when
+/// both are present so the compiler can emit it into the ACME config.
+fn parse_acme_eab_option(d: &mut Dispenser) -> Result<Option<(String, String)>> {
     if d.next_arg() {
         return Err(d.arg_err());
     }
+    let mut key_id: Option<String> = None;
+    let mut mac_key: Option<String> = None;
     while d.next_block(0) {
         match d.val().as_str() {
-            "key_id" | "mac_key" => {
+            field @ ("key_id" | "mac_key") => {
                 if !d.next_arg() {
                     return Err(d.arg_err());
                 }
+                let value = d.val();
                 d.remaining_args();
+                if field == "key_id" {
+                    key_id = Some(value);
+                } else {
+                    mac_key = Some(value);
+                }
             }
             other => bail!("unrecognized parameter '{other}'"),
         }
     }
-    Ok(())
+    Ok(match (key_id, mac_key) {
+        (Some(k), Some(m)) => Some((k, m)),
+        _ => None,
+    })
 }
 
 fn parse_unsupported_on_demand_tls_option(d: &mut Dispenser) -> Result<()> {

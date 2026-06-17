@@ -273,7 +273,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             .iter()
             .map(|k| Address::parse(&k.text))
             .collect::<Result<Vec<_>>>()?;
-        let (routes, error_routes, tls_policies) =
+        let (routes, error_routes, tls_policies, acme_automation) =
             compile_block_routes(&block, &options, &counter, &warnings, &extra_apps)?;
 
         compiled.push(CompiledBlock {
@@ -283,6 +283,7 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
             routes,
             error_routes,
             tls_policies,
+            acme_automation,
         });
     }
 
@@ -292,6 +293,9 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     {
         // Still allow address-only configs to produce an (empty) server.
     }
+
+    // Build the TLS automation app (ACME issuers) before `compiled` is consumed.
+    let tls_app = build_tls_automation(&options, &compiled, &warnings);
 
     let servers = build_servers(compiled, &options, &counter, &warnings, &named_routes)?;
 
@@ -309,12 +313,112 @@ pub fn adapt(blocks: Vec<ServerBlock>) -> Result<(Value, Vec<String>)> {
     for (key, value) in extra_apps.borrow().iter() {
         apps.insert(key.clone(), value.clone());
     }
+    if let Some(tls_app) = tls_app {
+        apps.insert("tls".to_string(), tls_app);
+    }
     apps.insert("http".to_string(), Value::Object(http_app));
     let config = json!({ "apps": Value::Object(apps) });
     let warns = Rc::try_unwrap(warnings)
         .map(RefCell::into_inner)
         .unwrap_or_default();
     Ok((config, warns))
+}
+
+/// Build the `apps.tls` app holding ACME `automation.policies`, translating the
+/// global `email`/`acme_ca`/`acme_eab` options and per-site `tls <email>` /
+/// `tls internal` / `tls { ca/eab }` directives. Returns `None` when the config
+/// configures no ACME automation and no `internal` issuer. The Caddy compiler
+/// reads this to emit `zeroserve.init.acme_config`.
+fn build_tls_automation(
+    options: &options::Options,
+    compiled: &[CompiledBlock],
+    warnings: &Rc<RefCell<Vec<String>>>,
+) -> Option<Value> {
+    // Merged ACME issuer fields (a single global `acme_config` collapses
+    // per-site differences; last value wins with a warning).
+    let mut acme_present = false;
+    let mut email = options.acme_email.clone();
+    let mut ca = options.acme_ca.clone();
+    let mut eab = options.acme_eab.clone();
+    if email.is_some() || ca.is_some() || eab.is_some() {
+        acme_present = true;
+    }
+    let mut merge = |field: &str, slot: &mut Option<String>, value: Option<&str>| {
+        if let Some(v) = value {
+            if let Some(existing) = slot {
+                if existing != v {
+                    warnings.borrow_mut().push(format!(
+                        "tls {field} {existing:?} overridden by {v:?}; the generated acme_config uses a single {field}"
+                    ));
+                }
+            }
+            *slot = Some(v.to_string());
+        }
+    };
+
+    let mut internal_subjects: Vec<String> = Vec::new();
+    for block in compiled {
+        let hosts: Vec<String> = block
+            .parsed_keys
+            .iter()
+            .filter(|a| !a.host.is_empty())
+            .map(|a| a.host.clone())
+            .collect();
+        for entry in &block.acme_automation {
+            if entry.get("internal").and_then(Value::as_bool) == Some(true) {
+                for host in &hosts {
+                    if !internal_subjects.contains(host) {
+                        internal_subjects.push(host.clone());
+                    }
+                }
+                continue;
+            }
+            acme_present = true;
+            merge(
+                "email",
+                &mut email,
+                entry.get("email").and_then(Value::as_str),
+            );
+            merge("ca", &mut ca, entry.get("ca").and_then(Value::as_str));
+            if let Some(e) = entry.get("eab") {
+                let kid = e.get("key_id").and_then(Value::as_str);
+                let mac = e.get("mac_key").and_then(Value::as_str);
+                if let (Some(kid), Some(mac)) = (kid, mac) {
+                    eab = Some((kid.to_string(), mac.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut policies: Vec<Value> = Vec::new();
+    if acme_present {
+        let mut issuer = Map::new();
+        issuer.insert("module".into(), json!("acme"));
+        if let Some(ca) = &ca {
+            issuer.insert("ca".into(), json!(ca));
+        }
+        if let Some(email) = &email {
+            issuer.insert("email".into(), json!(email));
+        }
+        if let Some((kid, mac)) = &eab {
+            issuer.insert(
+                "external_account".into(),
+                json!({ "key_id": kid, "mac_key": mac }),
+            );
+        }
+        policies.push(json!({ "issuers": [Value::Object(issuer)] }));
+    }
+    if !internal_subjects.is_empty() {
+        policies.push(json!({
+            "subjects": internal_subjects,
+            "issuers": [{ "module": "internal" }],
+        }));
+    }
+
+    if policies.is_empty() {
+        return None;
+    }
+    Some(json!({ "automation": { "policies": policies } }))
 }
 
 fn is_registered_directive_name(name: &str) -> bool {
@@ -331,7 +435,7 @@ fn compile_block_routes(
     counter: &Rc<RefCell<Counter>>,
     warnings: &Rc<RefCell<Vec<String>>>,
     extra_apps: &Rc<RefCell<Map<String, Value>>>,
-) -> Result<(Vec<ConfigValue>, Vec<Subroute>, Vec<Value>)> {
+) -> Result<(Vec<ConfigValue>, Vec<Subroute>, Vec<Value>, Vec<Value>)> {
     let segments: Vec<Vec<Token>> = block
         .segments
         .iter()
@@ -362,6 +466,7 @@ fn compile_block_routes(
     let mut routes: Vec<ConfigValue> = Vec::new();
     let mut error_routes: Vec<Subroute> = Vec::new();
     let mut tls_policies: Vec<Value> = Vec::new();
+    let mut acme_automation: Vec<Value> = Vec::new();
     for seg in &segments {
         let dir = seg.first().map(|t| t.text.clone()).unwrap_or_default();
         if dir.starts_with(MATCHER_PREFIX) {
@@ -409,12 +514,17 @@ fn compile_block_routes(
                         tls_policies.push(v);
                     }
                 }
+                "acme_automation" => {
+                    if let RouteOrSub::Json(v) = result.value {
+                        acme_automation.push(v);
+                    }
+                }
                 _ => routes.push(result),
             }
         }
     }
 
-    Ok((routes, error_routes, tls_policies))
+    Ok((routes, error_routes, tls_policies, acme_automation))
 }
 
 fn apply_segment_shorthands(seg: &[Token]) -> Vec<Token> {
@@ -443,7 +553,7 @@ fn build_named_routes(
             bail!("cannot have duplicate named_routes: {name}");
         }
 
-        let (routes, error_routes, _) =
+        let (routes, error_routes, _, _) =
             compile_block_routes(&block, options, counter, warnings, extra_apps)?;
         let mut subroute =
             handlers::build_subroute(routes, counter, true, &options.directive_order)?;
@@ -471,6 +581,7 @@ struct CompiledBlock {
     routes: Vec<ConfigValue>,
     error_routes: Vec<Subroute>,
     tls_policies: Vec<Value>,
+    acme_automation: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1459,7 +1570,6 @@ example.com {
             "events",
             "storage",
             "acme_dns",
-            "acme_eab",
             "cert_issuer",
             "on_demand_tls",
             "preferred_chains",
@@ -1509,7 +1619,6 @@ example.com {
             "default_bind",
             "storage_check",
             "storage_clean_interval",
-            "email",
             "renewal_window_ratio",
             "tls_resolvers",
             "ocsp_stapling",
@@ -4647,6 +4756,81 @@ example.com {
         let h = &v["apps"]["http"]["servers"]["srv0"]["routes"][0]["handle"][0]["routes"][0]["handle"]
             [0];
         assert_eq!(h["handler"], "static_response");
+    }
+
+    #[test]
+    fn acme_options_produce_tls_automation_policies() {
+        let (v, _) = adapt_full(
+            r#"{
+  email admin@example.com
+  acme_ca https://acme.example/dir
+  acme_eab {
+    key_id kid-1
+    mac_key bWFjLXNlY3JldA
+  }
+}
+example.com {
+  respond ok
+}
+internal.example {
+  tls internal
+  respond ok
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        let acme = policies
+            .iter()
+            .find_map(|p| {
+                p["issuers"]
+                    .as_array()?
+                    .iter()
+                    .find(|i| i["module"] == "acme")
+            })
+            .expect("acme issuer");
+        assert_eq!(acme["email"], "admin@example.com");
+        assert_eq!(acme["ca"], "https://acme.example/dir");
+        assert_eq!(acme["external_account"]["key_id"], "kid-1");
+        assert_eq!(acme["external_account"]["mac_key"], "bWFjLXNlY3JldA");
+        let internal = policies
+            .iter()
+            .find(|p| {
+                p["issuers"]
+                    .as_array()
+                    .is_some_and(|is| is.iter().any(|i| i["module"] == "internal"))
+            })
+            .expect("internal policy");
+        assert_eq!(internal["subjects"][0], "internal.example");
+    }
+
+    #[test]
+    fn site_tls_email_produces_acme_issuer() {
+        let (v, _) = adapt_full(
+            r#"example.com {
+  tls me@example.com
+  respond ok
+}"#,
+        );
+        let policies = v["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .expect("automation policies");
+        assert!(policies.iter().any(|p| {
+            p["issuers"].as_array().is_some_and(|is| {
+                is.iter()
+                    .any(|i| i["module"] == "acme" && i["email"] == "me@example.com")
+            })
+        }));
+    }
+
+    #[test]
+    fn no_tls_app_without_acme_config() {
+        let (v, _) = adapt_full(
+            r#"example.com {
+  respond ok
+}"#,
+        );
+        assert!(v["apps"].get("tls").is_none(), "{v}");
     }
 
     #[test]

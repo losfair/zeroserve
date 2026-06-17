@@ -625,6 +625,21 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
     if let [cert, key] = first_line.as_slice() {
         cert_policies.push(tls_certificate_policy(cert, key));
     }
+    // ACME automation intent captured for the generated
+    // `zeroserve.init.acme_config` section (see caddy_compile.rs).
+    let mut acme_internal = false;
+    let mut acme_issuer = false;
+    let mut acme_email: Option<String> = None;
+    let mut acme_ca: Option<String> = None;
+    let mut acme_eab: Option<(String, String)> = None;
+    if let [arg] = first_line.as_slice() {
+        match arg.as_str() {
+            "internal" => acme_internal = true,
+            "force_automate" => acme_issuer = true,
+            // Guarded above to be an email address.
+            _ => acme_email = Some(arg.clone()),
+        }
+    }
     let mut has_block = false;
     let mut dns_provider_set = h.options.tls_dns_provider_configured;
     let mut dns_options_set = Vec::<String>::new();
@@ -660,11 +675,11 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                     policies.push(policy);
                 }
             }
-            "ca"
-            | "ca_root"
-            | "key_type"
-            | "dns_challenge_override_domain"
-            | "insecure_secrets_log" => {
+            "ca" => {
+                let args = parse_exact_args(&mut h.d, 1)?;
+                acme_ca = Some(args[0].clone());
+            }
+            "ca_root" | "key_type" | "dns_challenge_override_domain" | "insecure_secrets_log" => {
                 parse_exact_args(&mut h.d, 1)?;
             }
             "propagation_delay" | "dns_ttl" => {
@@ -689,6 +704,11 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                         "getting module named 'tls.issuance.{issuer}': module not registered: tls.issuance.{issuer}"
                     );
                 }
+                if issuer == "acme" {
+                    acme_issuer = true;
+                } else if issuer == "internal" {
+                    acme_internal = true;
+                }
                 h.d.remaining_args();
             }
             "get_certificate" => {
@@ -704,7 +724,8 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
                 h.d.remaining_args();
             }
             "eab" => {
-                parse_exact_args(&mut h.d, 2)?;
+                let args = parse_exact_args(&mut h.d, 2)?;
+                acme_eab = Some((args[0].clone(), args[1].clone()));
             }
             "dns" => {
                 // zeroserve does not perform automatic certificate issuance, so an
@@ -756,24 +777,51 @@ fn parse_tls(h: &mut Helper) -> Result<Vec<ConfigValue>> {
         return Err(h.d.arg_err());
     }
     policies.extend(cert_policies);
+    let mut out: Vec<ConfigValue> = Vec::new();
     if policies.is_empty() {
         h.warn(
             "site tls directive is accepted but configured outside zeroserve's eBPF request-processing surface",
         );
-        Ok(Vec::new())
     } else {
         h.warn(
             "site tls directive generated middleware for supported TLS policy in the zeroserve TLS eBPF section",
         );
-        Ok(policies
-            .into_iter()
-            .map(|policy| ConfigValue {
-                class: "tls_connection_policy".into(),
-                directive: "tls".into(),
-                value: RouteOrSub::Json(policy),
-            })
-            .collect())
+        out.extend(policies.into_iter().map(|policy| ConfigValue {
+            class: "tls_connection_policy".into(),
+            directive: "tls".into(),
+            value: RouteOrSub::Json(policy),
+        }));
     }
+    // Record ACME automation intent (email / ca / eab / internal) so the Caddy
+    // compiler can emit `zeroserve.init.acme_config` scoped to this site's
+    // hostnames.
+    if acme_internal
+        || acme_issuer
+        || acme_email.is_some()
+        || acme_ca.is_some()
+        || acme_eab.is_some()
+    {
+        let mut obj = serde_json::Map::new();
+        obj.insert("internal".into(), json!(acme_internal));
+        if let Some(email) = acme_email {
+            obj.insert("email".into(), json!(email));
+        }
+        if let Some(ca) = acme_ca {
+            obj.insert("ca".into(), json!(ca));
+        }
+        if let Some((key_id, mac_key)) = acme_eab {
+            obj.insert(
+                "eab".into(),
+                json!({ "key_id": key_id, "mac_key": mac_key }),
+            );
+        }
+        out.push(ConfigValue {
+            class: "acme_automation".into(),
+            directive: "tls".into(),
+            value: RouteOrSub::Json(Value::Object(obj)),
+        });
+    }
+    Ok(out)
 }
 
 fn tls_certificate_policy(cert: &str, key: &str) -> Value {

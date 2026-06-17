@@ -350,6 +350,13 @@ Current generated middleware support includes:
   later handshakes from an in-memory certificate cache (dropped on hot reload,
   like cached log file handles). Runtime file access is gated by
   `--expose-filesystem`; `--caddy` forces that flag on.
+- Caddyfile ACME client configuration: the global `email`, `acme_ca`, and
+  `acme_eab` options and the site `tls <email>` / `tls { ca <url> … eab { … } }`
+  directives compile into a `zeroserve.init.acme_config` section listing the
+  routed public domains to manage (excluding `localhost`, IP literals,
+  wildcards, `tls internal` sites, and sites with an explicit `tls <cert> <key>`).
+  Certificates are obtained and renewed over ACME (TLS-ALPN-01) when the server
+  runs with `--acme-dir`; wildcard subjects and DNS-01 are not supported.
 - file serving from packed tarball content and from configured filesystem roots
   only when zeroserve is started with `--expose-filesystem`
 - Caddyfile/Caddy JSON access logging to `output file ...` targets, written by
@@ -405,8 +412,10 @@ body rewriting/copying or Caddy's full server runtime. In particular:
   `zs_res_copy_body` APIs
 - no generic `zs_res_set_header`, `zs_res_append_header`, or
   `zs_res_delete_header` APIs
-- no TLS automation, listener management, dynamic certificate management, ACME server
-  runtime, ECH, or PKI runtime behavior
+- no listener management, on-demand/dynamic certificate management, DNS-01 or
+  wildcard ACME issuance, ACME server runtime, ECH, or PKI runtime behavior (ACME
+  *client* issuance via TLS-ALPN-01 is supported through `acme_config` +
+  `--acme-dir`, see above)
 - no custom Caddy `tls.client_auth` verifier modules or trusted-leaf-only
   client-auth behavior
 - no Prometheus metrics serving

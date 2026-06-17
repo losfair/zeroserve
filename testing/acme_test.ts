@@ -79,29 +79,43 @@ const challtestsrvBin = await resolveBin(
 const available = pebbleBin !== null && challtestsrvBin !== null &&
   await hasOpenssl();
 
-Deno.test({
-  name: "e2e: ACME TLS-ALPN-01 issuance against Pebble",
-  ignore: !available,
-}, async () => {
-  const domain = "zs.test";
+const DOMAIN = "zs.test";
+
+interface PebbleEnv {
+  work: string;
+  caCrt: string;
+  directoryUrl: string;
+  zsTlsPort: number;
+  mgmtPort: number;
+  caClient: Deno.HttpClient;
+  children: Deno.ChildProcess[];
+  /** Spawn a child and drain its stderr for failure diagnostics. */
+  spawn: (cmd: Deno.Command, label: string) => Deno.ChildProcess;
+  dumpLogs: () => void;
+}
+
+/** Stand up a throwaway CA, Pebble, and pebble-challtestsrv; run `fn`; clean up. */
+async function withPebble(
+  fn: (env: PebbleEnv) => Promise<void>,
+): Promise<void> {
   const work = await Deno.makeTempDir({ prefix: "zs-acme-" });
   const children: Deno.ChildProcess[] = [];
-  const kill = (c: Deno.ChildProcess) => {
-    try {
-      c.kill("SIGKILL");
-    } catch { /* already gone */ }
-  };
-
-  // Drain a child's stderr into a growing buffer for diagnostics on failure.
   const logs = new Map<Deno.ChildProcess, () => string>();
-  const drain = (c: Deno.ChildProcess, label: string) => {
+  const spawn = (cmd: Deno.Command, label: string): Deno.ChildProcess => {
+    const child = cmd.spawn();
+    children.push(child);
     let buf = "";
     (async () => {
-      for await (const chunk of c.stderr) buf += decoder.decode(chunk);
+      for await (const chunk of child.stderr) buf += decoder.decode(chunk);
     })().catch(() => {});
-    logs.set(c, () => `--- ${label} ---\n${buf}`);
+    logs.set(child, () => `--- ${label} ---\n${buf}`);
+    return child;
+  };
+  const dumpLogs = () => {
+    for (const get of logs.values()) console.error(get());
   };
 
+  let caClient: Deno.HttpClient | undefined;
   try {
     const zsTlsPort = await getFreePort();
     const dirPort = await getFreePort();
@@ -109,8 +123,8 @@ Deno.test({
     const dnsPort = await getFreePort();
     const pebbleHttpPort = await getFreePort();
 
-    // 1. A throwaway CA and a leaf for Pebble's ACME directory endpoint, whose
-    //    SAN covers 127.0.0.1 (zeroserve verifies the directory by IP).
+    // A throwaway CA and a leaf for Pebble's ACME directory endpoint, whose SAN
+    // covers 127.0.0.1 (zeroserve verifies the directory by IP).
     const caCrt = join(work, "ca.crt");
     const caKey = join(work, "ca.key");
     const dirCrt = join(work, "dir.crt");
@@ -165,8 +179,8 @@ Deno.test({
       "2",
     ]);
 
-    // 2. Pebble config: serve the directory with our leaf; validate TLS-ALPN-01
-    //    against zeroserve's TLS port.
+    // Pebble: serve the directory with our leaf; validate TLS-ALPN-01 against
+    // zeroserve's TLS port.
     const pebbleConfig = join(work, "pebble.json");
     await Deno.writeTextFile(
       pebbleConfig,
@@ -184,52 +198,52 @@ Deno.test({
       }),
     );
 
-    // 3. challtestsrv: DNS only, every A query -> 127.0.0.1, no AAAA (Pebble
-    //    must reach zeroserve's IPv4 listener).
-    const chall = new Deno.Command(challtestsrvBin!, {
-      args: [
-        "-dnsserver",
-        `:${dnsPort}`,
-        "-defaultIPv4",
-        "127.0.0.1",
-        "-defaultIPv6",
-        "",
-        "-http01",
-        "",
-        "-https01",
-        "",
-        "-tlsalpn01",
-        "",
-        "-doh",
-        "",
-        "-management",
-        `:${await getFreePort()}`,
-      ],
-      stdout: "null",
-      stderr: "piped",
-    }).spawn();
-    children.push(chall);
-    drain(chall, "challtestsrv");
+    // challtestsrv: DNS only, every A query -> 127.0.0.1, no AAAA (Pebble must
+    // reach zeroserve's IPv4 listener).
+    spawn(
+      new Deno.Command(challtestsrvBin!, {
+        args: [
+          "-dnsserver",
+          `:${dnsPort}`,
+          "-defaultIPv4",
+          "127.0.0.1",
+          "-defaultIPv6",
+          "",
+          "-http01",
+          "",
+          "-https01",
+          "",
+          "-tlsalpn01",
+          "",
+          "-doh",
+          "",
+          "-management",
+          `:${await getFreePort()}`,
+        ],
+        stdout: "null",
+        stderr: "piped",
+      }),
+      "challtestsrv",
+    );
+    spawn(
+      new Deno.Command(pebbleBin!, {
+        args: ["-config", pebbleConfig, "-dnsserver", `127.0.0.1:${dnsPort}`],
+        env: { PEBBLE_VA_NOSLEEP: "1", PEBBLE_WFE_NONCEREJECT: "0" },
+        stdout: "null",
+        stderr: "piped",
+      }),
+      "pebble",
+    );
 
-    // 4. Pebble (no validation sleeps, never reject good nonces).
-    const pebble = new Deno.Command(pebbleBin!, {
-      args: ["-config", pebbleConfig, "-dnsserver", `127.0.0.1:${dnsPort}`],
-      env: { PEBBLE_VA_NOSLEEP: "1", PEBBLE_WFE_NONCEREJECT: "0" },
-      stdout: "null",
-      stderr: "piped",
-    }).spawn();
-    children.push(pebble);
-    drain(pebble, "pebble");
-
-    // Trust the directory CA from Deno when polling Pebble's HTTPS endpoints.
-    const caClient = Deno.createHttpClient({
+    caClient = Deno.createHttpClient({
       caCerts: [await Deno.readTextFile(caCrt)],
     });
     const directoryUrl = `https://127.0.0.1:${dirPort}/dir`;
+    const client = caClient;
     await waitFor(
       async () => {
         try {
-          const res = await fetch(directoryUrl, { client: caClient });
+          const res = await fetch(directoryUrl, { client });
           await res.body?.cancel();
           return res.ok;
         } catch {
@@ -240,8 +254,95 @@ Deno.test({
       "pebble directory",
     );
 
-    // 5. A site whose acme_config requests `domain` from our Pebble directory.
-    const siteRoot = join(work, "site");
+    await fn({
+      work,
+      caCrt,
+      directoryUrl,
+      zsTlsPort,
+      mgmtPort,
+      caClient,
+      children,
+      spawn,
+      dumpLogs,
+    });
+  } catch (err) {
+    dumpLogs();
+    throw err;
+  } finally {
+    caClient?.close();
+    for (const c of children) {
+      try {
+        c.kill("SIGKILL");
+      } catch { /* already gone */ }
+    }
+    await delay(100);
+    for (const c of children) await c.status.catch(() => {});
+    await Deno.remove(work, { recursive: true }).catch(() => {});
+  }
+}
+
+/** Wait for the issued cert to be persisted, then confirm it's served on the
+ *  TLS port for SNI=DOMAIN and chains to Pebble's issuing CA. */
+async function verifyIssuedAndServed(
+  env: PebbleEnv,
+  acmeDir: string,
+): Promise<void> {
+  const certPath = join(acmeDir, "certs", DOMAIN, "cert.pem");
+  await waitFor(
+    async () => {
+      try {
+        await Deno.stat(certPath);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    40_000,
+    "issued certificate",
+  );
+
+  const certText = await runOpensslText([
+    "x509",
+    "-in",
+    certPath,
+    "-noout",
+    "-issuer",
+    "-ext",
+    "subjectAltName",
+  ]);
+  assertStringIncludes(certText, "Pebble");
+  assertStringIncludes(certText, DOMAIN);
+
+  const trust = join(env.work, "pebble-trust.pem");
+  const root = await (await fetch(`https://127.0.0.1:${env.mgmtPort}/roots/0`, {
+    client: env.caClient,
+  })).text();
+  const intermediate = await (await fetch(
+    `https://127.0.0.1:${env.mgmtPort}/intermediates/0`,
+    { client: env.caClient },
+  )).text();
+  await Deno.writeTextFile(trust, `${root}\n${intermediate}\n`);
+
+  const handshake = await runOpensslText([
+    "s_client",
+    "-connect",
+    `127.0.0.1:${env.zsTlsPort}`,
+    "-servername",
+    DOMAIN,
+    "-CAfile",
+    trust,
+    "-verify_return_error",
+  ], "Q\n");
+  assertStringIncludes(handshake, "Verify return code: 0 (ok)");
+}
+
+Deno.test({
+  name: "e2e: ACME TLS-ALPN-01 issuance (script-driven acme_config)",
+  ignore: !available,
+}, async () => {
+  await withPebble(async (env) => {
+    // A site whose acme_config requests DOMAIN from our Pebble directory.
+    const siteRoot = join(env.work, "site");
     await Deno.mkdir(join(siteRoot, ".zeroserve", "scripts"), {
       recursive: true,
     });
@@ -253,13 +354,13 @@ ZS_INIT_ENTRY(acme_config) {
   zs_s64 cfg = zs_json_new_object();
   zs_s64 domains = zs_json_new_array();
   zs_s64 d = zs_json_new_object();
-  zs_json_set_string(d, ZS_STR("${domain}"));
+  zs_json_set_string(d, ZS_STR("${DOMAIN}"));
   zs_json_array_push(domains, d);
   zs_object_free(d);
   zs_json_set(cfg, ZS_STR("domains"), domains);
   zs_object_free(domains);
   zs_s64 u = zs_json_new_object();
-  zs_json_set_string(u, ZS_STR("${directoryUrl}"));
+  zs_json_set_string(u, ZS_STR("${env.directoryUrl}"));
   zs_json_set(cfg, ZS_STR("directory_url"), u);
   zs_object_free(u);
   return cfg;
@@ -268,93 +369,77 @@ ZS_INIT_ENTRY(acme_config) {
     );
     const tarPath = await packSite(siteRoot);
 
-    // 6. Run zeroserve, trusting our directory CA via SSL_CERT_FILE.
-    const acmeDir = join(work, "acme-store");
-    const zeroserve = new Deno.Command(await getZeroservePath(), {
-      args: [
-        "--addr",
-        "127.0.0.1:0",
-        "--tls-addr",
-        `127.0.0.1:${zsTlsPort}`,
-        "--acme-dir",
-        acmeDir,
-        "--disable-ns-isolation",
-        "--disable-request-logging",
-        tarPath,
-      ],
-      cwd: repoRoot,
-      env: { SSL_CERT_FILE: caCrt },
-      stdin: "null",
-      stdout: "null",
-      stderr: "piped",
-    }).spawn();
-    children.push(zeroserve);
-    drain(zeroserve, "zeroserve");
+    const acmeDir = join(env.work, "acme-store");
+    env.spawn(
+      new Deno.Command(await getZeroservePath(), {
+        args: [
+          "--addr",
+          "127.0.0.1:0",
+          "--tls-addr",
+          `127.0.0.1:${env.zsTlsPort}`,
+          "--acme-dir",
+          acmeDir,
+          "--disable-ns-isolation",
+          "--disable-request-logging",
+          tarPath,
+        ],
+        cwd: repoRoot,
+        env: { SSL_CERT_FILE: env.caCrt },
+        stdin: "null",
+        stdout: "null",
+        stderr: "piped",
+      }),
+      "zeroserve",
+    );
+    await verifyIssuedAndServed(env, acmeDir);
+  });
+});
 
-    // 7. Wait for the issued certificate to be persisted.
-    const certPath = join(acmeDir, "certs", domain, "cert.pem");
-    await waitFor(
-      async () => {
-        try {
-          await Deno.stat(certPath);
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      40_000,
-      "issued certificate",
+Deno.test({
+  name: "e2e: ACME issuance via Caddyfile-generated acme_config",
+  ignore: !available,
+}, async () => {
+  await withPebble(async (env) => {
+    // A Caddyfile whose global email + acme_ca compile to a
+    // zeroserve.init.acme_config covering the site's domain.
+    const caddyfile = join(env.work, "site.caddy");
+    await Deno.writeTextFile(
+      caddyfile,
+      `{
+  email admin@${DOMAIN}
+  acme_ca ${env.directoryUrl}
+}
+${DOMAIN} {
+  respond "ok"
+}
+`,
     );
 
-    // The persisted leaf is issued by Pebble and covers the domain.
-    const certText = await runOpensslText([
-      "x509",
-      "-in",
-      certPath,
-      "-noout",
-      "-issuer",
-      "-ext",
-      "subjectAltName",
-    ]);
-    assertStringIncludes(certText, "Pebble");
-    assertStringIncludes(certText, domain);
-
-    // 8. The certificate is actually served on the TLS port for SNI=domain and
-    //    chains to Pebble's root.
-    const trust = join(work, "pebble-trust.pem");
-    const root = await (await fetch(`https://127.0.0.1:${mgmtPort}/roots/0`, {
-      client: caClient,
-    })).text();
-    const intermediate =
-      await (await fetch(`https://127.0.0.1:${mgmtPort}/intermediates/0`, {
-        client: caClient,
-      })).text();
-    await Deno.writeTextFile(trust, `${root}\n${intermediate}\n`);
-    caClient.close();
-
-    const handshake = await runOpensslText([
-      "s_client",
-      "-connect",
-      `127.0.0.1:${zsTlsPort}`,
-      "-servername",
-      domain,
-      "-CAfile",
-      trust,
-      "-verify_return_error",
-    ], "Q\n");
-    assertStringIncludes(handshake, "Verify return code: 0 (ok)");
-  } catch (err) {
-    for (const get of logs.values()) {
-      console.error(get());
-    }
-    throw err;
-  } finally {
-    for (const c of children) kill(c);
-    // Let the children settle so their stderr readers finish before cleanup.
-    await delay(100);
-    for (const c of children) await c.status.catch(() => {});
-    await Deno.remove(work, { recursive: true }).catch(() => {});
-  }
+    const acmeDir = join(env.work, "acme-store");
+    env.spawn(
+      new Deno.Command(await getZeroservePath(), {
+        args: [
+          "--addr",
+          "127.0.0.1:0",
+          "--tls-addr",
+          `127.0.0.1:${env.zsTlsPort}`,
+          "--acme-dir",
+          acmeDir,
+          "--disable-ns-isolation",
+          "--disable-request-logging",
+          "--caddy",
+          caddyfile,
+        ],
+        cwd: repoRoot,
+        env: { SSL_CERT_FILE: env.caCrt },
+        stdin: "null",
+        stdout: "null",
+        stderr: "piped",
+      }),
+      "zeroserve",
+    );
+    await verifyIssuedAndServed(env, acmeDir);
+  });
 });
 
 async function waitFor(

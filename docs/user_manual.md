@@ -104,9 +104,14 @@ To inspect the adapter output without compiling, use `--adapt-caddyfile`:
 zeroserve --adapt-caddyfile Caddyfile   # prints Caddy JSON to stdout
 ```
 
-TLS/PKI/admin/automatic-HTTPS global options are accepted but reported as
-warnings, since they live outside zeroserve's eBPF request-processing surface
-(the same surface the JSON path documents below).
+Most TLS/PKI/admin global options are accepted but reported as warnings, since
+they live outside zeroserve's eBPF request-processing surface. The ACME client
+options are an exception: the global `email`, `acme_ca`, and `acme_eab`, and the
+site `tls <email>` / `tls { ca <url> … eab { … } }` directives compile into a
+`zeroserve.init.acme_config` section (see "Automatic HTTPS (ACME)"). Every
+routed public domain (excluding `localhost`, IP literals, wildcards, `tls
+internal` sites, and sites with an explicit `tls <cert> <key>`) is then
+provisioned automatically when the server runs with `--acme-dir`.
 
 The generated script implements Caddy HTTP routes, matcher sets, route groups,
 terminal routes, method/query/header/header-regexp/path-regexp/file/protocol/TLS/
