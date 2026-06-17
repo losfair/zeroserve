@@ -71,7 +71,7 @@ pub struct ServerIdentity {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     leaf: X509,
-    dns_names: Vec<String>,
+    pub(crate) dns_names: Vec<String>,
 }
 
 impl ServerIdentity {
@@ -557,7 +557,7 @@ fn dns_sans(cert: &X509Ref) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn dns_name_matches(pattern: &str, sni: &str) -> bool {
+pub(crate) fn dns_name_matches(pattern: &str, sni: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let sni = sni.to_ascii_lowercase();
 

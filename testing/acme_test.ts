@@ -8,7 +8,7 @@
 // installed via `go install` and exposed through PEBBLE_BIN /
 // PEBBLE_CHALLTESTSRV_BIN; locally the test is skipped if they are absent.
 
-import { assertStringIncludes } from "@std/assert";
+import { assert, assertStringIncludes } from "@std/assert";
 import { join } from "@std/path";
 import {
   delay,
@@ -439,6 +439,120 @@ ${DOMAIN} {
       "zeroserve",
     );
     await verifyIssuedAndServed(env, acmeDir);
+  });
+});
+
+Deno.test({
+  name: "e2e: --cert-dir takes precedence over ACME for covered hostnames",
+  ignore: !available,
+}, async () => {
+  await withPebble(async (env) => {
+    const covered = "covered.test";
+
+    // A --cert-dir holding a self-signed cert for `covered`.
+    const certDir = join(env.work, "certdir");
+    await Deno.mkdir(certDir);
+    await openssl([
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      join(certDir, "covered.key"),
+      "-out",
+      join(certDir, "covered.crt"),
+      "-days",
+      "2",
+      "-subj",
+      `/CN=${covered}`,
+      "-addext",
+      "basicConstraints=critical,CA:FALSE",
+      "-addext",
+      `subjectAltName=DNS:${covered}`,
+    ]);
+
+    // A site whose acme_config requests BOTH the cert-dir domain and an
+    // uncovered one; only the uncovered one should be acquired over ACME.
+    const siteRoot = join(env.work, "site");
+    await Deno.mkdir(join(siteRoot, ".zeroserve", "scripts"), {
+      recursive: true,
+    });
+    await Deno.writeTextFile(join(siteRoot, "index.html"), "<h1>acme</h1>\n");
+    await Deno.writeTextFile(
+      join(siteRoot, ".zeroserve", "scripts", "00-acme.c"),
+      `#include <zeroserve.h>
+ZS_INIT_ENTRY(acme_config) {
+  zs_s64 cfg = zs_json_new_object();
+  zs_s64 domains = zs_json_new_array();
+  zs_s64 a = zs_json_new_object();
+  zs_json_set_string(a, ZS_STR("${covered}"));
+  zs_json_array_push(domains, a);
+  zs_object_free(a);
+  zs_s64 b = zs_json_new_object();
+  zs_json_set_string(b, ZS_STR("${DOMAIN}"));
+  zs_json_array_push(domains, b);
+  zs_object_free(b);
+  zs_json_set(cfg, ZS_STR("domains"), domains);
+  zs_object_free(domains);
+  zs_s64 u = zs_json_new_object();
+  zs_json_set_string(u, ZS_STR("${env.directoryUrl}"));
+  zs_json_set(cfg, ZS_STR("directory_url"), u);
+  zs_object_free(u);
+  return cfg;
+}
+`,
+    );
+    const tarPath = await packSite(siteRoot);
+
+    const acmeDir = join(env.work, "acme-store");
+    env.spawn(
+      new Deno.Command(await getZeroservePath(), {
+        args: [
+          "--addr",
+          "127.0.0.1:0",
+          "--tls-addr",
+          `127.0.0.1:${env.zsTlsPort}`,
+          "--cert-dir",
+          certDir,
+          "--acme-dir",
+          acmeDir,
+          "--disable-ns-isolation",
+          "--disable-request-logging",
+          tarPath,
+        ],
+        cwd: repoRoot,
+        env: { SSL_CERT_FILE: env.caCrt },
+        stdin: "null",
+        stdout: "null",
+        stderr: "piped",
+      }),
+      "zeroserve",
+    );
+
+    // The uncovered domain is issued by Pebble and served.
+    await verifyIssuedAndServed(env, acmeDir);
+
+    // The cert-dir domain is NEVER ordered over ACME.
+    const orderedPath = join(acmeDir, "certs", covered, "cert.pem");
+    let ordered = true;
+    try {
+      await Deno.stat(orderedPath);
+    } catch {
+      ordered = false;
+    }
+    assert(!ordered, `${covered} should not be acquired over ACME`);
+
+    // ...and it is served from the cert-dir cert (self-signed; not Pebble).
+    const served = await runOpensslText([
+      "s_client",
+      "-connect",
+      `127.0.0.1:${env.zsTlsPort}`,
+      "-servername",
+      covered,
+    ], "Q\n");
+    assertStringIncludes(served, covered);
+    assert(!served.includes("Pebble"), `${covered} should not be ACME-issued`);
   });
 });
 

@@ -1535,21 +1535,23 @@ impl ScriptRuntime {
         local: std::net::SocketAddr,
     ) -> anyhow::Result<(Option<SslContext>, bool)> {
         let scripts = (*self.scripts.borrow()).clone();
-        // ACME (`--acme-dir`) provides a per-SNI live certificate fallback used
-        // whenever the site's TLS scripts (if any) select nothing.
-        let acme_certs = tls.acme_certs.clone();
-        let acme_sni = sni.clone();
-        let acme_fallback = move || {
-            acme_certs
-                .as_ref()
-                .zip(acme_sni.as_ref())
-                .and_then(|(certs, sni)| certs.live_for_sni(sni))
+        // Fallback used whenever the site's TLS scripts (if any) select nothing:
+        // a `--cert-dir` certificate covering the SNI is preferred, then an ACME
+        // (`--acme-dir`) live certificate. cert-dir wins so a name covered there
+        // is never served over ACME.
+        let runtime = tls.clone();
+        let fallback_sni = sni.clone();
+        let static_fallback = move || {
+            let sni = fallback_sni.as_ref()?;
+            runtime
+                .cert_dir_context_for_sni(sni)
+                .or_else(|| runtime.acme_certs.as_ref()?.live_for_sni(sni))
         };
         if !scripts
             .iter()
             .any(|(_, program)| program.has_section(SCRIPT_TLS_ENTRYPOINT))
         {
-            return Ok((acme_fallback(), false));
+            return Ok((static_fallback(), false));
         }
 
         let select = Rc::new(TlsCertSelect {
@@ -1633,7 +1635,7 @@ impl ScriptRuntime {
             }
         }
 
-        let chosen = select.chosen.borrow_mut().take().or_else(acme_fallback);
+        let chosen = select.chosen.borrow_mut().take().or_else(static_fallback);
         Ok((chosen, select.request_client_cert.get()))
     }
 

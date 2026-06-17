@@ -257,10 +257,16 @@ fn main() -> Result<()> {
     // When `--acme-dir` is set, create the ACME runtime first so its shared
     // certificate registry can be wired into the TLS acceptor (TLS-ALPN-01
     // challenges and per-SNI live certificates are resolved through it).
-    let acme_runtime = config
-        .acme_dir
-        .as_ref()
-        .map(|dir| acme::AcmeRuntime::new(dir.clone()));
+    let acme_runtime = config.acme_dir.as_ref().map(|dir| {
+        // Hostnames already covered by `--cert-dir` are served from there and
+        // excluded from ACME provisioning.
+        let cert_dir_names = config
+            .cert_dir_path
+            .as_deref()
+            .map(tls::cert_dir_dns_names)
+            .unwrap_or_default();
+        acme::AcmeRuntime::new(dir.clone(), cert_dir_names)
+    });
     let acme_certs = acme_runtime.as_ref().map(|a| a.certs());
 
     let tls_runtime = load_tls_if_configured(&config, acme_certs)?;

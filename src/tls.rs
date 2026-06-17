@@ -13,7 +13,7 @@ use boring::ssl::{SslContext, SslEchKeys};
 use boring::x509::X509;
 
 use crate::acme::SharedCerts;
-use crate::boringtls::{BoringAcceptor, ServerIdentity, build_identity_context};
+use crate::boringtls::{BoringAcceptor, ServerIdentity, build_identity_context, dns_name_matches};
 use crate::config::StaticConfig;
 use crate::ech::key::EchKeySet;
 
@@ -32,6 +32,12 @@ pub struct TlsRuntime {
     /// TLS-ALPN-01 challenge certificates from here and falls back to a live
     /// ACME certificate by SNI when no script selects one.
     pub acme_certs: Option<Arc<SharedCerts>>,
+    /// Certificates preloaded from `--cert-dir` when ACME is also enabled. The
+    /// per-connection selector serves a matching cert-dir certificate in
+    /// preference to an ACME one, so a hostname covered by `--cert-dir` is never
+    /// served (or acquired) over ACME. Each entry pairs a leaf's DNS SAN
+    /// patterns with its serving context.
+    cert_dir_contexts: Vec<(Vec<String>, SslContext)>,
     /// ECH keys to install on lazily built per-certificate contexts so they
     /// mirror the acceptor's own configuration.
     ssl_ech_keys: Option<SslEchKeys>,
@@ -59,6 +65,16 @@ impl TlsRuntime {
         cache.insert(key, context.clone());
         eprintln!("loaded TLS certificate {cert_path} (key {key_path})");
         Ok(context)
+    }
+
+    /// The `--cert-dir` certificate whose DNS SANs cover `sni`, if any. Consulted
+    /// before the ACME live store so `--cert-dir` certificates take precedence.
+    pub fn cert_dir_context_for_sni(&self, sni: &str) -> Option<SslContext> {
+        let sni = sni.to_ascii_lowercase();
+        self.cert_dir_contexts
+            .iter()
+            .find(|(names, _)| names.iter().any(|name| dns_name_matches(name, &sni)))
+            .map(|(_, ctx)| ctx.clone())
     }
 }
 
@@ -128,14 +144,49 @@ pub fn load_tls_if_configured(
                 Ok(())
             };
 
-            // In the `--caddy` flow (without an explicit `--cert-dir`) the
-            // site's eBPF TLS section drives certificate selection per
-            // connection; certificates referenced by the Caddyfile are loaded
-            // lazily at handshake time, not preloaded here.
-            let script_certificates = (config.caddy_tarball.is_some() || config.acme_dir.is_some())
-                && config.cert_dir_path.is_none();
+            // The per-connection script selector drives certificate selection
+            // when ACME is enabled (it serves ACME challenge/live certs and the
+            // cert-dir certificates preloaded below) or in the `--caddy` flow
+            // without an explicit `--cert-dir` (the site's eBPF TLS section
+            // chooses the cert). A `--cert-dir` alone uses static SNI selection.
+            let acme_enabled = config.acme_dir.is_some();
+            let caddy_script = config.caddy_tarball.is_some() && config.cert_dir_path.is_none();
+            let script_certificates = acme_enabled || caddy_script;
 
-            let acceptor = if let Some(cert_dir) = &config.cert_dir_path {
+            // When ACME and `--cert-dir` are combined, preload the directory's
+            // certificates so the selector can prefer them over ACME.
+            let mut cert_dir_contexts: Vec<(Vec<String>, SslContext)> = Vec::new();
+            if acme_enabled && let Some(cert_dir) = &config.cert_dir_path {
+                let identities = load_cert_dir(cert_dir).with_context(|| {
+                    format!("loading TLS certificates from {}", cert_dir.display())
+                })?;
+                eprintln!(
+                    "loaded {} cert-dir identity(s) from {} (preferred over ACME)",
+                    identities.len(),
+                    cert_dir.display()
+                );
+                for identity in &identities {
+                    let context = build_identity_context(identity, ssl_ech_keys.as_ref())?;
+                    cert_dir_contexts.push((identity.dns_names.clone(), context));
+                }
+            }
+
+            let acceptor = if script_certificates {
+                // `--cert`/`--key`, when given, become the default identity for
+                // connections whose SNI matches no policy and no cert-dir/ACME
+                // certificate.
+                let default_identity =
+                    match (config.cert_path.as_deref(), config.key_path.as_deref()) {
+                        (Some(cert), Some(key)) => Some(ServerIdentity::from_paths(cert, key)?),
+                        _ => None,
+                    };
+                BoringAcceptor::build_script_selected(
+                    default_identity,
+                    relay_public_names.clone(),
+                    acme_certs.clone(),
+                    configure,
+                )?
+            } else if let Some(cert_dir) = &config.cert_dir_path {
                 let identities = load_cert_dir(cert_dir).with_context(|| {
                     format!("loading TLS certificates from {}", cert_dir.display())
                 })?;
@@ -147,20 +198,6 @@ pub fn load_tls_if_configured(
                 BoringAcceptor::build_with_identities(
                     identities,
                     relay_public_names.clone(),
-                    configure,
-                )?
-            } else if script_certificates {
-                // `--cert`/`--key`, when given, become the default identity
-                // for connections whose SNI matches no Caddy TLS policy.
-                let default_identity =
-                    match (config.cert_path.as_deref(), config.key_path.as_deref()) {
-                        (Some(cert), Some(key)) => Some(ServerIdentity::from_paths(cert, key)?),
-                        _ => None,
-                    };
-                BoringAcceptor::build_script_selected(
-                    default_identity,
-                    relay_public_names.clone(),
-                    acme_certs.clone(),
                     configure,
                 )?
             } else {
@@ -208,11 +245,26 @@ pub fn load_tls_if_configured(
                 ech_public_name,
                 script_certificates,
                 acme_certs,
+                cert_dir_contexts,
                 ssl_ech_keys,
                 cert_contexts: Mutex::new(HashMap::new()),
             }))
         }
         None => Ok(None),
+    }
+}
+
+/// The DNS SAN patterns of every certificate in `--cert-dir`, used to exclude
+/// already-covered hostnames from ACME provisioning. Returns an empty list when
+/// the directory holds no usable certificate (errors are non-fatal here: the
+/// TLS runtime build surfaces directory problems).
+pub fn cert_dir_dns_names(dir: &Path) -> Vec<String> {
+    match load_cert_dir(dir) {
+        Ok(identities) => identities
+            .into_iter()
+            .flat_map(|identity| identity.dns_names)
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 

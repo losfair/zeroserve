@@ -21,6 +21,8 @@ use std::time::Duration;
 use anyhow::Result;
 use boring::ssl::SslContext;
 
+use crate::boringtls::dns_name_matches;
+
 pub use config::AcmeConfig;
 
 use challenge::{build_challenge_context, context_from_pem};
@@ -92,18 +94,29 @@ impl SharedCerts {
 pub struct AcmeRuntime {
     acme_dir: PathBuf,
     certs: Arc<SharedCerts>,
+    /// DNS SAN patterns of `--cert-dir` certificates. A domain covered here is
+    /// served from `--cert-dir` and never acquired over ACME.
+    cert_dir_names: Vec<String>,
 }
 
 impl AcmeRuntime {
-    pub fn new(acme_dir: PathBuf) -> Arc<Self> {
+    pub fn new(acme_dir: PathBuf, cert_dir_names: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             acme_dir,
             certs: Arc::new(SharedCerts::default()),
+            cert_dir_names,
         })
     }
 
     pub fn certs(&self) -> Arc<SharedCerts> {
         self.certs.clone()
+    }
+
+    /// Whether `--cert-dir` already provides a certificate for `domain`.
+    fn covered_by_cert_dir(&self, domain: &str) -> bool {
+        self.cert_dir_names
+            .iter()
+            .any(|name| dns_name_matches(name, domain))
     }
 
     /// Load any persisted certificates for `config`, then provision missing ones
@@ -120,8 +133,12 @@ impl AcmeRuntime {
             }
         };
 
-        // Serve already-issued certificates immediately on restart.
+        // Serve already-issued certificates immediately on restart, except for
+        // domains now covered by `--cert-dir` (which takes precedence).
         for domain in &config.domains {
+            if self.covered_by_cert_dir(domain) {
+                continue;
+            }
             if let Some((cert_pem, key_pem)) = store.load_cert(domain) {
                 match context_from_pem(&cert_pem, &key_pem) {
                     Ok(ctx) => self.certs.insert_live(domain, ctx),
@@ -146,7 +163,7 @@ impl AcmeRuntime {
         let pending: Vec<String> = config
             .domains
             .iter()
-            .filter(|d| store.needs_renewal(d))
+            .filter(|d| !self.covered_by_cert_dir(d) && store.needs_renewal(d))
             .cloned()
             .collect();
         if pending.is_empty() {
