@@ -224,10 +224,13 @@ jobs:
         with:
           version: 0.14.0
 
+      # Pin cargo-zigbuild: 0.23.0 regressed glibc-suffixed target triples
+      # (e.g. x86_64-unknown-linux-gnu.2.31), making zig reject the triple with
+      # "version '.2.31' ... is invalid". Stay on the last known-good release.
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild@0.22.3
 
       - name: Build
         run: cargo zigbuild --release --locked --target ${{ matrix.zig_target }}
