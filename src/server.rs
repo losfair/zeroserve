@@ -4337,7 +4337,17 @@ async fn reverse_proxy_request(
     head.version = ::http::Version::HTTP_11;
 
     let pool_key = target.pool_key();
-    let mut conn = match pool::take_connection(&pool_key) {
+    // Upgrade requests always dial a fresh backend connection: the tunnel is
+    // long-lived so reuse saves nothing, and a fresh socket rules out every
+    // stale-keep-alive hazard (backend idle timeouts racing the upgrade,
+    // leftover connection state) for the one request type that cannot recover
+    // from a poisoned connection mid-stream.
+    let pooled = if is_ws_request {
+        None
+    } else {
+        pool::take_connection(&pool_key)
+    };
+    let mut conn = match pooled {
         Some(conn) => conn,
         None => match connect_backend(&target).await {
             Ok(conn) => conn,

@@ -415,7 +415,10 @@ impl<IO> H1Connection<IO> {
         self.buf[self.pos..].windows(2).position(|x| x == b"\r\n")
     }
 
-    fn buffered_len(&self) -> usize {
+    /// Bytes already read from the peer but not yet consumed by parsing. A
+    /// connection with buffered bytes is mid-exchange and must not be reused
+    /// for a new request.
+    pub fn buffered_len(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
     }
 

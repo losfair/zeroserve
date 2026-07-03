@@ -50,6 +50,17 @@ impl PooledConnection {
             PooledConnection::Unix(conn) => conn.io_mut().ok().map(|io| io.as_raw_fd()),
         }
     }
+
+    /// Unconsumed bytes sitting in the connection's userspace parse buffer.
+    /// The idle poll below only sees the kernel receive queue, so this is the
+    /// other half of the "connection is truly quiescent" check.
+    fn buffered_len(&self) -> usize {
+        match self {
+            PooledConnection::Http(conn) => conn.buffered_len(),
+            PooledConnection::Https(conn) => conn.buffered_len(),
+            PooledConnection::Unix(conn) => conn.buffered_len(),
+        }
+    }
 }
 
 fn connection_still_idle(conn: &mut PooledConnection) -> bool {
@@ -108,6 +119,11 @@ impl ProxyPool {
     }
 
     pub fn put(&mut self, key: PoolKey, conn: PooledConnection) {
+        if conn.buffered_len() > 0 {
+            // Mid-exchange connection: reusing it would splice stale backend
+            // bytes into the next request's response. Drop it instead.
+            return;
+        }
         let entries = self.entries.entry(key.clone()).or_default();
         if entries.len() >= MAX_POOL_PER_KEY {
             return;
