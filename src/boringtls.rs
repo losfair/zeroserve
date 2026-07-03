@@ -678,6 +678,7 @@ where
         scratch: vec![0u8; READ_CHUNK],
         plaintext: vec![0u8; READ_CHUNK],
         shutdown_sent: false,
+        flush_in_flight: std::cell::Cell::new(false),
         outer_sni,
     }))
 }
@@ -827,6 +828,13 @@ pub struct BoringStream<IO> {
     scratch: Vec<u8>,
     plaintext: Vec<u8>,
     shutdown_sent: bool,
+    /// True while a `flush_outbound` socket write is in flight. After
+    /// `into_split`, the read half and write half of this stream run
+    /// concurrently (the WebSocket tunnel does this) and both paths flush
+    /// `outbound`; this guard ensures only one of them ever writes to the
+    /// socket at a time. Two interleaved `write_all`s on the same socket would
+    /// shear TLS records on the wire and kill the session.
+    flush_in_flight: std::cell::Cell<bool>,
     /// The cleartext outer SNI parsed from the wire ClientHello, set only when
     /// ECH was accepted (BoringSSL replaces `servername()` with the decrypted
     /// inner name, so the public/outer name is otherwise unrecoverable).
@@ -938,15 +946,38 @@ fn relay_ex_index() -> Index<Ssl, String> {
 }
 
 impl<IO: AsyncWriteRent> BoringStream<IO> {
+    /// Drain `outbound` to the socket. Safe to call concurrently from the read
+    /// and write halves of a split stream: a guard ensures only one socket
+    /// write is in flight at a time (concurrent `write_all`s would interleave
+    /// and shear TLS records), and bytes queued while a write is in flight are
+    /// picked up by the active drainer's loop instead of being lost.
     async fn flush_outbound(&mut self) -> io::Result<()> {
-        if self.ssl.get_mut().outbound.is_empty() {
+        if self.flush_in_flight.get() {
+            // The other half is draining; it will flush anything queued after
+            // its current write completes. Starting a second write here would
+            // interleave with the in-flight one and corrupt the record stream.
             return Ok(());
         }
-        let out = std::mem::take(&mut self.ssl.get_mut().outbound);
-        let (res, mut out) = self.io.write_all(out).await;
-        out.clear();
-        self.ssl.get_mut().outbound = out;
-        res.map(|_| ())
+        self.flush_in_flight.set(true);
+        let res = loop {
+            let out = std::mem::take(&mut self.ssl.get_mut().outbound);
+            if out.is_empty() {
+                break Ok(());
+            }
+            let (res, mut out) = self.io.write_all(out).await;
+            out.clear();
+            // Recycle the drained buffer's capacity, but never overwrite
+            // records the SSL queued while the write was in flight.
+            let bridge = self.ssl.get_mut();
+            if bridge.outbound.is_empty() {
+                bridge.outbound = out;
+            }
+            if res.is_err() {
+                break res.map(|_| ());
+            }
+        };
+        self.flush_in_flight.set(false);
+        res
     }
 }
 
@@ -1151,10 +1182,15 @@ impl<IO: AsyncReadRent + AsyncWriteRent> AsyncWriteRent for BoringStream<IO> {
     }
 }
 
-// SAFETY: read paths only touch `inbound`/`scratch` and write paths only touch
-// `outbound`; the underlying `IO` is itself `Split`. The h1 handler uses the
-// halves sequentially (read request, then write response), matching the prior
-// `monoio_rustls::TlsStream` usage which made the same promise.
+// SAFETY: the split halves may be driven concurrently (the WebSocket tunnel
+// runs a reader task and a writer task over the same stream). The read path
+// touches `inbound`/`scratch`/`plaintext`; the write path touches `outbound`;
+// the underlying `IO` is itself `Split` so concurrent socket read + write are
+// fine. The one shared piece of state is `outbound` plus the socket's write
+// direction: the read path drains it too (BoringSSL can queue records — e.g.
+// session tickets, KeyUpdate replies — while processing inbound data), and
+// `flush_outbound` serializes those drains behind `flush_in_flight` so the two
+// halves never issue interleaved socket writes or drop queued records.
 unsafe impl<IO: monoio::io::Split> monoio::io::Split for BoringStream<IO> {}
 
 #[cfg(test)]
@@ -1259,6 +1295,135 @@ mod tests {
                 }
             }
             assert_eq!(&out, b"ping");
+        };
+
+        monoio::join!(server, client);
+    }
+
+    // Full-duplex traffic over concurrently driven split halves — the shape
+    // the WebSocket tunnel uses. Guards the `flush_outbound` serialization:
+    // without it, the read half's ticket/KeyUpdate drains can interleave
+    // socket writes with the write half's in-flight flush and shear TLS
+    // records on the wire.
+    #[test]
+    fn split_halves_survive_concurrent_full_duplex() {
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap()
+            .block_on(split_halves_concurrent_inner());
+    }
+
+    async fn split_halves_concurrent_inner() {
+        use boring::ssl::{SslConnector, SslVerifyMode};
+        use monoio::io::{AsyncWriteRentExt, Splitable};
+        use monoio::net::{TcpListener, TcpStream};
+
+        let cert = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("certificate.pem");
+        let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("key.pem");
+        if !cert.exists() || !key.exists() {
+            eprintln!("skipping: test cert/key not present");
+            return;
+        }
+
+        const CHUNK: usize = 4096;
+        const CHUNKS: usize = 64;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = BoringAcceptor::build(&cert, &key, Vec::new(), |_| Ok(())).unwrap();
+
+        let server = async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let tls = match acceptor.accept(sock).await.unwrap() {
+                AcceptOutcome::Stream(s) => s,
+                AcceptOutcome::Relay { .. } => panic!("unexpected relay outcome"),
+            };
+            let (mut rh, mut wh) = tls.into_split();
+
+            // Writer: stream CHUNKS chunks of 0xAB while the reader half runs.
+            let writer = async move {
+                for _ in 0..CHUNKS {
+                    let (res, _) = wh.write_all(vec![0xABu8; CHUNK]).await;
+                    res.unwrap();
+                    wh.flush().await.unwrap();
+                }
+                wh
+            };
+            // Reader: consume CHUNKS chunks of 0xCD from the client.
+            let reader = async move {
+                let mut got = 0usize;
+                let mut buf = vec![0u8; CHUNK];
+                while got < CHUNK * CHUNKS {
+                    let (res, b) = rh.read(buf).await;
+                    let n = res.unwrap();
+                    assert!(n > 0, "client closed early");
+                    assert!(b[..n].iter().all(|x| *x == 0xCD), "corrupt client data");
+                    got += n;
+                    buf = b;
+                }
+            };
+            let (wh, ()) = monoio::join!(writer, reader);
+            drop(wh);
+        };
+
+        let client = async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let mut cfg = SslConnector::builder(SslMethod::tls()).unwrap();
+            cfg.set_verify(SslVerifyMode::NONE);
+            let cfg = cfg.build().configure().unwrap();
+            let ssl = cfg.into_ssl("localhost").unwrap();
+            let mut mid = SslStreamBuilder::new(ssl, MemBridge::new());
+            mid.set_connect_state();
+            let mut io = sock;
+            let mut mid = {
+                let mut m = mid.setup_connect();
+                loop {
+                    match m.handshake() {
+                        Ok(s) => break s,
+                        Err(HandshakeError::WouldBlock(mut mm)) => {
+                            flush_out(mm.get_mut(), &mut io).await.unwrap();
+                            if !fill_in(mm.get_mut(), &mut io).await.unwrap() {
+                                panic!("server closed during handshake");
+                            }
+                            m = mm;
+                        }
+                        Err(e) => panic!("client handshake failed: {e}"),
+                    }
+                }
+            };
+
+            // Interleave sends of 0xCD with reads of the server's 0xAB stream
+            // so both directions are in flight at once.
+            let mut received = 0usize;
+            let mut sent = 0usize;
+            let mut out = vec![0u8; CHUNK];
+            while sent < CHUNKS || received < CHUNK * CHUNKS {
+                if sent < CHUNKS {
+                    mid.ssl_write(&[0xCDu8; CHUNK]).unwrap();
+                    flush_out(mid.get_mut(), &mut io).await.unwrap();
+                    sent += 1;
+                }
+                while received < CHUNK * CHUNKS {
+                    match mid.ssl_read(&mut out) {
+                        Ok(n) => {
+                            assert!(
+                                out[..n].iter().all(|x| *x == 0xAB),
+                                "corrupt server data (TLS records interleaved)"
+                            );
+                            received += n;
+                        }
+                        Err(e) if e.code() == ErrorCode::WANT_READ => {
+                            if sent < CHUNKS {
+                                break; // go send more before blocking on reads
+                            }
+                            flush_out(mid.get_mut(), &mut io).await.unwrap();
+                            assert!(fill_in(mid.get_mut(), &mut io).await.unwrap());
+                        }
+                        Err(e) => panic!("client read failed: {e}"),
+                    }
+                }
+            }
         };
 
         monoio::join!(server, client);

@@ -923,15 +923,13 @@ pub fn content_length(headers: &HeaderMap) -> Option<u64> {
 }
 
 pub fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
-    headers
-        .get(&name)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
+    headers.get_all(&name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
             value
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case(token))
         })
-        .unwrap_or(false)
+    })
 }
 
 pub fn header_eq_ignore_case(headers: &HeaderMap, name: HeaderName, value: &str) -> bool {
@@ -947,10 +945,14 @@ pub fn is_websocket_upgrade_request(head: &RequestHead) -> bool {
         && header_eq_ignore_case(&head.headers, header::UPGRADE, "websocket")
 }
 
+/// Whether a backend response to a WebSocket upgrade request switches
+/// protocols. Any 101 counts (matching Caddy): backends are not uniformly
+/// strict about echoing `Connection: Upgrade` / `Upgrade: websocket`, and a
+/// 101 that is *not* tunneled leaves both connections poisoned — the client's
+/// first frame would be parsed as a new HTTP request, and the hijacked backend
+/// socket would go back into the keep-alive pool.
 pub fn is_websocket_upgrade_response(head: &ResponseHead) -> bool {
     head.status == StatusCode::SWITCHING_PROTOCOLS
-        && header_contains_token(&head.headers, header::CONNECTION, "upgrade")
-        && header_eq_ignore_case(&head.headers, header::UPGRADE, "websocket")
 }
 
 pub async fn write_request_head(
@@ -1201,6 +1203,28 @@ mod tests {
             Some("a=1; b=2")
         );
         assert_eq!(headers.get_all(header::COOKIE).iter().count(), 1);
+    }
+
+    #[test]
+    fn websocket_upgrade_request_detects_repeated_connection_headers() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let head = parse_request_head(raw).unwrap();
+        assert!(is_websocket_upgrade_request(&head));
+    }
+
+    #[test]
+    fn websocket_upgrade_response_accepts_any_101() {
+        // Some backends omit `Connection: Upgrade` (or the whole header set)
+        // from their 101; the proxy must still tunnel, or the client's first
+        // frame gets parsed as an HTTP request and the hijacked backend
+        // connection ends up in the keep-alive pool.
+        let raw = b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: x\r\n\r\n";
+        let head = parse_response_head(raw).unwrap();
+        assert!(is_websocket_upgrade_response(&head));
+
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let head = parse_response_head(raw).unwrap();
+        assert!(!is_websocket_upgrade_response(&head));
     }
 
     #[test]
