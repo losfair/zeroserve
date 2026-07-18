@@ -325,7 +325,12 @@ Key options:
   footprint in KB per request for scripts (default 256).
 - `--reload-signal-file <FILE>`: Poll a file and reload when its contents change.
 - `--disable-request-logging`: Turn off per-request logs.
-- `--enable-proxy-protocol`: Expect PROXY protocol v1 on each new connection.
+- `--enable-proxy-protocol`: Expect PROXY protocol v1 on both HTTP and HTTPS
+  connections.
+- `--enable-http-proxy-protocol`: Expect PROXY protocol v1 only on HTTP
+  connections.
+- `--enable-https-proxy-protocol`: Expect PROXY protocol v1 only on HTTPS
+  connections.
 - `--disable-ns-isolation`: Disable Linux namespace isolation.
 - `--enable-netns-isolation`: Enable Linux network namespace isolation.
 - `--preempt-timer-interval-ms <MS>`: Script preemption timer interval.
@@ -347,8 +352,8 @@ zeroserve --addr 0.0.0.0:8080 \
   --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem \
   site.tar
 
-# HTML fallback and PROXY protocol
-zeroserve --try-html --enable-proxy-protocol site.tar
+# HTML fallback and PROXY protocol on the HTTP listener
+zeroserve --try-html --enable-http-proxy-protocol site.tar
 
 # Plugin scripts before site scripts
 zeroserve --plugin auth.tar,headers.tar site.tar
@@ -1222,8 +1227,9 @@ ExecStart=/usr/bin/zeroserve --addr fd:3 --tls-addr fd:4 --cert /etc/certs/cert.
 ## Operational notes
 
 - Request logging is enabled by default; disable with `--disable-request-logging`.
-- `--enable-proxy-protocol` is required when running behind a TCP load balancer
-  that speaks PROXY protocol v1.
+- `--enable-proxy-protocol` enables PROXY protocol v1 on both listeners. Use
+  `--enable-http-proxy-protocol` or `--enable-https-proxy-protocol` when only
+  one listener is behind a TCP load balancer that speaks PROXY protocol v1.
 - `--disable-ns-isolation` and `--enable-netns-isolation` are Linux-specific
   isolation controls; leave them default unless you know you need them.
 - Long-running scripts are throttled; keep scripts fast and avoid busy loops.

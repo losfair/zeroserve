@@ -31,7 +31,8 @@ pub struct StaticConfig {
     pub try_html: bool,
     pub expose_filesystem: bool,
     pub disable_request_logging: bool,
-    pub enable_proxy_protocol: bool,
+    pub enable_http_proxy_protocol: bool,
+    pub enable_https_proxy_protocol: bool,
     pub disable_ns_isolation: bool,
     pub enable_netns_isolation: bool,
     pub threads: usize,
@@ -151,7 +152,9 @@ impl TryFrom<Cli> for StaticConfig {
             // is always forced on for it (a warning is logged at startup).
             expose_filesystem: cli.expose_filesystem || cli.caddy.is_some(),
             disable_request_logging: cli.disable_request_logging,
-            enable_proxy_protocol: cli.enable_proxy_protocol,
+            enable_http_proxy_protocol: cli.enable_proxy_protocol || cli.enable_http_proxy_protocol,
+            enable_https_proxy_protocol: cli.enable_proxy_protocol
+                || cli.enable_https_proxy_protocol,
             disable_ns_isolation: cli.disable_ns_isolation,
             threads: cli.threads,
             preempt_timer_interval: Duration::from_millis(cli.preempt_timer_interval_ms as u64),
@@ -167,5 +170,38 @@ impl TryFrom<Cli> for StaticConfig {
             validate_hostnames: cli.validate_hostnames,
             ebpf_compiler: cli.ebpf_compiler,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn legacy_proxy_protocol_flag_enables_both_listeners() {
+        let cli =
+            Cli::try_parse_from(["zeroserve", "--enable-proxy-protocol", "site.tar"]).unwrap();
+        let config = StaticConfig::try_from(cli).unwrap();
+
+        assert!(config.enable_http_proxy_protocol);
+        assert!(config.enable_https_proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_flags_enable_listeners_independently() {
+        let http_cli =
+            Cli::try_parse_from(["zeroserve", "--enable-http-proxy-protocol", "site.tar"]).unwrap();
+        let http_config = StaticConfig::try_from(http_cli).unwrap();
+        assert!(http_config.enable_http_proxy_protocol);
+        assert!(!http_config.enable_https_proxy_protocol);
+
+        let https_cli =
+            Cli::try_parse_from(["zeroserve", "--enable-https-proxy-protocol", "site.tar"])
+                .unwrap();
+        let https_config = StaticConfig::try_from(https_cli).unwrap();
+        assert!(!https_config.enable_http_proxy_protocol);
+        assert!(https_config.enable_https_proxy_protocol);
     }
 }

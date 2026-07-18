@@ -218,7 +218,7 @@ async fn run_http_listener(
         let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
             let mut stream = stream;
-            let peer = if state.config.enable_proxy_protocol {
+            let peer = if state.config.enable_http_proxy_protocol {
                 match read_proxy_protocol_peer(&mut stream, addr, &state.config).await {
                     Ok(peer) => peer,
                     Err(err) => {
@@ -291,7 +291,7 @@ async fn run_tls_listener(
         let script_runtime = script_runtime.clone();
         monoio::spawn(async move {
             let mut stream = stream;
-            let reported_peer = if state.config.enable_proxy_protocol {
+            let reported_peer = if state.config.enable_https_proxy_protocol {
                 match read_proxy_protocol_peer(&mut stream, peer, &state.config).await {
                     Ok(addr) => addr,
                     Err(err) => {

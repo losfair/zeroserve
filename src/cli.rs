@@ -193,9 +193,17 @@ pub struct Cli {
     #[arg(long)]
     pub disable_request_logging: bool,
 
-    /// Expect a PROXY protocol v1 header before the first request on each connection.
+    /// Expect a PROXY protocol v1 header on both HTTP and HTTPS connections.
     #[arg(long)]
     pub enable_proxy_protocol: bool,
+
+    /// Expect a PROXY protocol v1 header on HTTP connections.
+    #[arg(long, alias = "enable-proxy-protocol-http")]
+    pub enable_http_proxy_protocol: bool,
+
+    /// Expect a PROXY protocol v1 header on HTTPS connections.
+    #[arg(long, alias = "enable-proxy-protocol-https")]
+    pub enable_https_proxy_protocol: bool,
 
     /// Disable Linux namespace isolation.
     #[arg(long)]
@@ -341,5 +349,30 @@ mod tests {
         .unwrap();
 
         assert!(cli.ebpf_require_static_region_analysis);
+    }
+
+    #[test]
+    fn proxy_protocol_can_be_enabled_for_both_listeners() {
+        let cli =
+            Cli::try_parse_from(["zeroserve", "--enable-proxy-protocol", "site.tar"]).unwrap();
+
+        assert!(cli.enable_proxy_protocol);
+        assert!(!cli.enable_http_proxy_protocol);
+        assert!(!cli.enable_https_proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_can_be_enabled_per_listener() {
+        let cli = Cli::try_parse_from([
+            "zeroserve",
+            "--enable-http-proxy-protocol",
+            "--enable-https-proxy-protocol",
+            "site.tar",
+        ])
+        .unwrap();
+
+        assert!(!cli.enable_proxy_protocol);
+        assert!(cli.enable_http_proxy_protocol);
+        assert!(cli.enable_https_proxy_protocol);
     }
 }

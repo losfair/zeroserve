@@ -89,8 +89,13 @@ zeroserve --tls-addr 0.0.0.0:8443 --cert-dir /etc/zeroserve/certs site.tar
 # Fall back to <path>.html when a request path is missing
 zeroserve --try-html site.tar
 
-# Honor PROXY protocol v1 (e.g. behind a TCP load balancer)
+# Honor PROXY protocol v1 on both listeners (e.g. behind a TCP load balancer)
 zeroserve --enable-proxy-protocol site.tar
+
+# Or enable it only on the listener behind the load balancer
+zeroserve --enable-http-proxy-protocol site.tar
+zeroserve --tls-addr 0.0.0.0:8443 --cert certificate.pem --key key.pem \
+  --enable-https-proxy-protocol site.tar
 
 # Reject requests whose Host/SNI is not in the allow-list (otherwise 421)
 zeroserve --validate-hostnames example.com,www.example.com site.tar
