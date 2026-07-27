@@ -399,34 +399,29 @@ mod tests {
     fn challenge_served_from_sibling_published_on_disk() {
         // `#[monoio::test]` can't be used (it cfg-gates on the crate's `iouring`
         // feature, which zeroserve doesn't define), so build the runtime directly.
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let dir =
-                    std::env::temp_dir().join(format!("zs-acme-xchal-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                let store = Store::open(&dir).await.unwrap();
+        crate::rt::build_runtime(None).unwrap().block_on(async {
+            let dir = std::env::temp_dir().join(format!("zs-acme-xchal-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::open(&dir).await.unwrap();
 
-                // A process whose SharedCerts has no in-memory challenge still
-                // serves the TLS-ALPN-01 cert when a sibling published the key
-                // authorization on disk.
-                let certs = SharedCerts::new(Some(dir.join("challenges")));
-                assert!(certs.challenge_for_sni("acme.example").is_none());
-                store
-                    .write_challenge("acme.example", "token.thumbprint")
-                    .await
-                    .unwrap();
-                assert!(
-                    certs.challenge_for_sni("acme.example").is_some(),
-                    "should serve the on-disk challenge"
-                );
+            // A process whose SharedCerts has no in-memory challenge still
+            // serves the TLS-ALPN-01 cert when a sibling published the key
+            // authorization on disk.
+            let certs = SharedCerts::new(Some(dir.join("challenges")));
+            assert!(certs.challenge_for_sni("acme.example").is_none());
+            store
+                .write_challenge("acme.example", "token.thumbprint")
+                .await
+                .unwrap();
+            assert!(
+                certs.challenge_for_sni("acme.example").is_some(),
+                "should serve the on-disk challenge"
+            );
 
-                store.remove_challenge("acme.example").await;
-                assert!(certs.challenge_for_sni("acme.example").is_none());
-                std::fs::remove_dir_all(&dir).unwrap();
-            });
+            store.remove_challenge("acme.example").await;
+            assert!(certs.challenge_for_sni("acme.example").is_none());
+            std::fs::remove_dir_all(&dir).unwrap();
+        });
     }
 
     #[test]

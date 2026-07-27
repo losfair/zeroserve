@@ -285,11 +285,7 @@ mod tests {
     /// can't be used (it cfg-gates on the crate's `iouring` feature, which
     /// zeroserve doesn't define), so build the runtime explicitly.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap()
-            .block_on(fut)
+        crate::rt::build_runtime(None).unwrap().block_on(fut)
     }
 
     #[test]

@@ -229,6 +229,20 @@ export async function hasBpfToolchain(): Promise<boolean> {
   return true;
 }
 
+/**
+ * Deno's node:http2 client shim only surfaces informational (1xx) and
+ * mid-stream responses (a response arriving while the request body is still
+ * being written) starting with Deno 2.8: older runtimes never emit the
+ * `continue`/`response` events for them. OpenBSD CI runs the packaged Deno
+ * (2.6.x as of OpenBSD 7.9), so h2c interim/early-response client checks
+ * must be skipped there. Verified empirically: 2.7.0 fails, 2.8.0 passes,
+ * against the same zeroserve binary on Linux.
+ */
+export function denoSupportsH2cMidStreamResponses(): boolean {
+  const [major, minor] = Deno.version.deno.split(".").map(Number);
+  return major > 2 || (major === 2 && minor >= 8);
+}
+
 export async function waitForServer(
   hostname: string,
   port: number,

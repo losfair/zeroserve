@@ -155,11 +155,7 @@ mod tests {
     // Explicit runtime instead of `#[monoio::test]` for the same reason as the
     // boringtls loopback test: the macro cfg-gates on a feature we don't define.
     fn run(fut: impl Future<Output = ()>) {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap()
-            .block_on(fut);
+        crate::rt::build_runtime(None).unwrap().block_on(fut);
     }
 
     async fn pooled_pair(listener: &TcpListener) -> (PoolKey, monoio::net::TcpStream) {
@@ -206,11 +202,36 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 
             let (key, backend_side) = pooled_pair(&listener).await;
+
+            // Grab the pooled client fd so we can wait until the peer close is
+            // visible via poll. On some kernels (observed on OpenBSD) the FIN/RST
+            // is not always reflected on the local socket in the same syscall
+            // that shut the peer down.
+            let mut conn = take_connection(&key).expect("pooled connection");
+            let fd = conn.raw_fd().expect("raw fd");
+            return_connection(key.clone(), conn);
+
             unsafe {
                 libc::shutdown(backend_side.as_raw_fd(), libc::SHUT_RDWR);
             }
             drop(backend_side);
 
+            let mut closed = false;
+            for _ in 0..100 {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                // Match connection_still_idle: any poll activity means not reusable.
+                if ret != 0 || pfd.revents != 0 {
+                    closed = true;
+                    break;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(closed, "peer close never became visible on pooled fd");
             assert!(take_connection(&key).is_none());
         });
     }

@@ -8219,11 +8219,17 @@ async function fetchObserved(
   for (const name of probe.compareHeaders ?? []) {
     headers[name] = res.headers.get(name);
   }
+  let body = "";
+  if (probe.compareBody === false) {
+    // The body must still be consumed: leaving the stream open trips the
+    // test sanitizer ("a fetch response body was created but not consumed").
+    await res.body?.cancel();
+  } else {
+    body = normalizeBody(await res.text(), probe);
+  }
   return {
     status: res.status,
-    body: probe.compareBody === false
-      ? ""
-      : normalizeBody(await res.text(), probe),
+    body,
     headers,
   };
 }

@@ -1,6 +1,11 @@
 import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
-import { hasBpfToolchain, packSite, withZeroserve } from "./test_utils.ts";
+import {
+    denoSupportsH2cMidStreamResponses,
+    hasBpfToolchain,
+    packSite,
+    withZeroserve,
+} from "./test_utils.ts";
 import * as http2 from "node:http2";
 import { Buffer } from "node:buffer";
 
@@ -300,15 +305,27 @@ function h2cExpectContinueUpload(
         let gotContinue = false;
         let status = 0;
         const responseChunks: Buffer[] = [];
+        // Respect backpressure: writing the whole body in a tight loop stacks
+        // multiple chunks in the stream's write buffer, which routes through
+        // ClientHttp2Stream._writev — unimplemented in Deno's node:http2
+        // compat layer (observed on the slower OpenBSD CI VM). One chunk per
+        // drain keeps the buffer at a single chunk and exercises the same
+        // proxy behavior.
         const sendBody = () => {
             const chunk = Buffer.alloc(64 * 1024, 0x61);
             let remaining = bodySize;
-            while (remaining > 0) {
-                const take = Math.min(remaining, chunk.length);
-                req.write(chunk.subarray(0, take));
-                remaining -= take;
-            }
-            req.end();
+            const writeMore = () => {
+                while (remaining > 0) {
+                    const take = Math.min(remaining, chunk.length);
+                    remaining -= take;
+                    if (!req.write(chunk.subarray(0, take))) {
+                        req.once("drain", writeMore);
+                        return;
+                    }
+                }
+                req.end();
+            };
+            writeMore();
         };
 
         // Like curl, wait for the interim response before uploading, with a
@@ -372,18 +389,22 @@ Deno.test({
                 assertEquals(h1Result.sawExpect, false);
                 assertEquals(h1Result.totalBytes, bodySize);
 
-                // h2c client (the git-over-HTTP/2 push shape).
-                const h2 = await h2cExpectContinueUpload(
-                    url.hostname,
-                    Number(url.port),
-                    "/upload",
-                    bodySize,
-                );
-                assertEquals(h2.status, 200);
-                assert(h2.gotContinue, "expected an interim 100 over h2c");
-                const h2Result: InterimBackendResult = JSON.parse(h2.body);
-                assertEquals(h2Result.sawExpect, false);
-                assertEquals(h2Result.totalBytes, bodySize);
+                // h2c client (the git-over-HTTP/2 push shape). Needs the
+                // runtime to surface the interim 100 mid-stream — see
+                // denoSupportsH2cMidStreamResponses.
+                if (denoSupportsH2cMidStreamResponses()) {
+                    const h2 = await h2cExpectContinueUpload(
+                        url.hostname,
+                        Number(url.port),
+                        "/upload",
+                        bodySize,
+                    );
+                    assertEquals(h2.status, 200);
+                    assert(h2.gotContinue, "expected an interim 100 over h2c");
+                    const h2Result: InterimBackendResult = JSON.parse(h2.body);
+                    assertEquals(h2Result.sawExpect, false);
+                    assertEquals(h2Result.totalBytes, bodySize);
+                }
             });
         } finally {
             backend.close();

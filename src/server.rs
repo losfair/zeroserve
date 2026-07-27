@@ -4393,6 +4393,7 @@ async fn reverse_proxy_request(
     } else {
         pool::take_connection(&pool_key)
     };
+    let from_pool = pooled.is_some();
     let mut conn = match pooled {
         Some(conn) => conn,
         None => match connect_backend(&target).await {
@@ -4408,64 +4409,86 @@ async fn reverse_proxy_request(
     // TLS bytes are not necessarily application data, so decrypting them
     // mid-upload could block. TLS backends still get the salvage-on-write-
     // error path inside the forwarders.
-    let outcome = match &mut conn {
-        PooledConnection::Http(codec) => {
-            proxy_over_connection(
-                codec,
-                head,
-                body,
-                reader,
-                w,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                is_ws_request,
-                send_request_body,
-                request_body_limit,
-                true,
-                encode,
-            )
-            .await?
+    macro_rules! proxy_attempt {
+        ($body:expr) => {
+            match &mut conn {
+                PooledConnection::Http(codec) => {
+                    proxy_over_connection(
+                        codec,
+                        &head,
+                        $body,
+                        reader,
+                        w,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        is_ws_request,
+                        send_request_body,
+                        request_body_limit,
+                        true,
+                        encode,
+                    )
+                    .await
+                }
+                PooledConnection::Https(codec) => {
+                    proxy_over_connection(
+                        codec,
+                        &head,
+                        $body,
+                        reader,
+                        w,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        is_ws_request,
+                        send_request_body,
+                        request_body_limit,
+                        false,
+                        encode,
+                    )
+                    .await
+                }
+                PooledConnection::Unix(codec) => {
+                    proxy_over_connection(
+                        codec,
+                        &head,
+                        $body,
+                        reader,
+                        w,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        is_ws_request,
+                        send_request_body,
+                        request_body_limit,
+                        true,
+                        encode,
+                    )
+                    .await
+                }
+            }
+        };
+    }
+
+    // A pooled connection can be dead without the take-time poll having seen
+    // the peer's close yet (the FIN may still be in flight, or — observed on
+    // OpenBSD — not yet reflected on the local socket). Replay once on a fresh
+    // dial when that is provably safe: idempotent method, no request body to
+    // consume, and a ProxyNoResponse-marked error guaranteeing nothing was
+    // received from the backend or written to the client.
+    let replayable = from_pool
+        && matches!(head.method, Method::GET | Method::HEAD)
+        && matches!(body.hint(), StreamHint::None);
+    let outcome = match proxy_attempt!(std::mem::replace(&mut body, HttpBody::None)) {
+        Ok(outcome) => outcome,
+        Err(err) if replayable && err.is::<ProxyNoResponse>() => {
+            conn = connect_backend(&target).await?;
+            proxy_attempt!(HttpBody::None)?
         }
-        PooledConnection::Https(codec) => {
-            proxy_over_connection(
-                codec,
-                head,
-                body,
-                reader,
-                w,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                is_ws_request,
-                send_request_body,
-                request_body_limit,
-                false,
-                encode,
-            )
-            .await?
-        }
-        PooledConnection::Unix(codec) => {
-            proxy_over_connection(
-                codec,
-                head,
-                body,
-                reader,
-                w,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                is_ws_request,
-                send_request_body,
-                request_body_limit,
-                true,
-                encode,
-            )
-            .await?
-        }
+        Err(err) => return Err(err),
     };
 
     if outcome.reuse_backend {
@@ -4488,20 +4511,41 @@ async fn reverse_proxy_simple_request(
     let request_head =
         encode_simple_proxy_request_head(head, &target, peer, scheme, caddy_default_forwarded)?;
     let pool_key = target.pool_key();
-    let mut conn = match pool::take_connection(&pool_key) {
+    let pooled = pool::take_connection(&pool_key);
+    let from_pool = pooled.is_some();
+    let mut conn = match pooled {
         Some(conn) => conn,
         None => connect_backend(&target).await?,
     };
-    let outcome = match &mut conn {
-        PooledConnection::Http(codec) => {
-            proxy_simple_over_connection(codec, request_head, w).await?
+    macro_rules! proxy_attempt {
+        ($req:expr) => {
+            match &mut conn {
+                PooledConnection::Http(codec) => proxy_simple_over_connection(codec, $req, w).await,
+                PooledConnection::Https(codec) => {
+                    proxy_simple_over_connection(codec, $req, w).await
+                }
+                PooledConnection::Unix(codec) => proxy_simple_over_connection(codec, $req, w).await,
+            }
+        };
+    }
+    // The fast path is GET-only with no request body, so a pooled connection
+    // that turns out dead before producing a response (stale keep-alive, e.g.
+    // delayed FIN visibility on OpenBSD) is always safe to replay once on a
+    // fresh dial. The request head is re-encoded only on that cold path.
+    let outcome = match proxy_attempt!(request_head) {
+        Ok(outcome) => outcome,
+        Err(err) if from_pool && err.is::<ProxyNoResponse>() => {
+            conn = connect_backend(&target).await?;
+            let request_head = encode_simple_proxy_request_head(
+                head,
+                &target,
+                peer,
+                scheme,
+                caddy_default_forwarded,
+            )?;
+            proxy_attempt!(request_head)?
         }
-        PooledConnection::Https(codec) => {
-            proxy_simple_over_connection(codec, request_head, w).await?
-        }
-        PooledConnection::Unix(codec) => {
-            proxy_simple_over_connection(codec, request_head, w).await?
-        }
+        Err(err) => return Err(err),
     };
     if outcome.reuse_backend {
         pool::return_connection(pool_key, conn);
@@ -4547,10 +4591,12 @@ where
 {
     let (res, _) = conn
         .io_mut()
-        .map_err(|err| anyhow!("proxy backend missing io: {err}"))?
+        .map_err(|err| anyhow!("proxy backend missing io: {err}").context(ProxyNoResponse))?
         .write_all(request_head)
         .await;
-    res.map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+    res.map_err(|err| {
+        anyhow!("failed to send proxy request head: {err}").context(ProxyNoResponse)
+    })?;
 
     let response = match conn.next_final_response_fast().await {
         Ok(Some(h1::ResponseRead::RawFixed(raw))) => {
@@ -4572,8 +4618,12 @@ where
             });
         }
         Ok(Some(h1::ResponseRead::Parsed(resp))) => resp,
-        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+        Ok(None) => {
+            return Err(anyhow!("proxy backend closed without response").context(ProxyNoResponse));
+        }
+        Err(err) => {
+            return Err(anyhow!("failed to read proxy response: {err}").context(ProxyNoResponse));
+        }
     };
 
     let (resp_head, mut resp_body) = response.into_parts();
@@ -4811,7 +4861,9 @@ async fn reverse_proxy_request_h2(
     head.version = ::http::Version::HTTP_11;
 
     let pool_key = target.pool_key();
-    let mut conn = match pool::take_connection(&pool_key) {
+    let pooled = pool::take_connection(&pool_key);
+    let from_pool = pooled.is_some();
+    let mut conn = match pooled {
         Some(conn) => conn,
         None => match connect_backend(&target).await {
             Ok(conn) => conn,
@@ -4825,61 +4877,82 @@ async fn reverse_proxy_request_h2(
     // TLS bytes are not necessarily application data, so decrypting them
     // mid-upload could block. TLS backends still get the salvage-on-write-
     // error path inside the forwarders.
-    let outcome = match &mut conn {
-        PooledConnection::Http(codec) => {
-            proxy_over_connection_h2(
-                codec,
-                head,
-                body,
-                respond,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                chunked,
-                send_request_body,
-                request_body_limit,
-                true,
-                encode,
-            )
-            .await?
+    let mut body = Some(body);
+    macro_rules! proxy_attempt {
+        () => {
+            match &mut conn {
+                PooledConnection::Http(codec) => {
+                    proxy_over_connection_h2(
+                        codec,
+                        &head,
+                        &mut body,
+                        respond,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        chunked,
+                        send_request_body,
+                        request_body_limit,
+                        true,
+                        encode,
+                    )
+                    .await
+                }
+                PooledConnection::Https(codec) => {
+                    proxy_over_connection_h2(
+                        codec,
+                        &head,
+                        &mut body,
+                        respond,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        chunked,
+                        send_request_body,
+                        request_body_limit,
+                        false,
+                        encode,
+                    )
+                    .await
+                }
+                PooledConnection::Unix(codec) => {
+                    proxy_over_connection_h2(
+                        codec,
+                        &head,
+                        &mut body,
+                        respond,
+                        head_only,
+                        early_response_headers,
+                        metadata,
+                        hook_state,
+                        chunked,
+                        send_request_body,
+                        request_body_limit,
+                        true,
+                        encode,
+                    )
+                    .await
+                }
+            }
+        };
+    }
+
+    // Same stale-pooled-connection replay as the h1 path: retry once on a
+    // fresh dial when the request is idempotent, no request-body bytes can
+    // have been consumed from the client stream, and the marked error
+    // guarantees the backend produced no response.
+    let replayable = from_pool
+        && matches!(head.method, Method::GET | Method::HEAD)
+        && (!send_request_body || body.as_ref().is_some_and(|b| b.is_end_stream()));
+    let outcome = match proxy_attempt!() {
+        Ok(outcome) => outcome,
+        Err(err) if replayable && err.is::<ProxyNoResponse>() => {
+            conn = connect_backend(&target).await?;
+            proxy_attempt!()?
         }
-        PooledConnection::Https(codec) => {
-            proxy_over_connection_h2(
-                codec,
-                head,
-                body,
-                respond,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                chunked,
-                send_request_body,
-                request_body_limit,
-                false,
-                encode,
-            )
-            .await?
-        }
-        PooledConnection::Unix(codec) => {
-            proxy_over_connection_h2(
-                codec,
-                head,
-                body,
-                respond,
-                head_only,
-                early_response_headers,
-                metadata,
-                hook_state,
-                chunked,
-                send_request_body,
-                request_body_limit,
-                true,
-                encode,
-            )
-            .await?
-        }
+        Err(err) => return Err(err),
     };
 
     if outcome.reuse_backend {
@@ -4962,9 +5035,25 @@ struct ProxyOutcome {
     preserved_body: Option<HttpBody>,
 }
 
+/// Marker attached (via anyhow context) to proxy errors raised before any
+/// response byte was received from the backend and before anything was written
+/// to the client. On a pooled connection such a failure is the stale-keep-alive
+/// case — the peer closed the connection while it sat in the pool, possibly not
+/// yet visible to the take-time poll (notably on OpenBSD, where FIN visibility
+/// can lag) — so the request may be replayed once on a freshly dialed
+/// connection when it is idempotent and its body was not consumed.
+#[derive(Debug)]
+struct ProxyNoResponse;
+
+impl std::fmt::Display for ProxyNoResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no response received from proxy backend")
+    }
+}
+
 async fn proxy_over_connection<IO, R>(
     conn: &mut h1::H1Connection<IO>,
-    head: RequestHead,
+    head: &RequestHead,
     mut body: HttpBody,
     reader: &mut h1::H1Connection<R>,
     w: &mut impl AsyncWriteRent,
@@ -4986,9 +5075,11 @@ where
         .as_ref()
         .is_some_and(|state| state.has_hooks())
         .then(Instant::now);
-    h1::write_request_head(conn.io_mut()?, &head)
+    h1::write_request_head(conn.io_mut()?, head)
         .await
-        .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+        .map_err(|err| {
+            anyhow!("failed to send proxy request head: {err}").context(ProxyNoResponse)
+        })?;
     let mut early_response = None;
     if send_request_body {
         match forward_request_body(
@@ -5070,14 +5161,30 @@ where
                 });
             }
             Ok(Some(h1::ResponseRead::Parsed(resp))) => resp,
-            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+            Ok(None) => {
+                return Err(
+                    anyhow!("proxy backend closed without response").context(ProxyNoResponse)
+                );
+            }
+            Err(err) => {
+                return Err(
+                    anyhow!("failed to read proxy response: {err}").context(ProxyNoResponse)
+                );
+            }
         }
     } else {
         match conn.next_final_response().await {
             Ok(Some(resp)) => resp,
-            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+            Ok(None) => {
+                return Err(
+                    anyhow!("proxy backend closed without response").context(ProxyNoResponse)
+                );
+            }
+            Err(err) => {
+                return Err(
+                    anyhow!("failed to read proxy response: {err}").context(ProxyNoResponse)
+                );
+            }
         }
     };
     let upstream_latency = roundtrip_start.map(|start| start.elapsed());
@@ -5280,8 +5387,8 @@ where
 
 async fn proxy_over_connection_h2<IO>(
     conn: &mut h1::H1Connection<IO>,
-    head: RequestHead,
-    mut body: h2::RecvStream,
+    head: &RequestHead,
+    body: &mut Option<h2::RecvStream>,
     respond: &mut h2::server::SendResponse<Bytes>,
     head_only: bool,
     early_response_headers: Option<&::http::HeaderMap>,
@@ -5300,14 +5407,19 @@ where
         .as_ref()
         .is_some_and(|state| state.has_hooks())
         .then(Instant::now);
-    h1::write_request_head(conn.io_mut()?, &head)
+    h1::write_request_head(conn.io_mut()?, head)
         .await
-        .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+        .map_err(|err| {
+            anyhow!("failed to send proxy request head: {err}").context(ProxyNoResponse)
+        })?;
     let mut early_response = None;
     if send_request_body {
+        let body = body
+            .as_mut()
+            .expect("h2 proxy request body already consumed");
         match forward_h2_request_body(
             conn,
-            &mut body,
+            body,
             chunked,
             request_body_limit,
             watch_early_response,
@@ -5346,8 +5458,16 @@ where
         Some(response) => response,
         None => match conn.next_final_response().await {
             Ok(Some(resp)) => resp,
-            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+            Ok(None) => {
+                return Err(
+                    anyhow!("proxy backend closed without response").context(ProxyNoResponse)
+                );
+            }
+            Err(err) => {
+                return Err(
+                    anyhow!("failed to read proxy response: {err}").context(ProxyNoResponse)
+                );
+            }
         },
     };
     let upstream_latency = roundtrip_start.map(|start| start.elapsed());
@@ -5389,7 +5509,7 @@ where
         return Ok(H2ProxyConnectionOutcome {
             reuse_backend: can_reuse,
             continue_request: true,
-            preserved_body: if send_request_body { None } else { Some(body) },
+            preserved_body: if send_request_body { None } else { body.take() },
             status: Some(status.as_u16()),
         });
     }

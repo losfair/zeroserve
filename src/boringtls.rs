@@ -1214,9 +1214,7 @@ mod tests {
     // so the test silently vanishes. Build the runtime explicitly instead.
     #[test]
     fn loopback_handshake_and_echo() {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
+        crate::rt::build_runtime(None)
             .unwrap()
             .block_on(loopback_handshake_and_echo_inner());
     }
@@ -1307,9 +1305,7 @@ mod tests {
     // records on the wire.
     #[test]
     fn split_halves_survive_concurrent_full_duplex() {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
+        crate::rt::build_runtime(None)
             .unwrap()
             .block_on(split_halves_concurrent_inner());
     }
@@ -1435,9 +1431,7 @@ mod tests {
     // signal). This is the regression guard for server-side ECH.
     #[test]
     fn ech_accepted_end_to_end() {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
+        crate::rt::build_runtime(None)
             .unwrap()
             .block_on(ech_accepted_end_to_end_inner());
     }
@@ -1584,9 +1578,7 @@ mod tests {
     // of the ECH "don't stick out" fallback.
     #[test]
     fn relay_when_outer_sni_uncovered_and_inner_undecryptable() {
-        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
+        crate::rt::build_runtime(None)
             .unwrap()
             .block_on(relay_when_outer_sni_uncovered_and_inner_undecryptable_inner());
     }

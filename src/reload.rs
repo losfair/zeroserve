@@ -11,6 +11,9 @@ use futures::{StreamExt, channel::mpsc};
 use crate::{script::ScriptRuntime, shared::SharedState, site::Site, tls::load_tls_if_configured};
 
 pub struct SighupBlocked {
+    // Used by Linux signalfd creation; on BSD the blocked set is process-wide
+    // and the kqueue EVFILT_SIGNAL path does not need the stored mask.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     mask: libc::sigset_t,
 }
 
@@ -36,7 +39,8 @@ pub struct ReloadRequest {
 }
 
 /// How often the coordinator wakes to poll the reload signal file and run the
-/// periodic rate-limit cleanup. A SIGHUP wakes it immediately via the signalfd.
+/// periodic rate-limit cleanup. A SIGHUP wakes it immediately via the platform
+/// signal wait fd (signalfd on Linux, kqueue EVFILT_SIGNAL elsewhere).
 const COORDINATOR_TICK: Duration = Duration::from_secs(1);
 /// How often expired rate-limit buckets are swept from the (shared) current site.
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -57,16 +61,115 @@ pub fn spawn_coordinator(
     worker_txs: Vec<mpsc::UnboundedSender<ReloadRequest>>,
     sighup_blocked: SighupBlocked,
 ) -> Result<()> {
-    let sfd = unsafe { libc::signalfd(-1, &sighup_blocked.mask, libc::SFD_CLOEXEC) };
-    if sfd < 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to create signalfd");
-    }
+    let sfd = create_sighup_wait_fd(&sighup_blocked).context("failed to create SIGHUP wait fd")?;
 
     std::thread::Builder::new()
         .name("coordinator".into())
         .spawn(move || coordinator_loop(shared, worker_txs, sfd))
         .context("failed to spawn coordinator thread")?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_sighup_wait_fd(sighup_blocked: &SighupBlocked) -> std::io::Result<RawFd> {
+    let sfd = unsafe { libc::signalfd(-1, &sighup_blocked.mask, libc::SFD_CLOEXEC) };
+    if sfd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(sfd)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_sighup_wait_fd(_sighup_blocked: &SighupBlocked) -> std::io::Result<RawFd> {
+    // SIGHUP is already blocked process-wide via sigprocmask. On BSD, a kqueue
+    // EVFILT_SIGNAL note fires when a (blocked) signal is posted, without
+    // installing a handler — the closest equivalent to Linux signalfd. Unlike
+    // signalfd it neither reports signals that were already pending when the
+    // knote was registered nor dequeues them from the pending set;
+    // coordinator_loop sweeps the pending set every tick to cover both.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = unsafe { libc::fcntl(kq, libc::F_GETFD) };
+    if flags >= 0 {
+        let _ = unsafe { libc::fcntl(kq, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    }
+    let mut kev = libc::kevent {
+        ident: libc::SIGHUP as _,
+        filter: libc::EVFILT_SIGNAL,
+        flags: (libc::EV_ADD | libc::EV_CLEAR) as _,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let ret = unsafe { libc::kevent(kq, &mut kev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(kq);
+        }
+        return Err(err);
+    }
+    Ok(kq)
+}
+
+#[cfg(target_os = "linux")]
+fn drain_sighup_wait_fd(sfd: RawFd) {
+    // Drain the signalfd so it doesn't stay readable.
+    let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+    unsafe {
+        libc::read(sfd, buf.as_mut_ptr().cast(), buf.len());
+    }
+}
+
+/// Consume a pending (blocked) SIGHUP, if any, and report whether one was
+/// taken. kqueue's EVFILT_SIGNAL only fires for signals posted *after* the
+/// knote is registered, so a SIGHUP that arrived between the early process-wide
+/// block in main() and coordinator startup (site/TLS loading happens in
+/// between) would otherwise be silently lost — Linux signalfd is
+/// level-triggered against the pending set and has no such hole. Sweeping every
+/// tick also keeps consumed SIGHUPs from sitting in the pending set forever
+/// (nothing else ever dequeues them on BSD).
+#[cfg(not(target_os = "linux"))]
+fn take_pending_sighup() -> bool {
+    unsafe {
+        let mut pending: libc::sigset_t = core::mem::zeroed();
+        if libc::sigpending(&mut pending) != 0 {
+            return false;
+        }
+        if libc::sigismember(&pending, libc::SIGHUP) != 1 {
+            return false;
+        }
+        // SIGHUP is pending and blocked, so sigwait dequeues it and returns
+        // immediately.
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        let mut sig: libc::c_int = 0;
+        libc::sigwait(&set, &mut sig) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drain_sighup_wait_fd(kq: RawFd) {
+    // Consume the pending EVFILT_SIGNAL event(s).
+    let mut events: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
+    let ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::kevent(
+            kq,
+            std::ptr::null(),
+            0,
+            events.as_mut_ptr(),
+            events.len() as _,
+            &ts,
+        );
+    }
 }
 
 fn coordinator_loop(
@@ -81,7 +184,7 @@ fn coordinator_loop(
     loop {
         let mut should_reload = false;
 
-        // Block until SIGHUP arrives on the signalfd or the tick elapses.
+        // Block until SIGHUP arrives on the wait fd or the tick elapses.
         let mut pfd = libc::pollfd {
             fd: sfd,
             events: libc::POLLIN,
@@ -89,17 +192,21 @@ fn coordinator_loop(
         };
         let ret = unsafe { libc::poll(&mut pfd, 1, COORDINATOR_TICK.as_millis() as libc::c_int) };
         if ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            // Drain the signalfd so it doesn't stay readable.
-            let mut buf = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-            unsafe {
-                libc::read(sfd, buf.as_mut_ptr().cast(), buf.len());
-            }
+            drain_sighup_wait_fd(sfd);
             should_reload = true;
         } else if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EINTR) {
                 eprintln!("coordinator poll failed: {err:?}");
             }
+        }
+
+        // Sweep the pending set: catches a SIGHUP that predates the kqueue
+        // registration (invisible to EVFILT_SIGNAL) and dequeues signals the
+        // kqueue path never consumes.
+        #[cfg(not(target_os = "linux"))]
+        if take_pending_sighup() {
+            should_reload = true;
         }
 
         // Poll the reload signal file for content changes.

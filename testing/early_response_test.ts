@@ -1,6 +1,11 @@
 import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
-import { hasBpfToolchain, packSite, withZeroserve } from "./test_utils.ts";
+import {
+    denoSupportsH2cMidStreamResponses,
+    hasBpfToolchain,
+    packSite,
+    withZeroserve,
+} from "./test_utils.ts";
 import * as http2 from "node:http2";
 import { Buffer } from "node:buffer";
 
@@ -249,7 +254,9 @@ async function h1ChunkedUpload(
 
 Deno.test({
     name: "e2e: backend response before the request body completes is relayed (h2c)",
-    ignore: !canRunScripts,
+    // The h2c client here needs the runtime to deliver a response while the
+    // request stream is still open — see denoSupportsH2cMidStreamResponses.
+    ignore: !canRunScripts || !denoSupportsH2cMidStreamResponses(),
     fn: async () => {
         const backend = await startEarlyRejectBackend(64 * 1024);
         let tarPath: string | null = null;
