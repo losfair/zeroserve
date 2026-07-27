@@ -99,6 +99,12 @@ impl Response {
     pub fn into_parts(self) -> (ResponseHead, Body) {
         (self.head, self.body)
     }
+
+    /// Whether this is an interim response (1xx other than `101 Switching
+    /// Protocols`) that precedes the final response on the same connection.
+    pub fn is_interim(&self) -> bool {
+        is_interim_response_status(self.head.status)
+    }
 }
 
 pub enum ResponseRead {
@@ -487,6 +493,25 @@ impl<IO> H1Connection<IO> {
             .windows(4)
             .position(|x| x == b"\r\n\r\n")
     }
+
+    /// Parse a response head if one is fully buffered, without performing IO.
+    /// Returns `Ok(None)` when the buffered bytes do not yet form a complete
+    /// head. Used to detect a backend response that arrives while the request
+    /// body is still being forwarded to it.
+    pub fn try_next_response(&mut self) -> Result<Option<Response>, HttpError> {
+        let Some(idx) = self.find_double_crlf() else {
+            if self.buffered_len() > MAX_HEADER_SIZE {
+                return Err(HttpError::HeadersTooLarge);
+            }
+            return Ok(None);
+        };
+        let start = self.pos;
+        let raw = self.buf[start..start + idx].to_vec();
+        self.consume(idx + 4);
+        let head = parse_response_head(&raw)?;
+        let body = response_body_from_headers(&head);
+        Ok(Some(Response { head, body }))
+    }
 }
 
 fn parse_chunk_size_line(line: &[u8]) -> Result<usize, HttpError> {
@@ -661,6 +686,13 @@ impl<IO: AsyncReadRent> H1Connection<IO> {
         };
         self.scratch = Some(restored);
         res.map_err(HttpError::from)
+    }
+
+    /// Perform a single read into the connection's parse buffer, returning
+    /// the byte count (0 on EOF). Pairs with [`Self::try_next_response`] to
+    /// pull in a response head that the peer sent ahead of schedule.
+    pub async fn read_ahead(&mut self) -> Result<usize, HttpError> {
+        self.read_more().await
     }
 
     async fn read_chunk_size(&mut self) -> Result<Option<usize>, HttpError> {

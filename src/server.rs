@@ -4371,6 +4371,10 @@ async fn reverse_proxy_request(
         let _ = w.flush().await;
     }
 
+    // Mid-stream early-response detection needs plaintext sockets: readable
+    // TLS bytes are not necessarily application data, so decrypting them
+    // mid-upload could block. TLS backends still get the salvage-on-write-
+    // error path inside the forwarders.
     let outcome = match &mut conn {
         PooledConnection::Http(codec) => {
             proxy_over_connection(
@@ -4386,6 +4390,7 @@ async fn reverse_proxy_request(
                 is_ws_request,
                 send_request_body,
                 request_body_limit,
+                true,
                 encode,
             )
             .await?
@@ -4404,6 +4409,7 @@ async fn reverse_proxy_request(
                 is_ws_request,
                 send_request_body,
                 request_body_limit,
+                false,
                 encode,
             )
             .await?
@@ -4422,6 +4428,7 @@ async fn reverse_proxy_request(
                 is_ws_request,
                 send_request_body,
                 request_body_limit,
+                true,
                 encode,
             )
             .await?
@@ -4781,6 +4788,10 @@ async fn reverse_proxy_request_h2(
         },
     };
 
+    // Mid-stream early-response detection needs plaintext sockets: readable
+    // TLS bytes are not necessarily application data, so decrypting them
+    // mid-upload could block. TLS backends still get the salvage-on-write-
+    // error path inside the forwarders.
     let outcome = match &mut conn {
         PooledConnection::Http(codec) => {
             proxy_over_connection_h2(
@@ -4795,6 +4806,7 @@ async fn reverse_proxy_request_h2(
                 chunked,
                 send_request_body,
                 request_body_limit,
+                true,
                 encode,
             )
             .await?
@@ -4812,6 +4824,7 @@ async fn reverse_proxy_request_h2(
                 chunked,
                 send_request_body,
                 request_body_limit,
+                false,
                 encode,
             )
             .await?
@@ -4829,6 +4842,7 @@ async fn reverse_proxy_request_h2(
                 chunked,
                 send_request_body,
                 request_body_limit,
+                true,
                 encode,
             )
             .await?
@@ -4928,10 +4942,11 @@ async fn proxy_over_connection<IO, R>(
     is_ws_request: bool,
     send_request_body: bool,
     request_body_limit: Option<usize>,
+    watch_early_response: bool,
     encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<ProxyOutcome>
 where
-    IO: AsyncReadRent + AsyncWriteRent + Split,
+    IO: AsyncReadRent + AsyncWriteRent + Split + AsRawFd,
     R: AsyncReadRent,
 {
     let roundtrip_start = hook_state
@@ -4941,9 +4956,21 @@ where
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+    let mut early_response = None;
     if send_request_body {
-        match forward_request_body(conn, reader, &mut body, request_body_limit).await {
-            Ok(()) => {}
+        match forward_request_body(
+            conn,
+            reader,
+            &mut body,
+            request_body_limit,
+            watch_early_response,
+        )
+        .await
+        {
+            Ok(ForwardRequestBodyOutcome::Completed) => {}
+            Ok(ForwardRequestBodyOutcome::EarlyResponse(response)) => {
+                early_response = Some(response);
+            }
             Err(ProxyRequestBodyError::TooLarge) => {
                 return Ok(ProxyOutcome {
                     reuse_backend: false,
@@ -4964,8 +4991,11 @@ where
             }
         }
     }
+    let request_body_fully_sent = early_response.is_none();
 
-    let response = if can_use_raw_fixed_proxy_response(
+    let response = if let Some(response) = early_response {
+        response
+    } else if can_use_raw_fixed_proxy_response(
         early_response_headers,
         metadata,
         hook_state,
@@ -5007,7 +5037,8 @@ where
 
     let (resp_head, mut resp_body) = response.into_parts();
     let status = resp_head.status;
-    let mut can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut can_reuse = request_body_fully_sent
+        && should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
     let is_ws_response = is_ws_request && h1::is_websocket_upgrade_response(&resp_head);
     let mut headers = resp_head.headers;
     if is_ws_response {
@@ -5075,6 +5106,12 @@ where
         if !head_only {
             drain_proxy_payload(conn, &mut resp_body).await?;
         }
+        if !request_body_fully_sent {
+            // The client is still sending the rest of the request body;
+            // consume it so continued handling (and keep-alive) sees a
+            // clean connection.
+            drain_payload(reader, &mut body).await;
+        }
         let _ = w.flush().await;
         return Ok(ProxyOutcome {
             reuse_backend: can_reuse,
@@ -5086,7 +5123,10 @@ where
             preserved_body: if send_request_body { None } else { Some(body) },
         });
     }
-    if !send_request_body {
+    if !send_request_body || !request_body_fully_sent {
+        // Either the body was never destined for the backend, or the backend
+        // responded early and forwarding was aborted: consume what the client
+        // is still sending so the response goes out on a clean connection.
         drain_payload(reader, &mut body).await;
     }
     let send_body = should_send_proxy_body_raw(raw_status, body_hint, head_only);
@@ -5188,10 +5228,11 @@ async fn proxy_over_connection_h2<IO>(
     chunked: bool,
     send_request_body: bool,
     request_body_limit: Option<usize>,
+    watch_early_response: bool,
     encode: Option<&crate::helpers::compress::EncodeState>,
 ) -> Result<H2ProxyConnectionOutcome>
 where
-    IO: AsyncReadRent + AsyncWriteRent + Split,
+    IO: AsyncReadRent + AsyncWriteRent + Split + AsRawFd,
 {
     let roundtrip_start = hook_state
         .as_ref()
@@ -5200,9 +5241,21 @@ where
     h1::write_request_head(conn.io_mut()?, &head)
         .await
         .map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
+    let mut early_response = None;
     if send_request_body {
-        match forward_h2_request_body(conn, &mut body, chunked, request_body_limit).await {
-            Ok(()) => {}
+        match forward_h2_request_body(
+            conn,
+            &mut body,
+            chunked,
+            request_body_limit,
+            watch_early_response,
+        )
+        .await
+        {
+            Ok(ForwardRequestBodyOutcome::Completed) => {}
+            Ok(ForwardRequestBodyOutcome::EarlyResponse(response)) => {
+                early_response = Some(response);
+            }
             Err(ProxyRequestBodyError::TooLarge) => {
                 send_h2_response(
                     respond,
@@ -5226,16 +5279,21 @@ where
         }
     }
 
-    let response = match conn.next_final_response().await {
-        Ok(Some(resp)) => resp,
-        Ok(None) => return Err(anyhow!("proxy backend closed without response")),
-        Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+    let request_body_fully_sent = early_response.is_none();
+    let response = match early_response {
+        Some(response) => response,
+        None => match conn.next_final_response().await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => return Err(anyhow!("proxy backend closed without response")),
+            Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
+        },
     };
     let upstream_latency = roundtrip_start.map(|start| start.elapsed());
 
     let (resp_head, mut resp_body) = response.into_parts();
     let mut status = resp_head.status;
-    let mut can_reuse = should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
+    let mut can_reuse = request_body_fully_sent
+        && should_reuse_proxy_connection(resp_head.version, &resp_head.headers);
     let mut headers = resp_head.headers;
     strip_hop_headers(&mut headers, false);
     let body_hint = resp_body.hint();
@@ -5488,6 +5546,123 @@ enum ProxyRequestBodyError {
     Other(anyhow::Error),
 }
 
+enum ForwardRequestBodyOutcome {
+    /// The whole request body was forwarded to the backend.
+    Completed,
+    /// The backend sent a final response before consuming the whole request
+    /// body (RFC 9110 §9.5), so forwarding was aborted. The backend
+    /// connection must not be reused: the request on it is incomplete.
+    EarlyResponse(h1::Response),
+}
+
+const MAX_EARLY_INTERIM_RESPONSES: usize = 16;
+
+/// Whether a read on the socket would complete immediately (data, EOF, or a
+/// pending error). Zero-timeout poll, same technique as the pool's idle check.
+fn socket_has_pending_bytes(fd: std::os::fd::RawFd) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+    ret > 0 && pfd.revents != 0
+}
+
+/// Check — without ever blocking the upload — whether the backend has sent
+/// bytes while the request body is still being forwarded to it. Interim 1xx
+/// responses are consumed and dropped; a final response head is returned so
+/// the caller can abort the transfer and relay it. EOF here means the backend
+/// gave up on the exchange entirely.
+///
+/// Only sound for plaintext backends: a readable TLS socket may hold
+/// non-application records (e.g. session tickets), and decrypting them could
+/// block waiting for more data, stalling the upload.
+async fn poll_early_backend_response<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    interim_seen: &mut usize,
+) -> Result<Option<h1::Response>, ProxyRequestBodyError>
+where
+    IO: AsyncReadRent + AsRawFd,
+{
+    loop {
+        if let Some(response) = take_buffered_final_response(conn, interim_seen)? {
+            return Ok(Some(response));
+        }
+        let fd = conn
+            .io_mut()
+            .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?
+            .as_raw_fd();
+        if !socket_has_pending_bytes(fd) {
+            return Ok(None);
+        }
+        let n = conn.read_ahead().await.map_err(|err| {
+            ProxyRequestBodyError::Other(anyhow!("failed to read early proxy response: {err}"))
+        })?;
+        if n == 0 {
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "proxy backend closed while receiving request body"
+            )));
+        }
+    }
+}
+
+/// Parse a final response head out of the connection's buffered bytes,
+/// consuming and discarding any interim 1xx responses in front of it.
+fn take_buffered_final_response<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    interim_seen: &mut usize,
+) -> Result<Option<h1::Response>, ProxyRequestBodyError> {
+    loop {
+        match conn.try_next_response() {
+            Ok(Some(response)) => {
+                if response.is_interim() {
+                    *interim_seen += 1;
+                    if *interim_seen > MAX_EARLY_INTERIM_RESPONSES {
+                        return Err(ProxyRequestBodyError::Other(anyhow!(
+                            "too many interim responses from proxy backend"
+                        )));
+                    }
+                    continue;
+                }
+                return Ok(Some(response));
+            }
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(ProxyRequestBodyError::Other(anyhow!(
+                    "failed to parse early proxy response: {err}"
+                )));
+            }
+        }
+    }
+}
+
+/// A request body write failed. The likely cause is the backend rejecting the
+/// request mid-stream and closing its end (e.g. an upload size limit), in
+/// which case the response explaining why is either buffered already or
+/// arrives promptly. Try briefly to read it so the client gets the actual
+/// reason instead of a bare 502; return None to surface the original error.
+async fn salvage_early_backend_response<IO>(
+    conn: &mut h1::H1Connection<IO>,
+    interim_seen: &mut usize,
+) -> Option<h1::Response>
+where
+    IO: AsyncReadRent,
+{
+    for _ in 0..8 {
+        match take_buffered_final_response(conn, interim_seen) {
+            Ok(Some(response)) => return Some(response),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        match monoio::time::timeout(Duration::from_millis(500), conn.read_ahead()).await {
+            Ok(Ok(n)) if n > 0 => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn add_limited_request_body_bytes(
     bytes_seen: &mut usize,
     chunk_len: usize,
@@ -5508,56 +5683,64 @@ async fn forward_h2_request_body<IO>(
     body: &mut h2::RecvStream,
     chunked: bool,
     request_body_limit: Option<usize>,
-) -> Result<(), ProxyRequestBodyError>
+    watch_early_response: bool,
+) -> Result<ForwardRequestBodyOutcome, ProxyRequestBodyError>
 where
-    IO: AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + AsRawFd,
 {
     if body.is_end_stream() {
-        return Ok(());
+        return Ok(ForwardRequestBodyOutcome::Completed);
     }
 
     let mut bytes_seen = 0usize;
-    if chunked {
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
-            })?;
-            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
-            let io = conn
-                .io_mut()
-                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
-            h1::write_chunk(io, chunk.as_ref()).await.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body chunk: {err}"))
-            })?;
-            let _ = body.flow_control().release_capacity(chunk.len());
+    let mut interim_seen = 0usize;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|err| {
+            ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+        })?;
+        add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+        if watch_early_response
+            && let Some(response) = poll_early_backend_response(conn, &mut interim_seen).await?
+        {
+            return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
         }
         let io = conn
             .io_mut()
             .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
-        h1::write_chunk_end(io).await.map_err(|err| {
-            ProxyRequestBodyError::Other(anyhow!("failed to write proxy body end: {err}"))
-        })?;
-    } else {
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
-            })?;
-            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
-            let io = conn
-                .io_mut()
-                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        let write_res = if chunked {
+            h1::write_chunk(io, chunk.as_ref()).await
+        } else {
             let (res, _) = io.write_all(chunk.to_vec()).await;
-            res.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body: {err}"))
-            })?;
-            let _ = body.flow_control().release_capacity(chunk.len());
+            res.map(|_| ()).map_err(h1::HttpError::from)
+        };
+        if let Err(err) = write_res {
+            if let Some(response) = salvage_early_backend_response(conn, &mut interim_seen).await {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "failed to write proxy body: {err}"
+            )));
+        }
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    if chunked {
+        let io = conn
+            .io_mut()
+            .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        if let Err(err) = h1::write_chunk_end(io).await {
+            if let Some(response) = salvage_early_backend_response(conn, &mut interim_seen).await {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "failed to write proxy body end: {err}"
+            )));
         }
     }
     let io = conn
         .io_mut()
         .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
     let _ = io.flush().await;
-    Ok(())
+    Ok(ForwardRequestBodyOutcome::Completed)
 }
 
 async fn forward_proxy_body_h2<IO>(
@@ -5691,13 +5874,14 @@ async fn forward_request_body<IO, R>(
     reader: &mut h1::H1Connection<R>,
     body: &mut h1::Body,
     request_body_limit: Option<usize>,
-) -> Result<(), ProxyRequestBodyError>
+    watch_early_response: bool,
+) -> Result<ForwardRequestBodyOutcome, ProxyRequestBodyError>
 where
-    IO: AsyncWriteRent,
+    IO: AsyncReadRent + AsyncWriteRent + AsRawFd,
     R: AsyncReadRent,
 {
     match body.hint() {
-        StreamHint::None => return Ok(()),
+        StreamHint::None => return Ok(ForwardRequestBodyOutcome::Completed),
         StreamHint::Stream if body.is_eof() => {
             return Err(ProxyRequestBodyError::Other(anyhow!(
                 "proxy request body missing length"
@@ -5706,46 +5890,55 @@ where
         _ => {}
     }
 
+    let chunked = body.is_chunked();
     let mut bytes_seen = 0usize;
-    if body.is_chunked() {
-        while let Some(chunk) = body.next_data(reader).await {
-            let chunk = chunk.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
-            })?;
-            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
-            let io = conn
-                .io_mut()
-                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
-            h1::write_chunk(io, chunk.as_ref()).await.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body chunk: {err}"))
-            })?;
+    let mut interim_seen = 0usize;
+    while let Some(chunk) = body.next_data(reader).await {
+        let chunk = chunk.map_err(|err| {
+            ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
+        })?;
+        add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
+        if watch_early_response
+            && let Some(response) = poll_early_backend_response(conn, &mut interim_seen).await?
+        {
+            return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
         }
         let io = conn
             .io_mut()
             .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
-        h1::write_chunk_end(io).await.map_err(|err| {
-            ProxyRequestBodyError::Other(anyhow!("failed to write proxy body end: {err}"))
-        })?;
-    } else {
-        while let Some(chunk) = body.next_data(reader).await {
-            let chunk = chunk.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
-            })?;
-            add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
-            let io = conn
-                .io_mut()
-                .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        let write_res = if chunked {
+            h1::write_chunk(io, chunk.as_ref()).await
+        } else {
             let (res, _) = io.write_all(chunk.to_vec()).await;
-            res.map_err(|err| {
-                ProxyRequestBodyError::Other(anyhow!("failed to write proxy body: {err}"))
-            })?;
+            res.map(|_| ()).map_err(h1::HttpError::from)
+        };
+        if let Err(err) = write_res {
+            if let Some(response) = salvage_early_backend_response(conn, &mut interim_seen).await {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "failed to write proxy body: {err}"
+            )));
+        }
+    }
+    if chunked {
+        let io = conn
+            .io_mut()
+            .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
+        if let Err(err) = h1::write_chunk_end(io).await {
+            if let Some(response) = salvage_early_backend_response(conn, &mut interim_seen).await {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            return Err(ProxyRequestBodyError::Other(anyhow!(
+                "failed to write proxy body end: {err}"
+            )));
         }
     }
     let io = conn
         .io_mut()
         .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
     let _ = io.flush().await;
-    Ok(())
+    Ok(ForwardRequestBodyOutcome::Completed)
 }
 
 async fn drain_proxy_payload<IO>(conn: &mut h1::H1Connection<IO>, body: &mut h1::Body) -> Result<()>
