@@ -64,16 +64,32 @@ zs_u64 entry(void) {
                         await resp.body?.cancel();
                     }
 
-                    // 3rd request with key "abc" should be rate limited
-                    const resp3 = await fetch(`${baseUrl}/`, {
-                        headers: { "X-API-Key": "abc" },
-                    });
-                    assertEquals(
-                        resp3.status,
-                        429,
-                        "3rd request with key abc should be rate limited",
+                    // Subsequent requests with key "abc" should hit the
+                    // per-second limit. The limiter uses fixed wall-clock
+                    // second windows, so a rollover between requests can let
+                    // extra requests through; keep requesting until the 429
+                    // shows up. Rollovers happen at most once per second while
+                    // this loop runs in milliseconds, so it converges fast.
+                    let sawRateLimit = false;
+                    for (let i = 0; i < 8; i++) {
+                        const resp = await fetch(`${baseUrl}/`, {
+                            headers: { "X-API-Key": "abc" },
+                        });
+                        await resp.body?.cancel();
+                        if (resp.status === 429) {
+                            sawRateLimit = true;
+                            break;
+                        }
+                        assertEquals(
+                            resp.status,
+                            200,
+                            `Request ${i + 3} with key abc should be 200 or 429`,
+                        );
+                    }
+                    assert(
+                        sawRateLimit,
+                        "requests with key abc should eventually be rate limited",
                     );
-                    await resp3.body?.cancel();
 
                     // Request with different key "xyz" should still succeed
                     const respX = await fetch(`${baseUrl}/`, {
