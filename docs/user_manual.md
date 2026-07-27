@@ -1183,6 +1183,11 @@ Zeroserve will:
 - Generated Caddy reverse-proxy middleware preserves `TE: trailers` on upstream
   requests while stripping other hop-by-hop headers, matching Caddy's proxy
   request preparation.
+- Handle `Expect: 100-continue` at the proxy: clients that withhold the request
+  body until acknowledged (for example large `git push` uploads) receive an
+  interim `100 Continue` from zeroserve, the `Expect` header is not forwarded
+  upstream, and any interim 1xx responses a backend emits before its final
+  response are skipped rather than relayed as the final response.
 - Populate `http.reverse_proxy.status_code`, `http.reverse_proxy.status_text`,
   `http.reverse_proxy.header.*`, `http.reverse_proxy.upstream.latency`, and
   `http.reverse_proxy.upstream.latency_ms` placeholders from upstream response

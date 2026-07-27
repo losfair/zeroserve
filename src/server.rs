@@ -4315,6 +4315,13 @@ async fn reverse_proxy_request(
             }
         };
     }
+    // Clients that sent `Expect: 100-continue` (git, curl, ...) may withhold
+    // the request body until it is acknowledged (RFC 9110 §10.1.1). The proxy
+    // owns that handshake: `Expect` is stripped from the forwarded request,
+    // so the acknowledgement must come from here.
+    let client_expects_continue = send_request_body
+        && !matches!(body.hint(), StreamHint::None)
+        && h1::header_contains_token(&head.headers, ::http::header::EXPECT, "100-continue");
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
     caddy::prepare_reverse_proxy_request_headers_h1(
         &mut headers,
@@ -4357,6 +4364,12 @@ async fn reverse_proxy_request(
             }
         },
     };
+
+    if client_expects_continue {
+        let (res, _) = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()).await;
+        res.map_err(|err| anyhow!("failed to send interim 100 response: {err}"))?;
+        let _ = w.flush().await;
+    }
 
     let outcome = match &mut conn {
         PooledConnection::Http(codec) => {
@@ -4499,7 +4512,7 @@ where
         .await;
     res.map_err(|err| anyhow!("failed to send proxy request head: {err}"))?;
 
-    let response = match conn.next_response_fast().await {
+    let response = match conn.next_final_response_fast().await {
         Ok(Some(h1::ResponseRead::RawFixed(raw))) => {
             let status = raw.status;
             let can_reuse = raw.can_reuse;
@@ -4654,6 +4667,7 @@ fn is_simple_proxy_skip_request_header(name: &str, caddy_default_forwarded: bool
         || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("expect")
         || name.eq_ignore_ascii_case("content-length")
         || (caddy_default_forwarded
             && (name.eq_ignore_ascii_case("x-forwarded-for")
@@ -4727,6 +4741,19 @@ async fn reverse_proxy_request_h2(
     }
 
     let has_body = send_request_body && !body.is_end_stream();
+    // Clients that sent `Expect: 100-continue` (git, curl, ...) may withhold
+    // the request body until it is acknowledged (RFC 9110 §10.1.1). The proxy
+    // owns that handshake: `Expect` is stripped from the forwarded request,
+    // so acknowledge with an interim response before pulling the body. A
+    // send failure here surfaces on the next stream operation.
+    if has_body
+        && h1::header_contains_token(&head.headers, ::http::header::EXPECT, "100-continue")
+        && let Ok(interim) = ::http::Response::builder()
+            .status(StatusCode::CONTINUE)
+            .body(())
+    {
+        let _ = respond.send_informational(interim);
+    }
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
     let chunked = caddy::prepare_reverse_proxy_request_headers_h2(
         &mut headers,
@@ -4946,7 +4973,7 @@ where
         head_only,
         encode,
     ) {
-        match conn.next_response_fast().await {
+        match conn.next_final_response_fast().await {
             Ok(Some(h1::ResponseRead::RawFixed(raw))) => {
                 let status = raw.status;
                 let can_reuse = raw.can_reuse;
@@ -4970,7 +4997,7 @@ where
             Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
         }
     } else {
-        match conn.next_response().await {
+        match conn.next_final_response().await {
             Ok(Some(resp)) => resp,
             Ok(None) => return Err(anyhow!("proxy backend closed without response")),
             Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
@@ -5199,7 +5226,7 @@ where
         }
     }
 
-    let response = match conn.next_response().await {
+    let response = match conn.next_final_response().await {
         Ok(Some(resp)) => resp,
         Ok(None) => return Err(anyhow!("proxy backend closed without response")),
         Err(err) => return Err(anyhow!("failed to read proxy response: {err}")),
@@ -6066,6 +6093,11 @@ fn strip_hop_headers_inner(
         "trailer",
         "transfer-encoding",
         "upgrade",
+        // The proxy owns the `Expect: 100-continue` handshake with the
+        // client: forwarding it would make the backend emit an interim
+        // `100 Continue` of its own, which must never be mistaken for the
+        // final response.
+        "expect",
     ] {
         if keep_upgrade && (name == "connection" || name == "upgrade") {
             continue;
@@ -6549,6 +6581,7 @@ mod tests {
             "Trailer",
             "Transfer-Encoding",
             "Upgrade",
+            "Expect",
         ] {
             headers.insert(
                 ::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -6569,6 +6602,7 @@ mod tests {
             "trailer",
             "transfer-encoding",
             "upgrade",
+            "expect",
         ] {
             assert!(!headers.contains_key(name), "{name} should be stripped");
         }

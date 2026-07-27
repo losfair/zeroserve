@@ -12,6 +12,7 @@ use ::http::{
 const READ_BUF_SIZE: usize = 8 * 1024;
 const MAX_HEADER_SIZE: usize = 64 * 1024;
 const MAX_LINE_SIZE: usize = 8 * 1024;
+const MAX_INTERIM_RESPONSES: usize = 16;
 
 #[derive(Debug)]
 pub enum HttpError {
@@ -726,12 +727,56 @@ impl<IO: AsyncReadRent> H1Connection<IO> {
             Err(err) => Err(err),
         }
     }
+
+    /// Read the next *final* response, skipping interim 1xx responses such as
+    /// the `100 Continue` a backend sends before consuming the request body,
+    /// or `103 Early Hints`. `101 Switching Protocols` is returned as-is: it
+    /// hands the connection over to another protocol. Interim responses carry
+    /// no body, so there is nothing to drain between reads.
+    pub async fn next_final_response(&mut self) -> Result<Option<Response>, HttpError> {
+        for _ in 0..MAX_INTERIM_RESPONSES {
+            let response = match self.next_response().await? {
+                Some(response) => response,
+                None => return Ok(None),
+            };
+            if is_interim_response_status(response.head.status) {
+                continue;
+            }
+            return Ok(Some(response));
+        }
+        Err(HttpError::InvalidResponse("too many interim responses"))
+    }
+
+    /// [`Self::next_response_fast`], skipping interim 1xx responses the same
+    /// way [`Self::next_final_response`] does.
+    pub async fn next_final_response_fast(&mut self) -> Result<Option<ResponseRead>, HttpError> {
+        for _ in 0..MAX_INTERIM_RESPONSES {
+            let response = match self.next_response_fast().await? {
+                Some(response) => response,
+                None => return Ok(None),
+            };
+            if let ResponseRead::Parsed(parsed) = &response
+                && is_interim_response_status(parsed.head.status)
+            {
+                continue;
+            }
+            return Ok(Some(response));
+        }
+        Err(HttpError::InvalidResponse("too many interim responses"))
+    }
+}
+
+fn is_interim_response_status(status: StatusCode) -> bool {
+    status.is_informational() && status != StatusCode::SWITCHING_PROTOCOLS
 }
 
 fn raw_fixed_response(raw: &[u8]) -> Result<Option<RawFixedResponse>, HttpError> {
-    let Some(line_end) = raw.windows(2).position(|x| x == b"\r\n") else {
-        return Err(HttpError::InvalidResponse("missing status line"));
-    };
+    // A head without any header lines (e.g. `HTTP/1.1 100 Continue\r\n\r\n`)
+    // arrives here with no CRLF at all: the whole head is the status line.
+    let line_end = raw
+        .windows(2)
+        .position(|x| x == b"\r\n")
+        .unwrap_or(raw.len());
     let status_line = &raw[..line_end];
     let mut parts = status_line.split(|b| *b == b' ');
     let version = parts
@@ -1340,6 +1385,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn raw_fixed_response_accepts_headerless_head() {
+        // `read_headers` strips the terminating double CRLF, so an interim
+        // response with no header lines (`HTTP/1.1 100 Continue\r\n\r\n`)
+        // arrives as a bare status line. It must parse (and fall through to
+        // the non-raw path) instead of erroring out.
+        let result = raw_fixed_response(b"HTTP/1.1 100 Continue").unwrap();
+        assert!(result.is_none());
+
+        let head = parse_response_head(b"HTTP/1.1 100 Continue").unwrap();
+        assert_eq!(head.status, StatusCode::CONTINUE);
+        assert!(matches!(response_body_from_headers(&head), Body::None));
+    }
+
+    #[test]
+    fn interim_response_statuses_exclude_switching_protocols() {
+        assert!(is_interim_response_status(StatusCode::CONTINUE));
+        assert!(is_interim_response_status(
+            StatusCode::from_u16(103).unwrap()
+        ));
+        assert!(!is_interim_response_status(StatusCode::SWITCHING_PROTOCOLS));
+        assert!(!is_interim_response_status(StatusCode::OK));
     }
 
     #[test]
