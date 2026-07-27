@@ -211,6 +211,7 @@ async function h1ExpectContinueUpload(
             buf += decoder.decode(chunk.subarray(0, n), { stream: true });
             return true;
         };
+        let lastHead = "";
         const readResponseHead = async (): Promise<number> => {
             while (!buf.includes("\r\n\r\n")) {
                 if (!(await readChunk())) {
@@ -218,9 +219,9 @@ async function h1ExpectContinueUpload(
                 }
             }
             const headEnd = buf.indexOf("\r\n\r\n");
-            const head = buf.slice(0, headEnd);
+            lastHead = buf.slice(0, headEnd);
             buf = buf.slice(headEnd + 4);
-            return Number(head.split("\r\n")[0].split(" ")[1]);
+            return Number(lastHead.split("\r\n")[0].split(" ")[1]);
         };
 
         // The proxy must acknowledge the expectation before we send the body.
@@ -253,11 +254,14 @@ async function h1ExpectContinueUpload(
         while (status >= 100 && status < 200) {
             status = await readResponseHead();
         }
-        // Body: assume content-length JSON from the backend, proxied through.
-        while (buf.length === 0) {
+        // Read the full content-length body (ASCII JSON, so byte length
+        // equals string length); a single read may return a partial body.
+        const lenMatch = lastHead.match(/content-length:\s*(\d+)/i);
+        const bodyLen = lenMatch ? Number(lenMatch[1]) : 0;
+        while (buf.length < bodyLen) {
             if (!(await readChunk())) break;
         }
-        return { interimStatuses, status, body: buf };
+        return { interimStatuses, status, body: buf.slice(0, bodyLen) };
     } finally {
         try {
             conn.close();

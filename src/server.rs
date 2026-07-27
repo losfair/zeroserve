@@ -1214,6 +1214,25 @@ async fn handle_request<R: AsyncReadRent + 'static>(
                 }
             };
         }
+        // Acknowledge `Expect: 100-continue` before proxying so the client
+        // starts its upload; the proxy owns that handshake and `Expect` is
+        // stripped from the forwarded request. Written outside the tracked
+        // writer's "response started" accounting: after only an interim
+        // response, a proxy failure can still be answered with a normal
+        // error response. Skipped when the declared body length already
+        // exceeds the configured limit - the client gets the 413 instead of
+        // an invitation to upload.
+        if h1_client_expects_continue(&head, &body, script_outcome.request.proxy_method())
+            && !request_body_content_length_exceeds(
+                &head.headers,
+                script_outcome.request_body_limit,
+            )
+        {
+            let (res, _) = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()).await;
+            if res.is_ok() {
+                let _ = w.flush().await;
+            }
+        }
         let response_started = Cell::new(false);
         let mut tracked_w = TrackedWriter {
             inner: w,
@@ -4222,6 +4241,23 @@ fn append_script_response_headers(headers: &mut ::http::HeaderMap, extra: &[(Str
     }
 }
 
+/// Whether an h1 client is (or may be) withholding its request body until the
+/// server acknowledges `Expect: 100-continue` (RFC 9110 §10.1.1). Only
+/// HTTP/1.1 clients qualify: 1xx responses must not be sent to an HTTP/1.0
+/// client, which would parse the interim response as the final one.
+fn h1_client_expects_continue(
+    head: &RequestHead,
+    body: &HttpBody,
+    proxy_method: Option<&str>,
+) -> bool {
+    let send_request_body = !matches!(head.method, Method::GET | Method::HEAD)
+        && !matches!(proxy_method, Some("GET" | "HEAD"));
+    send_request_body
+        && head.version == ::http::Version::HTTP_11
+        && !matches!(body.hint(), StreamHint::None)
+        && h1::header_contains_token(&head.headers, ::http::header::EXPECT, "100-continue")
+}
+
 async fn reverse_proxy_request(
     backend_url: &str,
     mut head: RequestHead,
@@ -4268,17 +4304,27 @@ async fn reverse_proxy_request(
         }
     };
     if send_request_body && request_body_content_length_exceeds(&head.headers, request_body_limit) {
-        drain_payload(reader, &mut body).await;
+        // Bounded drain: an `Expect: 100-continue` client may be withholding
+        // the body entirely, and any client may take arbitrarily long to
+        // upload a body that is already known to be rejected.
+        let drained =
+            monoio::time::timeout(CLIENT_BODY_LINGER_DRAIN, drain_payload(reader, &mut body))
+                .await
+                .is_ok();
+        let send = send_fixed(
+            w,
+            payload_too_large(),
+            early_response_headers,
+            metadata,
+            hook_state,
+        )
+        .await;
         return Ok(ProxyOutcome {
             reuse_backend: false,
-            send: send_fixed(
-                w,
-                payload_too_large(),
-                early_response_headers,
-                metadata,
-                hook_state,
-            )
-            .await,
+            send: H1SendOutcome {
+                keep_client: send.keep_client && drained,
+                status: send.status,
+            },
             continue_request: false,
             preserved_body: None,
         });
@@ -4315,13 +4361,6 @@ async fn reverse_proxy_request(
             }
         };
     }
-    // Clients that sent `Expect: 100-continue` (git, curl, ...) may withhold
-    // the request body until it is acknowledged (RFC 9110 §10.1.1). The proxy
-    // owns that handshake: `Expect` is stripped from the forwarded request,
-    // so the acknowledgement must come from here.
-    let client_expects_continue = send_request_body
-        && !matches!(body.hint(), StreamHint::None)
-        && h1::header_contains_token(&head.headers, ::http::header::EXPECT, "100-continue");
     let mut headers = proxy_headers.cloned().unwrap_or(head.headers);
     caddy::prepare_reverse_proxy_request_headers_h1(
         &mut headers,
@@ -4364,12 +4403,6 @@ async fn reverse_proxy_request(
             }
         },
     };
-
-    if client_expects_continue {
-        let (res, _) = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()).await;
-        res.map_err(|err| anyhow!("failed to send interim 100 response: {err}"))?;
-        let _ = w.flush().await;
-    }
 
     // Mid-stream early-response detection needs plaintext sockets: readable
     // TLS bytes are not necessarily application data, so decrypting them
@@ -4972,16 +5005,30 @@ where
                 early_response = Some(response);
             }
             Err(ProxyRequestBodyError::TooLarge) => {
+                // The limit tripped mid-body: the client is still sending.
+                // Briefly drain so keep-alive survives when the tail is
+                // short; otherwise close instead of leaving upload bytes to
+                // be parsed as the next request.
+                let drained = monoio::time::timeout(
+                    CLIENT_BODY_LINGER_DRAIN,
+                    drain_payload(reader, &mut body),
+                )
+                .await
+                .is_ok();
+                let send = send_fixed(
+                    w,
+                    payload_too_large(),
+                    early_response_headers,
+                    metadata,
+                    hook_state,
+                )
+                .await;
                 return Ok(ProxyOutcome {
                     reuse_backend: false,
-                    send: send_fixed(
-                        w,
-                        payload_too_large(),
-                        early_response_headers,
-                        metadata,
-                        hook_state,
-                    )
-                    .await,
+                    send: H1SendOutcome {
+                        keep_client: send.keep_client && drained,
+                        status: send.status,
+                    },
                     continue_request: false,
                     preserved_body: None,
                 });
@@ -5123,11 +5170,26 @@ where
             preserved_body: if send_request_body { None } else { Some(body) },
         });
     }
-    if !send_request_body || !request_body_fully_sent {
-        // Either the body was never destined for the backend, or the backend
-        // responded early and forwarding was aborted: consume what the client
-        // is still sending so the response goes out on a clean connection.
+    let mut client_reusable = true;
+    if !send_request_body {
         drain_payload(reader, &mut body).await;
+    } else if !request_body_fully_sent {
+        // The backend responded early and forwarding was aborted. Drain what
+        // the client is still sending, but only briefly: delivering the
+        // response must not wait behind an unbounded (possibly endless)
+        // upload. A client still sending at the deadline gets the response
+        // with `Connection: close` and the connection is not reused.
+        let drained =
+            monoio::time::timeout(CLIENT_BODY_LINGER_DRAIN, drain_payload(reader, &mut body))
+                .await
+                .is_ok();
+        if !drained {
+            client_reusable = false;
+            headers.insert(
+                ::http::header::CONNECTION,
+                ::http::HeaderValue::from_static("close"),
+            );
+        }
     }
     let send_body = should_send_proxy_body_raw(raw_status, body_hint, head_only);
     if send_body {
@@ -5156,7 +5218,7 @@ where
                 return Ok(ProxyOutcome {
                     reuse_backend: can_reuse,
                     send: H1SendOutcome {
-                        keep_client: true,
+                        keep_client: client_reusable,
                         status: raw_status,
                     },
                     continue_request: false,
@@ -5177,7 +5239,7 @@ where
         return Ok(ProxyOutcome {
             reuse_backend: can_reuse,
             send: H1SendOutcome {
-                keep_client: true,
+                keep_client: client_reusable,
                 status: raw_status,
             },
             continue_request: false,
@@ -5195,7 +5257,7 @@ where
         return Ok(ProxyOutcome {
             reuse_backend: can_reuse,
             send: H1SendOutcome {
-                keep_client: true,
+                keep_client: client_reusable,
                 status: raw_status,
             },
             continue_request: false,
@@ -5208,7 +5270,7 @@ where
     Ok(ProxyOutcome {
         reuse_backend: can_reuse,
         send: H1SendOutcome {
-            keep_client: true,
+            keep_client: client_reusable,
             status: raw_status,
         },
         continue_request: false,
@@ -5556,6 +5618,14 @@ enum ForwardRequestBodyOutcome {
 }
 
 const MAX_EARLY_INTERIM_RESPONSES: usize = 16;
+
+/// How long to keep draining an h1 client's remaining request body after the
+/// exchange's outcome is already decided (early backend response, body over
+/// limit). A client that finishes within the window keeps a clean, reusable
+/// connection; one still sending at the deadline gets the response with
+/// `Connection: close` instead of having it delayed behind an unbounded
+/// (possibly endless) drain.
+const CLIENT_BODY_LINGER_DRAIN: Duration = Duration::from_secs(2);
 
 /// Whether a read on the socket would complete immediately (data, EOF, or a
 /// pending error). Zero-timeout poll, same technique as the pool's idle check.

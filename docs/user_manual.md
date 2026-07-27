@@ -1194,7 +1194,10 @@ Zeroserve will:
   instead of failing the request, and does not return the half-used backend
   connection to the keep-alive pool. For plaintext backends the response is
   detected while the upload is still streaming; for TLS backends it is
-  recovered when the aborted upload surfaces as a write error.
+  recovered when the aborted upload surfaces as a write error. An HTTP/1.1
+  client that finishes its upload within a short lingering window keeps its
+  connection; one still uploading at the deadline gets the response with
+  `Connection: close`.
 - Populate `http.reverse_proxy.status_code`, `http.reverse_proxy.status_text`,
   `http.reverse_proxy.header.*`, `http.reverse_proxy.upstream.latency`, and
   `http.reverse_proxy.upstream.latency_ms` placeholders from upstream response
