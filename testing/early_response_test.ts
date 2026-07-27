@@ -6,6 +6,14 @@ import { Buffer } from "node:buffer";
 
 const canRunScripts = await hasBpfToolchain();
 
+/** Deno.Conn.write may write partially; loop until the whole buffer is out. */
+async function writeAll(conn: Deno.Conn, data: Uint8Array): Promise<void> {
+    let offset = 0;
+    while (offset < data.length) {
+        offset += await conn.write(data.subarray(offset));
+    }
+}
+
 /**
  * Raw h1 backend that rejects uploads mid-stream: it reads the request head
  * plus a small prefix of the body, sends a final 413 response, and then keeps
@@ -63,7 +71,7 @@ async function handleConn(conn: Deno.Conn, rejectAfterBytes: number) {
         }
 
         const body = JSON.stringify({ error: "upload too large" });
-        await conn.write(
+        await writeAll(conn,
             encoder.encode(
                 `HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body}`,
             ),
@@ -205,7 +213,7 @@ async function h1ChunkedUpload(
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     try {
-        await conn.write(
+        await writeAll(conn,
             encoder.encode(
                 `POST ${path} HTTP/1.1\r\nhost: ${hostname}:${port}\r\ntransfer-encoding: chunked\r\n\r\n`,
             ),
@@ -213,11 +221,11 @@ async function h1ChunkedUpload(
         const chunk = new Uint8Array(chunkSize).fill(0x61);
         const framing = encoder.encode(`${chunkSize.toString(16)}\r\n`);
         for (let i = 0; i < chunkCount; i++) {
-            await conn.write(framing);
-            await conn.write(chunk);
-            await conn.write(encoder.encode("\r\n"));
+            await writeAll(conn, framing);
+            await writeAll(conn, chunk);
+            await writeAll(conn, encoder.encode("\r\n"));
         }
-        await conn.write(encoder.encode("0\r\n\r\n"));
+        await writeAll(conn, encoder.encode("0\r\n\r\n"));
 
         let buf = "";
         while (!buf.includes("\r\n\r\n")) {

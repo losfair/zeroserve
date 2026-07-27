@@ -6,6 +6,14 @@ import { Buffer } from "node:buffer";
 
 const canRunScripts = await hasBpfToolchain();
 
+/** Deno.Conn.write may write partially; loop until the whole buffer is out. */
+async function writeAll(conn: Deno.Conn, data: Uint8Array): Promise<void> {
+    let offset = 0;
+    while (offset < data.length) {
+        offset += await conn.write(data.subarray(offset));
+    }
+}
+
 interface InterimBackendResult {
     sawExpect: boolean;
     totalBytes: number;
@@ -88,7 +96,7 @@ async function handleBackendConn(conn: Deno.Conn): Promise<void> {
 
             // Interim responses before consuming the body, like a backend
             // honoring `Expect: 100-continue` (plus an unsolicited 103).
-            await conn.write(
+            await writeAll(conn,
                 encoder.encode(
                     "HTTP/1.1 103 Early Hints\r\nlink: </style.css>; rel=preload\r\n\r\n" +
                         "HTTP/1.1 100 Continue\r\n\r\n",
@@ -137,7 +145,7 @@ async function handleBackendConn(conn: Deno.Conn): Promise<void> {
             const body = JSON.stringify(
                 { sawExpect, totalBytes } satisfies InterimBackendResult,
             );
-            await conn.write(
+            await writeAll(conn,
                 encoder.encode(
                     `HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body}`,
                 ),
@@ -188,7 +196,7 @@ async function h1ExpectContinueUpload(
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     try {
-        await conn.write(
+        await writeAll(conn,
             encoder.encode(
                 `POST ${path} HTTP/1.1\r\nhost: ${hostname}:${port}\r\n` +
                     "expect: 100-continue\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -233,12 +241,12 @@ async function h1ExpectContinueUpload(
         let remaining = bodySize;
         while (remaining > 0) {
             const take = Math.min(remaining, chunk.length);
-            await conn.write(encoder.encode(`${take.toString(16)}\r\n`));
-            await conn.write(chunk.subarray(0, take));
-            await conn.write(encoder.encode("\r\n"));
+            await writeAll(conn, encoder.encode(`${take.toString(16)}\r\n`));
+            await writeAll(conn, chunk.subarray(0, take));
+            await writeAll(conn, encoder.encode("\r\n"));
             remaining -= take;
         }
-        await conn.write(encoder.encode("0\r\n\r\n"));
+        await writeAll(conn, encoder.encode("0\r\n\r\n"));
 
         // Final response (skip any further interim responses).
         status = await readResponseHead();
