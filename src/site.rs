@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use nix::sys::memfd::{MFdFlags, memfd_create};
 use tar::{Archive, EntryType};
 
 use crate::bpf_compiler::EbpfCompiler;
@@ -271,15 +270,31 @@ fn script_object_tarball(file_name: &OsStr, object: &[u8]) -> Result<Vec<u8>> {
 /// Build a fresh in-memory file seeded with `bytes`, for use as a tarball
 /// backing file. The returned file is seekable and supports positional reads.
 pub fn memfd_from_bytes(name: &str, bytes: &[u8]) -> Result<StdFile> {
-    let cname = std::ffi::CString::new(name).expect("memfd name has no interior NUL");
-    let fd = memfd_create(cname.as_c_str(), MFdFlags::MFD_CLOEXEC)
-        .with_context(|| format!("memfd_create({name}) failed"))?;
-    let mut file = StdFile::from(fd);
-    file.write_all(bytes)
-        .context("failed to write bytes into memfd")?;
-    file.seek(SeekFrom::Start(0))
-        .context("failed to rewind memfd")?;
-    Ok(file)
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::memfd::{MFdFlags, memfd_create};
+        let cname = std::ffi::CString::new(name).expect("memfd name has no interior NUL");
+        let fd = memfd_create(cname.as_c_str(), MFdFlags::MFD_CLOEXEC)
+            .with_context(|| format!("memfd_create({name}) failed"))?;
+        let mut file = StdFile::from(fd);
+        file.write_all(bytes)
+            .context("failed to write bytes into memfd")?;
+        file.seek(SeekFrom::Start(0))
+            .context("failed to rewind memfd")?;
+        Ok(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Portable fallback: anonymous temp file (unlinked) seeded with the
+        // payload. Positional reads work the same as Linux memfd.
+        let _ = name;
+        let mut file = tempfile::tempfile().context("failed to create anonymous temp file")?;
+        file.write_all(bytes)
+            .context("failed to write bytes into anonymous temp file")?;
+        file.seek(SeekFrom::Start(0))
+            .context("failed to rewind anonymous temp file")?;
+        Ok(file)
+    }
 }
 
 #[derive(Clone)]

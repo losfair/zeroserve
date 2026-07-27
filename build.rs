@@ -96,13 +96,16 @@ fn link_tinycc() {
         println!("cargo:rerun-if-changed={}", tinycc_dir.join(file).display());
     }
 
-    let status = Command::new("make")
+    // TinyCC's Makefile is GNU-make specific; prefer gmake on BSD where
+    // plain `make` is BSD make.
+    let make = find_gnu_make();
+    let status = Command::new(&make)
         .current_dir(&tinycc_dir)
         .env("CC", &toolchain.target_cc)
         .env("AR", &toolchain.target_ar)
         .args(["bpf-tcc", "ONE_SOURCE=no"])
         .status()
-        .unwrap_or_else(|err| panic!("failed to run make in {}: {err}", tinycc_dir.display()));
+        .unwrap_or_else(|err| panic!("failed to run {} in {}: {err}", make, tinycc_dir.display()));
     if !status.success() {
         panic!("failed to build BPF tinycc in {}", tinycc_dir.display());
     }
@@ -115,11 +118,30 @@ fn link_tinycc() {
     emit_tinycc_link_directives(&out_dir);
 }
 
+fn find_gnu_make() -> String {
+    // Prefer gmake (common on BSD/macOS ports) so we don't accidentally invoke
+    // BSD make against a GNU Makefile.
+    for candidate in ["gmake", "make"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GNU Make"))
+            .unwrap_or(false)
+        {
+            return candidate.to_string();
+        }
+    }
+    panic!("GNU make (gmake) is required to build the bundled BPF tinycc");
+}
+
 fn emit_tinycc_link_directives(out_dir: &Path) {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=zeroserve_tinycc_bpf");
     println!("cargo:rustc-link-lib=m");
-    println!("cargo:rustc-link-lib=dl");
+    // libdl is part of libc on BSD/macOS.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=dl");
+    }
     println!("cargo:rustc-link-lib=pthread");
 }
 

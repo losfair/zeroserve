@@ -14,17 +14,19 @@ lalrpop = "0.23"
 lalrpop-util = "0.23"
 arc-swap = "1"
 chrono = "0.4"
-async-ebpf = "0.4.0-alpha.5"
+# OpenBSD-capable async-ebpf (coroutine JIT + libclang discovery).
+async-ebpf = "0.4.0-alpha.6"
 base64ct = { version = "1", features = ["alloc"] }
 dashmap = "6"
 blake3 = "1"
 bytes = "1"
-caps = "0.5"
 faster-hex = "0.10"
 futures = "0.3"
 h2 = "0.4"
-monoio = { version = "0.2", default-features = false, features = ["async-cancel", "bytes", "iouring", "poll-io", "utils", "sync", "macros", "mkdirat", "unlinkat", "renameat"] }
-monoio-compat = "0.2"
+# Base monoio features used on all platforms (legacy/kqueue on BSD).
+# Fork adds OpenBSD support for the legacy driver.
+monoio = { git = "https://github.com/losfair/monoio", rev = "c17852f233275d6849580f7630f09eda68e33973", default-features = false, features = ["async-cancel", "bytes", "legacy", "poll-io", "utils", "sync", "macros", "mkdirat", "unlinkat", "renameat"] }
+monoio-compat = { git = "https://github.com/losfair/monoio", rev = "c17852f233275d6849580f7630f09eda68e33973" }
 boring = "5"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -33,10 +35,9 @@ bcrypt = "0.19.1"
 hmac = "0.12"
 http = "1"
 idna = "1"
-io-uring = "0.6"
 libc = "0.2"
 mini-moka = { version = "0.10", default-features = false }
-nix = { version = "0.30", features = ["mount", "event", "fs"] }
+nix = { version = "0.30", features = ["event", "fs"] }
 parking_lot = "0.12"
 rand = "0.8"
 rayon = "1.11"
@@ -56,6 +57,11 @@ chacha20poly1305 = "0.10"
 serde_vici = "0.1.5"
 flate2 = "1.1.9"
 zstd = "0.13.3"
+tempfile = "3"
 
-[patch.crates-io]
-monoio = { git = "https://github.com/bytedance/monoio", rev = "212fde187f3d41f65ecd35b9cac80f7e246bb58e" }
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5"
+io-uring = "0.6"
+# Unioned with the base monoio dependency so Linux also gets io_uring.
+monoio = { git = "https://github.com/losfair/monoio", rev = "c17852f233275d6849580f7630f09eda68e33973", default-features = false, features = ["iouring"] }
+nix = { version = "0.30", features = ["mount", "event", "fs"] }

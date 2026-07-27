@@ -19,6 +19,7 @@ mod pack;
 mod pool;
 mod ratelimit;
 mod reload;
+mod rt;
 mod script;
 mod script_compile;
 mod server;
@@ -39,8 +40,6 @@ use crate::cli::ListenAddr;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::channel::mpsc;
-use monoio::{IoUringDriver, RuntimeBuilder};
-use nix::mount::MsFlags;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::reload::SighupBlocked;
@@ -203,40 +202,57 @@ fn main() -> Result<()> {
     }
 
     if !config.disable_ns_isolation {
-        setup_ns_isolation(&config).with_context(
-            || "failed to set up namespace isolation (set --disable-ns-isolation to disable)",
-        )?;
+        #[cfg(target_os = "linux")]
+        {
+            setup_ns_isolation(&config).with_context(
+                || "failed to set up namespace isolation (set --disable-ns-isolation to disable)",
+            )?;
 
-        let resolv_conf = std::fs::read("/etc/resolv.conf").ok();
+            let resolv_conf = std::fs::read("/etc/resolv.conf").ok();
 
-        nix::mount::mount(
-            None::<&str>,
-            "/etc",
-            Some("tmpfs"),
-            MsFlags::empty(),
-            None::<&str>,
-        )
-        .with_context(|| "failed to mount virtual /etc")?;
+            nix::mount::mount(
+                None::<&str>,
+                "/etc",
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            )
+            .with_context(|| "failed to mount virtual /etc")?;
 
-        if let Some(x) = &resolv_conf {
-            std::fs::write("/etc/resolv.conf", x)
-                .with_context(|| "failed to write /etc/resolv.conf in tmpfs")?;
-        }
-
-        drop_all_capabilities().with_context(|| "failed to drop capabilities")?;
-
-        if let Err(err) = rlimit::Resource::NPROC.set(1024, 1024) {
-            eprintln!("failed to restrict nproc: {:?}", err);
-        }
-
-        eprintln!(
-            "isolation: ns_user=y, ns_net={}, ns_mount=y; caps, nproc",
-            if config.enable_netns_isolation {
-                "y"
-            } else {
-                "n"
+            if let Some(x) = &resolv_conf {
+                std::fs::write("/etc/resolv.conf", x)
+                    .with_context(|| "failed to write /etc/resolv.conf in tmpfs")?;
             }
-        );
+
+            drop_all_capabilities().with_context(|| "failed to drop capabilities")?;
+
+            if let Err(err) = rlimit::Resource::NPROC.set(1024, 1024) {
+                eprintln!("failed to restrict nproc: {:?}", err);
+            }
+
+            eprintln!(
+                "isolation: ns_user=y, ns_net={}, ns_mount=y; caps, nproc",
+                if config.enable_netns_isolation {
+                    "y"
+                } else {
+                    "n"
+                }
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if config.enable_netns_isolation {
+                eprintln!(
+                    "warning: network namespace isolation is Linux-only; ignoring --enable-netns-isolation"
+                );
+            }
+            // Namespace/capability isolation is Linux-only, but the process
+            // count cap is portable — keep that much.
+            if let Err(err) = rlimit::Resource::NPROC.set(1024, 1024) {
+                eprintln!("failed to restrict nproc: {:?}", err);
+            }
+            eprintln!("isolation: nproc only (namespaces/caps not supported on this platform)");
+        }
     }
 
     // Block SIGHUP early before spawning any threads
@@ -381,17 +397,8 @@ fn run_worker(
     reload_rx: mpsc::UnboundedReceiver<ReloadRequest>,
     startup_tx: std_mpsc::Sender<(usize, Result<(), String>)>,
 ) -> Result<()> {
-    let mut urb = io_uring::IoUring::builder();
-    urb.setup_single_issuer();
-    if let Some(ms) = config.sqpoll_idle_ms {
-        urb.setup_sqpoll(ms);
-    }
-
-    RuntimeBuilder::<IoUringDriver>::new()
-        .enable_timer()
-        .uring_builder(urb)
-        .build()
-        .expect("zeroserve: failed to build io_uring runtime")
+    crate::rt::build_runtime(config.sqpoll_idle_ms)
+        .expect("zeroserve: failed to build monoio runtime")
         .block_on(async move {
             // SAFETY: GlobalEnv::new() is idempotent (Once-guarded) and
             // init_thread() sets up this thread's preemption watcher; both are
@@ -496,6 +503,7 @@ fn load_plugin_sites(config: &StaticConfig) -> Result<Vec<Arc<Site>>> {
     Ok(sites)
 }
 
+#[cfg(target_os = "linux")]
 fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
     unsafe {
         let uid = libc::getuid();
@@ -564,6 +572,7 @@ fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<Vec<TcpLis
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn drop_all_capabilities() -> Result<(), caps::errors::CapsError> {
     use caps::CapSet;
 
@@ -576,5 +585,10 @@ pub fn drop_all_capabilities() -> Result<(), caps::errors::CapsError> {
     caps::clear(None, CapSet::Permitted)?;
     caps::clear(None, CapSet::Effective)?;
 
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn drop_all_capabilities() -> Result<()> {
     Ok(())
 }

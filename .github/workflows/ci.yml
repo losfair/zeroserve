@@ -120,6 +120,140 @@ jobs:
         run: deno test -A --parallel
 
   # ---------------------------------------------------------------------------
+  # OpenBSD amd64: build, unit tests, and the Deno e2e suite inside a
+  # KVM-accelerated VM (GitHub has no native OpenBSD runners). Exercises the
+  # non-Linux port surface: monoio legacy/kqueue driver, hupwatch kqueue
+  # thread, EVFILT_SIGNAL reload path, tempfile-backed site loading.
+  # Package availability verified against the 7.9 amd64 package index.
+  # ---------------------------------------------------------------------------
+  test-openbsd:
+    name: Unit + e2e tests (OpenBSD amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # Cross-compile the pinned Caddy + Pebble (pure Go) for OpenBSD on the
+      # host and ship the binaries into the VM with the workspace rsync.
+      # Building them inside the VM needs ~2 GB of Go module/build cache in
+      # /root, which overflows the VM's small root partition. Same pins as the
+      # Linux job: behavioral comparisons must not drift.
+      - name: Cross-compile pinned Caddy + Pebble for OpenBSD
+        env:
+          CADDY_COMMIT: d3986f824d2e82310405d5ca520d61f3e2e701c9
+          PEBBLE_VERSION: v2.10.1
+          GOOS: openbsd
+          GOARCH: amd64
+        run: |
+          go install "github.com/caddyserver/caddy/v2/cmd/caddy@${CADDY_COMMIT}"
+          go install "github.com/letsencrypt/pebble/v2/cmd/pebble@${PEBBLE_VERSION}"
+          go install "github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@${PEBBLE_VERSION}"
+          mkdir -p .obsd-tools
+          cp "$(go env GOPATH)/bin/openbsd_amd64/"* .obsd-tools/
+          chmod +x .obsd-tools/*
+
+      - name: Build and test in OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.9"
+          arch: x86_64
+          usesh: true
+          mem: 8192
+          # rsync the workspace in; nothing needs syncing back (no artifacts).
+          sync: rsync
+          copyback: false
+          # rust (1.94.1): the crate itself. gmake: build.rs builds the bundled
+          #   BPF tinycc with GNU make. cmake: boring-sys builds BoringSSL.
+          #   llvm%19: clang/llc for the clang eBPF compiler mode plus
+          #   libclang.so for bindgen (base-system clang ships neither llc nor
+          #   libclang). deno + node: the e2e suite. git: boring-sys runs
+          #   `git init` while assembling its BoringSSL source tree. unzip--
+          #   (default flavor): build.rs extracts the tinycc archive with it.
+          #   openssl%3.5: the ACME tests use `openssl x509 -copy_extensions`,
+          #   which base LibreSSL does not support.
+          #
+          # The e2e suite must NOT run as root: permission-denial tests chmod
+          # directories to 0o000 and expect 403s, and root bypasses file
+          # permissions entirely. Give the builder user a login class with
+          # enough fds and address space for the server under test.
+          prepare: |
+            pkg_add -I rust gmake cmake llvm%19 deno node git unzip-- openssl%3.5
+            cat >> /etc/login.conf <<'EOF'
+            builder:\
+                :datasize=infinity:\
+                :maxproc-max=1024:\
+                :maxproc-cur=1024:\
+                :openfiles-max=16384:\
+                :openfiles-cur=16384:\
+                :tc=default:
+            EOF
+            useradd -m -L builder -s /bin/ksh builder
+            # The ACME tests invoke `openssl`; expose the ports OpenSSL 3 (its
+            # binary is installed under an eopenssl* name) ahead of base
+            # LibreSSL on PATH.
+            mkdir -p /home/tools
+            for c in eopenssl35 eopenssl; do
+              if [ -x "/usr/local/bin/$c" ]; then
+                ln -sf "/usr/local/bin/$c" /home/tools/openssl
+                break
+              fi
+            done
+            test -x /home/tools/openssl
+          run: |
+            set -e
+            df -h
+            export CARGO_TERM_COLOR=always
+            # The llvm package installs under a versioned prefix
+            # (/usr/local/llvm19/{bin,lib}); put clang/llc on PATH and point
+            # bindgen's clang-sys at libclang.so explicitly.
+            export PATH="/usr/local/llvm19/bin:$PATH"
+            export LIBCLANG_PATH=/usr/local/llvm19/lib
+            # Keep the big caches off the small /root partition: the synced
+            # workspace (and thus the cargo target dir) lives under /home,
+            # which holds the bulk of the disk — put the cargo registry and
+            # deno cache there too.
+            export CARGO_HOME=/home/cargo
+            export DENO_DIR=/home/deno-cache
+            # rustc needs more address space than some default login classes
+            # allow; lift the soft limit to the hard limit.
+            ulimit -d "$(ulimit -Hd)" || true
+
+            WS="$(pwd)"
+
+            cargo build --release --locked
+            cargo test --locked
+
+            # Run the e2e suite as the unprivileged builder user (root would
+            # defeat the permission-denial tests). V8's JIT pages violate
+            # OpenBSD's W^X; deno must run jitless.
+            cat > /tmp/e2e.sh <<EOF
+            set -e
+            export PATH="/home/tools:/usr/local/llvm19/bin:\$PATH"
+            # clang/llc in the versioned llvm prefix need their shared libs
+            # (libclang-cpp, libLLVM) which live outside the default ld.so
+            # search path.
+            export LD_LIBRARY_PATH=/usr/local/llvm19/lib
+            export DENO_DIR=/home/deno-cache
+            export DENO_V8_FLAGS=--jitless
+            export CADDY_BIN="$WS/.obsd-tools/caddy"
+            export PEBBLE_BIN="$WS/.obsd-tools/pebble"
+            export PEBBLE_CHALLTESTSRV_BIN="$WS/.obsd-tools/pebble-challtestsrv"
+            cd "$WS/testing"
+            ZEROSERVE_EBPF_COMPILER=tcc deno test -A --parallel
+            ZEROSERVE_EBPF_COMPILER=clang deno test -A --parallel
+            EOF
+            mkdir -p /home/deno-cache
+            chown -R builder "$WS" /home/deno-cache /tmp/e2e.sh
+            # OpenBSD su: -c selects a login CLASS, not a command; passing the
+            # script path as a shell argument runs it under builder's ksh.
+            su builder /tmp/e2e.sh
+            df -h
+
+  # ---------------------------------------------------------------------------
   # Small routing benchmark matrix used as a performance smoke test. This keeps
   # runtime bounded while covering the optimized N=8 / 2-thread / 10ms
   # preemption shape across servers, compilers, protocols, and proxy mode.
