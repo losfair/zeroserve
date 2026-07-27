@@ -1183,6 +1183,21 @@ Zeroserve will:
 - Generated Caddy reverse-proxy middleware preserves `TE: trailers` on upstream
   requests while stripping other hop-by-hop headers, matching Caddy's proxy
   request preparation.
+- Handle `Expect: 100-continue` at the proxy: clients that withhold the request
+  body until acknowledged (for example large `git push` uploads) receive an
+  interim `100 Continue` from zeroserve, the `Expect` header is not forwarded
+  upstream, and any interim 1xx responses a backend emits before its final
+  response are skipped rather than relayed as the final response.
+- Relay early final responses: if a backend answers before consuming the whole
+  request body (for example an upload rejected by a size limit, per
+  RFC 9110 §9.5), zeroserve stops forwarding the body and relays that response
+  instead of failing the request, and does not return the half-used backend
+  connection to the keep-alive pool. For plaintext backends the response is
+  detected while the upload is still streaming; for TLS backends it is
+  recovered when the aborted upload surfaces as a write error. An HTTP/1.1
+  client that finishes its upload within a short lingering window keeps its
+  connection; one still uploading at the deadline gets the response with
+  `Connection: close`.
 - Populate `http.reverse_proxy.status_code`, `http.reverse_proxy.status_text`,
   `http.reverse_proxy.header.*`, `http.reverse_proxy.upstream.latency`, and
   `http.reverse_proxy.upstream.latency_ms` placeholders from upstream response
