@@ -8,6 +8,7 @@ mod caddyfile;
 mod cli;
 mod config;
 mod ech;
+mod file_io;
 mod helpers;
 mod http;
 mod hupwatch;

@@ -8,14 +8,12 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
-use monoio::{
-    fs::File,
-    io::{AsyncWriteRent, AsyncWriteRentExt},
-};
+use monoio::io::{AsyncWriteRent, AsyncWriteRentExt};
 
 use crate::{
     acme::AcmeRuntime,
     config::StaticConfig,
+    file_io::File,
     logging::FileLogSender,
     site::{Site, TarEntry},
     tls::TlsRuntime,

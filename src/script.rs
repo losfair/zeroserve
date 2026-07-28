@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::file_io::File;
 use ::http::{
     Method, Uri,
     header::{HeaderName, HeaderValue},
@@ -25,7 +26,6 @@ use async_ebpf::{
 };
 use boring::ssl::SslContext;
 use futures::{FutureExt, channel::oneshot};
-use monoio::fs::File;
 use serde::Deserialize;
 use ulid::Ulid;
 use url::form_urlencoded;
