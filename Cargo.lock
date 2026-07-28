@@ -2969,7 +2969,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zeroserve"
-version = "0.2.12-alpha.9"
+version = "0.2.12-alpha.10"
 dependencies = [
  "anyhow",
  "arc-swap",
