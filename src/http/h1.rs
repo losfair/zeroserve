@@ -100,6 +100,10 @@ impl Response {
         (self.head, self.body)
     }
 
+    pub fn status(&self) -> StatusCode {
+        self.head.status
+    }
+
     /// Whether this is an interim response (1xx other than `101 Switching
     /// Protocols`) that precedes the final response on the same connection.
     pub fn is_interim(&self) -> bool {

@@ -323,3 +323,232 @@ Deno.test({
         }
     },
 });
+
+/**
+ * Raw h1 backend that runs a bidirectional exchange the way git smart HTTP
+ * does: it sends its (non-error) response head immediately — before consuming
+ * any of the request body — then reads the entire chunked body, then streams
+ * the response body. The proxy must NOT treat the early head as a reason to
+ * abort the upload (that would truncate the request and, through intermediary
+ * proxies, surface as "client closed request" failures).
+ */
+async function startBidirectionalBackend(): Promise<{
+    url: string;
+    close: () => void;
+}> {
+    const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const port = (listener.addr as Deno.NetAddr).port;
+
+    (async () => {
+        for await (const conn of listener) {
+            handleBidirectionalConn(conn).catch(() => {});
+        }
+    })();
+
+    return {
+        url: `http://127.0.0.1:${port}`,
+        close: () => listener.close(),
+    };
+}
+
+async function handleBidirectionalConn(conn: Deno.Conn) {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    let buf = new Uint8Array(0);
+
+    const readMore = async (): Promise<boolean> => {
+        const chunk = new Uint8Array(65536);
+        const n = await conn.read(chunk);
+        if (n === null) return false;
+        const merged = new Uint8Array(buf.length + n);
+        merged.set(buf);
+        merged.set(chunk.subarray(0, n), buf.length);
+        buf = merged;
+        return true;
+    };
+    const findCrlf = (): number => {
+        for (let i = 0; i + 2 <= buf.length; i++) {
+            if (buf[i] === 13 && buf[i + 1] === 10) return i;
+        }
+        return -1;
+    };
+
+    try {
+        // Request head
+        let headEnd = -1;
+        while (headEnd < 0) {
+            for (let i = 0; i + 4 <= buf.length; i++) {
+                if (
+                    buf[i] === 13 && buf[i + 1] === 10 &&
+                    buf[i + 2] === 13 && buf[i + 3] === 10
+                ) {
+                    headEnd = i;
+                    break;
+                }
+            }
+            if (headEnd < 0 && !(await readMore())) return;
+        }
+        buf = buf.subarray(headEnd + 4);
+
+        // Respond with the head IMMEDIATELY, like git http-backend.
+        await writeAll(
+            conn,
+            encoder.encode("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"),
+        );
+
+        // Now consume the entire chunked request body.
+        let totalBytes = 0;
+        while (true) {
+            let lineEnd = findCrlf();
+            while (lineEnd < 0) {
+                if (!(await readMore())) return;
+                lineEnd = findCrlf();
+            }
+            const size = parseInt(
+                decoder.decode(buf.subarray(0, lineEnd)).split(";")[0],
+                16,
+            );
+            buf = buf.subarray(lineEnd + 2);
+            if (size === 0) {
+                let tEnd = findCrlf();
+                while (tEnd < 0) {
+                    if (!(await readMore())) return;
+                    tEnd = findCrlf();
+                }
+                buf = buf.subarray(tEnd + 2);
+                break;
+            }
+            while (buf.length < size + 2) {
+                if (!(await readMore())) return;
+            }
+            totalBytes += size;
+            buf = buf.subarray(size + 2);
+        }
+
+        // Only now stream the response body and finish.
+        const body = `done ${totalBytes}`;
+        await writeAll(
+            conn,
+            encoder.encode(
+                `${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`,
+            ),
+        );
+    } finally {
+        try {
+            conn.close();
+        } catch {
+            // already closed
+        }
+    }
+}
+
+/** h2c client that uploads the whole body, then reads the response. */
+function h2cFullUpload(
+    hostname: string,
+    port: number,
+    path: string,
+    chunkCount: number,
+    chunkSize: number,
+    timeoutMs = 30000,
+): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+        const client = http2.connect(`http://${hostname}:${port}`);
+        const timer = setTimeout(() => {
+            client.close();
+            reject(new Error("h2c bidirectional upload timed out"));
+        }, timeoutMs);
+        client.on("error", (err) => {
+            clearTimeout(timer);
+            client.close();
+            reject(err);
+        });
+        const req = client.request({
+            ":path": path,
+            ":method": "POST",
+            "content-type": "application/octet-stream",
+        });
+        let status = 0;
+        const responseChunks: Buffer[] = [];
+        req.on("response", (hdrs) => {
+            status = hdrs[":status"] as number;
+        });
+        req.on("data", (chunk: Buffer) => {
+            responseChunks.push(chunk);
+        });
+        req.on("end", () => {
+            clearTimeout(timer);
+            client.close();
+            resolve({
+                status,
+                body: Buffer.concat(responseChunks).toString("utf-8"),
+            });
+        });
+        req.on("error", (err) => {
+            clearTimeout(timer);
+            client.close();
+            reject(err);
+        });
+        const chunk = Buffer.alloc(chunkSize, 0x61);
+        for (let i = 0; i < chunkCount; i++) {
+            req.write(chunk);
+        }
+        req.end();
+    });
+}
+
+Deno.test({
+    name:
+        "e2e: early non-error response head does not abort the upload (git-style bidirectional exchange)",
+    ignore: !canRunScripts,
+    fn: async () => {
+        const backend = await startBidirectionalBackend();
+        let tarPath: string | null = null;
+        try {
+            tarPath = await buildProxySite(backend.url);
+            await withZeroserve(tarPath, async (baseUrl) => {
+                const url = new URL(baseUrl);
+                const chunkCount = 16;
+                const chunkSize = 256 * 1024;
+                const total = chunkCount * chunkSize;
+
+                // h1 client: the full body must reach the backend even though
+                // the backend sent its 200 head before reading any of it.
+                let sent = 0;
+                const stream = new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        if (sent >= chunkCount) {
+                            controller.close();
+                            return;
+                        }
+                        controller.enqueue(new Uint8Array(chunkSize).fill(0x61));
+                        sent++;
+                    },
+                });
+                const res = await fetch(`${baseUrl}/upload`, {
+                    method: "POST",
+                    body: stream,
+                    // @ts-ignore: Deno supports duplex
+                    duplex: "half",
+                });
+                assertEquals(res.status, 200);
+                assertEquals(await res.text(), `done ${total}`);
+
+                // h2c client, same exchange.
+                const h2 = await h2cFullUpload(
+                    url.hostname,
+                    Number(url.port),
+                    "/upload",
+                    chunkCount,
+                    chunkSize,
+                );
+                assertEquals(h2.status, 200);
+                assertEquals(h2.body, `done ${total}`);
+            });
+        } finally {
+            backend.close();
+            if (tarPath) {
+                await Deno.remove(tarPath).catch(() => {});
+            }
+        }
+    },
+});
