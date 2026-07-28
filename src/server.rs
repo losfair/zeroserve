@@ -3049,7 +3049,7 @@ async fn write_static_body_compressed_h1(
             }
         }
         StaticBody::FsFile { path, size, .. } => {
-            let file = monoio::fs::File::open(path).await?;
+            let file = crate::file_io::File::open(path).await?;
             let chunk_size = shared.config.chunk_size;
             let mut remaining = *size;
             let mut offset = 0u64;
@@ -3279,7 +3279,7 @@ async fn write_static_body_compressed_h2(
             }
         }
         StaticBody::FsFile { path, size, .. } => {
-            let file = monoio::fs::File::open(path).await?;
+            let file = crate::file_io::File::open(path).await?;
             let chunk_size = shared.config.chunk_size;
             let mut remaining = *size;
             let mut offset = 0u64;
@@ -3346,7 +3346,7 @@ async fn stream_fs_file_h2(
     chunk_size: usize,
     stream: &mut h2::SendStream<Bytes>,
 ) -> Result<()> {
-    let file = monoio::fs::File::open(path).await?;
+    let file = crate::file_io::File::open(path).await?;
     let mut remaining = len;
     let mut offset = start;
     let mut buffer = vec![0u8; chunk_size];
