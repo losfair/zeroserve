@@ -486,3 +486,56 @@ zs_u64 entry(void) {
         }
     },
 });
+
+Deno.test("e2e: h2c advertises enlarged flow-control windows", async () => {
+    // The h2 crate's default 64 KiB windows cap upload throughput at
+    // 64 KiB per round trip, which throttles large reverse-proxied uploads
+    // (e.g. git pushes). The server must advertise the configured settings.
+    function fetchRemoteSettings(
+        hostname: string,
+        port: number,
+    ): Promise<http2.Settings> {
+        return new Promise((resolve, reject) => {
+            const client = http2.connect(`http://${hostname}:${port}`);
+            const finish = (fn: () => void) => {
+                clearTimeout(timer);
+                fn();
+                // Closing from inside the event handler crashes some runtimes;
+                // defer it to the next tick.
+                setTimeout(() => client.close(), 0);
+            };
+            const timer = setTimeout(
+                () => finish(() => reject(new Error("timed out waiting for SETTINGS"))),
+                10000,
+            );
+            client.on("error", (err) => finish(() => reject(err)));
+            client.on("remoteSettings", (s) => finish(() => resolve(s)));
+        });
+    }
+
+    const siteDir = await Deno.makeTempDir();
+    let tarPath: string | null = null;
+    try {
+        await Deno.writeTextFile(join(siteDir, "index.html"), "windows\n");
+        tarPath = await packSite(siteDir);
+
+        await withZeroserve(tarPath, async (baseUrl) => {
+            const url = new URL(baseUrl);
+            const settings = await fetchRemoteSettings(url.hostname, Number(url.port));
+            assertEquals(settings.initialWindowSize, 512 * 1024);
+            assertEquals(settings.maxFrameSize, 64 * 1024);
+        });
+
+        // The windows are configurable per instance.
+        await withZeroserve(tarPath, async (baseUrl) => {
+            const url = new URL(baseUrl);
+            const settings = await fetchRemoteSettings(url.hostname, Number(url.port));
+            assertEquals(settings.initialWindowSize, 128 * 1024);
+        }, ["--h2-stream-window-kb", "128", "--h2-connection-window-kb", "256"]);
+    } finally {
+        if (tarPath) {
+            await Deno.remove(tarPath).catch(() => {});
+        }
+        await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+    }
+});

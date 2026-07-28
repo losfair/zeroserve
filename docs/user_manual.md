@@ -323,6 +323,14 @@ Key options:
   body reads via `zs_req_body_json` (default 256).
 - `--max-request-external-memory-footprint-kb <KB>`: Maximum external memory
   footprint in KB per request for scripts (default 256).
+- `--h2-stream-window-kb <KB>`: HTTP/2 per-stream receive window (default 512).
+  Upload throughput per stream is capped at roughly window/RTT, and a stalled
+  stream can buffer at most this much; raise it for high bandwidth-delay
+  clients, lower it to tighten per-stream memory bounds. Valid range is 64 to
+  2097151.
+- `--h2-connection-window-kb <KB>`: HTTP/2 connection-wide receive window
+  (default 1024). Bounds worst-case buffered upload data per connection across
+  all of its streams. Same valid range as `--h2-stream-window-kb`.
 - `--reload-signal-file <FILE>`: Poll a file and reload when its contents change.
 - `--disable-request-logging`: Turn off per-request logs.
 - `--enable-proxy-protocol`: Expect PROXY protocol v1 on both HTTP and HTTPS

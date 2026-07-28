@@ -53,6 +53,14 @@ type HttpBody = h1::Body;
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const PROXY_WRITE_BATCH_SIZE: usize = 64 * 1024;
 
+// The h2 crate defaults to 16 KiB frames; larger frames reduce per-frame
+// overhead on big uploads/downloads. The receive flow-control windows are
+// configurable (`--h2-stream-window-kb` / `--h2-connection-window-kb`): the
+// protocol-minimum 64 KiB defaults cap upload throughput at 64 KiB per round
+// trip (~10 MiB/s at 6 ms RTT), while larger windows raise that cap at the
+// cost of per-connection worst-case buffering.
+const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+
 mod caddy;
 
 use caddy::ResponseHookState;
@@ -958,7 +966,11 @@ async fn handle_h2_connection<IO>(
 where
     IO: monoio::io::poll_io::AsyncRead + monoio::io::poll_io::AsyncWrite + Unpin + 'static,
 {
-    let mut connection = h2::server::handshake(io)
+    let mut connection = h2::server::Builder::new()
+        .initial_window_size(shared.config.h2_stream_window)
+        .initial_connection_window_size(shared.config.h2_connection_window)
+        .max_frame_size(H2_MAX_FRAME_SIZE)
+        .handshake(io)
         .await
         .map_err(|err| anyhow!("h2 handshake failed: {err}"))?;
     let (_local_hup_tx, local_hup_rx) = oneshot::channel::<()>();
