@@ -40,6 +40,8 @@ pub struct StaticConfig {
     pub sqpoll_idle_ms: Option<u32>,
     pub debug_proxy_protocol_disable_fast_path: bool,
     pub max_buffered_body_size: usize,
+    pub h2_stream_window: u32,
+    pub h2_connection_window: u32,
     pub max_request_external_memory_footprint: u64,
     pub max_rate_limit_buckets: usize,
     pub script_code_size_limit: usize,
@@ -63,6 +65,9 @@ impl TryFrom<Cli> for StaticConfig {
             .checked_mul(1024)
             .filter(|limit| u32::try_from(*limit).is_ok())
             .ok_or_else(|| anyhow!("--script-code-size-limit-kb is too large"))?;
+        let h2_stream_window = h2_window_bytes(cli.h2_stream_window_kb, "--h2-stream-window-kb")?;
+        let h2_connection_window =
+            h2_window_bytes(cli.h2_connection_window_kb, "--h2-connection-window-kb")?;
         let http_addr = cli.addr;
         let tls_requested = cli.tls_addr.is_some()
             || cli.cert.is_some()
@@ -162,6 +167,8 @@ impl TryFrom<Cli> for StaticConfig {
             enable_netns_isolation: cli.enable_netns_isolation,
             debug_proxy_protocol_disable_fast_path: cli.debug_proxy_protocol_disable_fast_path,
             max_buffered_body_size: cli.max_buffered_body_size_kb * 1024,
+            h2_stream_window,
+            h2_connection_window,
             max_request_external_memory_footprint: (cli.max_request_external_memory_footprint_kb
                 * 1024) as u64,
             max_rate_limit_buckets: cli.max_rate_limit_buckets,
@@ -173,11 +180,57 @@ impl TryFrom<Cli> for StaticConfig {
     }
 }
 
+/// Convert an `--h2-*-window-kb` flag to bytes, enforcing the valid HTTP/2
+/// receive window range: at least the 64 KiB protocol default, at most the
+/// protocol maximum of 2^31 - 1 bytes.
+fn h2_window_bytes(kb: usize, flag: &str) -> Result<u32> {
+    kb.checked_mul(1024)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .filter(|bytes| (65_535..=2_147_483_647).contains(bytes))
+        .ok_or_else(|| anyhow!("{flag} must be between 64 and 2097151 (KiB)"))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn h2_window_flags_convert_and_validate() {
+        let cli = Cli::try_parse_from(["zeroserve", "site.tar"]).unwrap();
+        let config = StaticConfig::try_from(cli).unwrap();
+        assert_eq!(config.h2_stream_window, 512 * 1024);
+        assert_eq!(config.h2_connection_window, 1024 * 1024);
+
+        let cli = Cli::try_parse_from([
+            "zeroserve",
+            "--h2-stream-window-kb",
+            "2048",
+            "--h2-connection-window-kb",
+            "4096",
+            "site.tar",
+        ])
+        .unwrap();
+        let config = StaticConfig::try_from(cli).unwrap();
+        assert_eq!(config.h2_stream_window, 2048 * 1024);
+        assert_eq!(config.h2_connection_window, 4096 * 1024);
+
+        // Below the 64 KiB protocol default is rejected.
+        let cli =
+            Cli::try_parse_from(["zeroserve", "--h2-stream-window-kb", "16", "site.tar"]).unwrap();
+        assert!(StaticConfig::try_from(cli).is_err());
+
+        // Above the 2^31 - 1 byte protocol maximum is rejected.
+        let cli = Cli::try_parse_from([
+            "zeroserve",
+            "--h2-connection-window-kb",
+            "2097152",
+            "site.tar",
+        ])
+        .unwrap();
+        assert!(StaticConfig::try_from(cli).is_err());
+    }
 
     #[test]
     fn legacy_proxy_protocol_flag_enables_both_listeners() {

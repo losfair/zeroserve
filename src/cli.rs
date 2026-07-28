@@ -235,6 +235,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 256, value_parser = must_be_positive)]
     pub max_buffered_body_size_kb: usize,
 
+    /// HTTP/2 per-stream receive window in kilobytes. Caps upload throughput
+    /// at window/RTT per stream and bounds worst-case buffering per stalled
+    /// stream.
+    #[arg(long, default_value_t = 512, value_parser = must_be_positive)]
+    pub h2_stream_window_kb: usize,
+
+    /// HTTP/2 connection-wide receive window in kilobytes. Bounds worst-case
+    /// buffered upload data per connection across all of its streams.
+    #[arg(long, default_value_t = 1024, value_parser = must_be_positive)]
+    pub h2_connection_window_kb: usize,
+
     /// Maximum external memory footprint in kilobytes per request for scripts.
     #[arg(long, default_value_t = 256, value_parser = must_be_positive)]
     pub max_request_external_memory_footprint_kb: usize,
