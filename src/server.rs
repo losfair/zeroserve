@@ -5081,6 +5081,7 @@ where
             anyhow!("failed to send proxy request head: {err}").context(ProxyNoResponse)
         })?;
     let mut early_response = None;
+    let mut request_body_fully_sent = true;
     if send_request_body {
         match forward_request_body(
             conn,
@@ -5091,9 +5092,12 @@ where
         )
         .await
         {
-            Ok(ForwardRequestBodyOutcome::Completed) => {}
+            Ok(ForwardRequestBodyOutcome::Completed(pending)) => {
+                early_response = pending;
+            }
             Ok(ForwardRequestBodyOutcome::EarlyResponse(response)) => {
                 early_response = Some(response);
+                request_body_fully_sent = false;
             }
             Err(ProxyRequestBodyError::TooLarge) => {
                 // The limit tripped mid-body: the client is still sending.
@@ -5129,7 +5133,6 @@ where
             }
         }
     }
-    let request_body_fully_sent = early_response.is_none();
 
     let response = if let Some(response) = early_response {
         response
@@ -5413,6 +5416,7 @@ where
             anyhow!("failed to send proxy request head: {err}").context(ProxyNoResponse)
         })?;
     let mut early_response = None;
+    let mut request_body_fully_sent = true;
     if send_request_body {
         let body = body
             .as_mut()
@@ -5426,9 +5430,12 @@ where
         )
         .await
         {
-            Ok(ForwardRequestBodyOutcome::Completed) => {}
+            Ok(ForwardRequestBodyOutcome::Completed(pending)) => {
+                early_response = pending;
+            }
             Ok(ForwardRequestBodyOutcome::EarlyResponse(response)) => {
                 early_response = Some(response);
+                request_body_fully_sent = false;
             }
             Err(ProxyRequestBodyError::TooLarge) => {
                 send_h2_response(
@@ -5453,7 +5460,6 @@ where
         }
     }
 
-    let request_body_fully_sent = early_response.is_none();
     let response = match early_response {
         Some(response) => response,
         None => match conn.next_final_response().await {
@@ -5729,12 +5735,27 @@ enum ProxyRequestBodyError {
 }
 
 enum ForwardRequestBodyOutcome {
-    /// The whole request body was forwarded to the backend.
-    Completed,
-    /// The backend sent a final response before consuming the whole request
-    /// body (RFC 9110 §9.5), so forwarding was aborted. The backend
-    /// connection must not be reused: the request on it is incomplete.
+    /// The whole request body was forwarded to the backend. If the backend
+    /// began a non-error response while still consuming the body — a
+    /// bidirectional exchange like git smart HTTP, where receive-pack sends
+    /// its response head (and later sideband keepalives) before the pack
+    /// finishes uploading — its already-parsed head is carried here and must
+    /// be relayed instead of reading a fresh response.
+    Completed(Option<h1::Response>),
+    /// The backend rejected the request with an error (4xx/5xx) response
+    /// before consuming the whole body (RFC 9110 §9.5), so forwarding was
+    /// aborted. The backend connection must not be reused: the request on it
+    /// is incomplete.
     EarlyResponse(h1::Response),
+}
+
+/// Whether an early backend response justifies aborting the request body
+/// transfer. Only errors do: a non-error response mid-request means the
+/// backend is running a bidirectional exchange and still wants the body —
+/// aborting it would truncate the request (and, through intermediary
+/// proxies, surface as "client closed request" failures).
+fn early_response_aborts_upload(response: &h1::Response) -> bool {
+    response.status().as_u16() >= 400
 }
 
 const MAX_EARLY_INTERIM_RESPONSES: usize = 16;
@@ -5829,9 +5850,11 @@ fn take_buffered_final_response<IO>(
 
 /// A request body write failed. The likely cause is the backend rejecting the
 /// request mid-stream and closing its end (e.g. an upload size limit), in
-/// which case the response explaining why is either buffered already or
+/// which case the error response explaining why is either buffered already or
 /// arrives promptly. Try briefly to read it so the client gets the actual
 /// reason instead of a bare 502; return None to surface the original error.
+/// Only error responses are salvaged: a non-error head with the connection
+/// already broken cannot be followed by a coherent response body.
 async fn salvage_early_backend_response<IO>(
     conn: &mut h1::H1Connection<IO>,
     interim_seen: &mut usize,
@@ -5841,7 +5864,9 @@ where
 {
     for _ in 0..8 {
         match take_buffered_final_response(conn, interim_seen) {
-            Ok(Some(response)) => return Some(response),
+            Ok(Some(response)) => {
+                return early_response_aborts_upload(&response).then_some(response);
+            }
             Ok(None) => {}
             Err(_) => return None,
         }
@@ -5879,20 +5904,29 @@ where
     IO: AsyncReadRent + AsyncWriteRent + AsRawFd,
 {
     if body.is_end_stream() {
-        return Ok(ForwardRequestBodyOutcome::Completed);
+        return Ok(ForwardRequestBodyOutcome::Completed(None));
     }
 
     let mut bytes_seen = 0usize;
     let mut interim_seen = 0usize;
+    let mut pending_response: Option<h1::Response> = None;
     while let Some(chunk) = body.data().await {
         let chunk = chunk.map_err(|err| {
             ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
         })?;
         add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
         if watch_early_response
+            && pending_response.is_none()
             && let Some(response) = poll_early_backend_response(conn, &mut interim_seen).await?
         {
-            return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            if early_response_aborts_upload(&response) {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            // Bidirectional exchange: the backend started a non-error
+            // response while still consuming the body. Keep forwarding; the
+            // parsed head is relayed after the upload completes, and its
+            // body stays queued on the socket until the relay reads it.
+            pending_response = Some(response);
         }
         let io = conn
             .io_mut()
@@ -5930,7 +5964,7 @@ where
         .io_mut()
         .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
     let _ = io.flush().await;
-    Ok(ForwardRequestBodyOutcome::Completed)
+    Ok(ForwardRequestBodyOutcome::Completed(pending_response))
 }
 
 async fn forward_proxy_body_h2<IO>(
@@ -6071,7 +6105,7 @@ where
     R: AsyncReadRent,
 {
     match body.hint() {
-        StreamHint::None => return Ok(ForwardRequestBodyOutcome::Completed),
+        StreamHint::None => return Ok(ForwardRequestBodyOutcome::Completed(None)),
         StreamHint::Stream if body.is_eof() => {
             return Err(ProxyRequestBodyError::Other(anyhow!(
                 "proxy request body missing length"
@@ -6083,15 +6117,24 @@ where
     let chunked = body.is_chunked();
     let mut bytes_seen = 0usize;
     let mut interim_seen = 0usize;
+    let mut pending_response: Option<h1::Response> = None;
     while let Some(chunk) = body.next_data(reader).await {
         let chunk = chunk.map_err(|err| {
             ProxyRequestBodyError::Other(anyhow!("proxy request body read failed: {err}"))
         })?;
         add_limited_request_body_bytes(&mut bytes_seen, chunk.len(), request_body_limit)?;
         if watch_early_response
+            && pending_response.is_none()
             && let Some(response) = poll_early_backend_response(conn, &mut interim_seen).await?
         {
-            return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            if early_response_aborts_upload(&response) {
+                return Ok(ForwardRequestBodyOutcome::EarlyResponse(response));
+            }
+            // Bidirectional exchange: the backend started a non-error
+            // response while still consuming the body. Keep forwarding; the
+            // parsed head is relayed after the upload completes, and its
+            // body stays queued on the socket until the relay reads it.
+            pending_response = Some(response);
         }
         let io = conn
             .io_mut()
@@ -6128,7 +6171,7 @@ where
         .io_mut()
         .map_err(|err| ProxyRequestBodyError::Other(anyhow!("{err}")))?;
     let _ = io.flush().await;
-    Ok(ForwardRequestBodyOutcome::Completed)
+    Ok(ForwardRequestBodyOutcome::Completed(pending_response))
 }
 
 async fn drain_proxy_payload<IO>(conn: &mut h1::H1Connection<IO>, body: &mut h1::Body) -> Result<()>
