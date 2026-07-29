@@ -42,7 +42,11 @@ repro_rustflags=(
 )
 printf -v joined_rustflags ' %q' "${repro_rustflags[@]}"
 
-export ARFLAGS=crsD
+# Do NOT set ARFLAGS here: cc-rs prepends $ARFLAGS to its archiver command but
+# always appends its own "cq" operation, so e.g. ARFLAGS=crsD makes ar parse
+# "cq" as the archive name and fail. Deterministic archives don't need it:
+# zig's ar (llvm-ar) is deterministic by default, and ZERO_AR_DATE covers
+# Apple ar.
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR="$cargo_target_dir"
 export LC_ALL=C
