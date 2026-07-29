@@ -608,8 +608,9 @@ fn dup_listener_n(fd: RawFd, n: usize) -> Result<Vec<TcpListener>> {
     let mut listeners = Vec::with_capacity(n);
     for _ in 0..n {
         // SAFETY: `fd` is a valid listening socket owned by the caller for the
-        // duration of this function; dup yields an independent descriptor.
-        let duped = unsafe { libc::dup(fd) };
+        // duration of this function; F_DUPFD_CLOEXEC yields an independent
+        // descriptor that is not inherited by spawned children (clang/llc).
+        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if duped < 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("failed to dup listening fd {fd}"));
