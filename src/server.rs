@@ -17,7 +17,8 @@ use ::http::{
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::{
-    channel::oneshot,
+    StreamExt,
+    channel::{mpsc, oneshot},
     future::{self, FutureExt},
 };
 use monoio::{
@@ -35,6 +36,7 @@ use url::Url;
 use crate::{
     boringtls::{AcceptOutcome, BoringStream},
     config::StaticConfig,
+    handoff::{ConnDistributor, HandoffConn, HandoffGroup},
     http::h1::{self, HttpError, Request, RequestHead, StreamHint},
     hupwatch::HupWatcher,
     logging::async_log,
@@ -193,19 +195,69 @@ pub async fn amain(
     hup: Arc<HupWatcher>,
     http_listener: std::net::TcpListener,
     tls_listener: Option<std::net::TcpListener>,
+    http_handoff: Option<HandoffGroup>,
+    tls_handoff: Option<HandoffGroup>,
 ) -> Result<()> {
     if let Some(tls_listener) = tls_listener {
         let tls_state = shared.clone();
         let script_runtime = script_runtime.clone();
         let hup = hup.clone();
         monoio::spawn(async move {
-            if let Err(err) = run_tls_listener(tls_state, script_runtime, hup, tls_listener).await {
+            if let Err(err) =
+                run_tls_listener(tls_state, script_runtime, hup, tls_listener, tls_handoff).await
+            {
                 eprintln!("TLS listener stopped: {err:?}");
             }
         });
     }
 
-    run_http_listener(shared, script_runtime, hup, http_listener).await
+    run_http_listener(shared, script_runtime, hup, http_listener, http_handoff).await
+}
+
+/// Route an accepted connection through the distributor when the listen
+/// socket is shared across workers; `None` means it was handed to a sibling.
+fn assign(
+    distributor: &Option<ConnDistributor>,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> Option<(TcpStream, SocketAddr)> {
+    match distributor {
+        Some(distributor) => distributor.route(stream, peer),
+        None => Some((stream, peer)),
+    }
+}
+
+type ServeConn = fn(
+    TcpStream,
+    SocketAddr,
+    SocketAddr,
+    &Arc<SharedState>,
+    &Rc<ScriptRuntime>,
+    &Arc<HupWatcher>,
+) -> Result<()>;
+
+/// Adopt connections that sibling workers assigned to this one.
+fn spawn_handoff_receiver(
+    mut receiver: mpsc::UnboundedReceiver<HandoffConn>,
+    shared: Arc<SharedState>,
+    script_runtime: Rc<ScriptRuntime>,
+    hup: Arc<HupWatcher>,
+    local: SocketAddr,
+    serve: ServeConn,
+) {
+    monoio::spawn(async move {
+        while let Some(conn) = receiver.next().await {
+            let peer = conn.peer();
+            match conn.into_stream() {
+                Ok((stream, peer)) => {
+                    if let Err(err) = serve(stream, peer, local, &shared, &script_runtime, &hup) {
+                        eprintln!("failed to serve handed-off connection {peer}: {err:?}");
+                    }
+                }
+                Err(err) => eprintln!("failed to adopt handed-off connection {peer}: {err}"),
+            }
+        }
+    });
 }
 
 async fn run_http_listener(
@@ -213,46 +265,71 @@ async fn run_http_listener(
     script_runtime: Rc<ScriptRuntime>,
     hup: Arc<HupWatcher>,
     http_listener: std::net::TcpListener,
+    handoff: Option<HandoffGroup>,
 ) -> Result<()> {
     let listener = TcpListener::from_std(http_listener)?;
     let local = listener.local_addr()?;
+    let distributor = handoff.map(|group| {
+        spawn_handoff_receiver(
+            group.receiver,
+            shared.clone(),
+            script_runtime.clone(),
+            hup.clone(),
+            local,
+            serve_http_conn,
+        );
+        group.distributor
+    });
     loop {
         let (stream, addr) = listener.accept().await?;
-        if stream.set_nodelay(true).is_err() {
+        let Some((stream, addr)) = assign(&distributor, stream, addr) else {
             continue;
-        }
-        let conn_hup = hup.wait(stream.as_raw_fd())?;
-        let state = shared.clone();
-        let script_runtime = script_runtime.clone();
-        monoio::spawn(async move {
-            let mut stream = stream;
-            let peer = if state.config.enable_http_proxy_protocol {
-                match read_proxy_protocol_peer(&mut stream, addr, &state.config).await {
-                    Ok(peer) => peer,
-                    Err(err) => {
-                        eprintln!(
-                            "dropping http connection {addr} due to invalid PROXY header: {err}"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                addr
-            };
-            if let Err(err) =
-                handle_http_connection(conn_hup, stream, peer, local, state, script_runtime).await
-            {
-                async_log(
-                    format!(
-                        "[listener] connection {} over http closed with error: {err:?}",
-                        peer
-                    )
-                    .into_bytes(),
-                )
-                .await;
-            }
-        });
+        };
+        serve_http_conn(stream, addr, local, &shared, &script_runtime, &hup)?;
     }
+}
+
+fn serve_http_conn(
+    stream: TcpStream,
+    addr: SocketAddr,
+    local: SocketAddr,
+    shared: &Arc<SharedState>,
+    script_runtime: &Rc<ScriptRuntime>,
+    hup: &Arc<HupWatcher>,
+) -> Result<()> {
+    if stream.set_nodelay(true).is_err() {
+        return Ok(());
+    }
+    let conn_hup = hup.wait(stream.as_raw_fd())?;
+    let state = shared.clone();
+    let script_runtime = script_runtime.clone();
+    monoio::spawn(async move {
+        let mut stream = stream;
+        let peer = if state.config.enable_http_proxy_protocol {
+            match read_proxy_protocol_peer(&mut stream, addr, &state.config).await {
+                Ok(peer) => peer,
+                Err(err) => {
+                    eprintln!("dropping http connection {addr} due to invalid PROXY header: {err}");
+                    return;
+                }
+            }
+        } else {
+            addr
+        };
+        if let Err(err) =
+            handle_http_connection(conn_hup, stream, peer, local, state, script_runtime).await
+        {
+            async_log(
+                format!(
+                    "[listener] connection {} over http closed with error: {err:?}",
+                    peer
+                )
+                .into_bytes(),
+            )
+            .await;
+        }
+    });
+    Ok(())
 }
 
 async fn handle_http_connection(
@@ -286,152 +363,176 @@ async fn run_tls_listener(
     script_runtime: Rc<ScriptRuntime>,
     hup: Arc<HupWatcher>,
     tls_listener: std::net::TcpListener,
+    handoff: Option<HandoffGroup>,
 ) -> Result<()> {
     let listener = TcpListener::from_std(tls_listener)?;
     let local = listener.local_addr()?;
+    let distributor = handoff.map(|group| {
+        spawn_handoff_receiver(
+            group.receiver,
+            shared.clone(),
+            script_runtime.clone(),
+            hup.clone(),
+            local,
+            serve_tls_conn,
+        );
+        group.distributor
+    });
     loop {
         let (stream, peer) = listener.accept().await?;
-        if stream.set_nodelay(true).is_err() {
+        let Some((stream, peer)) = assign(&distributor, stream, peer) else {
             continue;
-        }
-        let mut conn_hup = hup.wait(stream.as_raw_fd())?;
-        let state = shared.clone();
-        let script_runtime = script_runtime.clone();
-        monoio::spawn(async move {
-            let mut stream = stream;
-            let reported_peer = if state.config.enable_https_proxy_protocol {
-                match read_proxy_protocol_peer(&mut stream, peer, &state.config).await {
-                    Ok(addr) => addr,
-                    Err(err) => {
-                        eprintln!(
-                            "dropping TLS connection {peer} due to invalid PROXY header: {err}"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                peer
-            };
-            let tls_state = match state.tls.load_full() {
-                Some(runtime) => runtime,
-                None => {
-                    eprintln!("dropping TLS connection {reported_peer} due to missing TLS config");
+        };
+        serve_tls_conn(stream, peer, local, &shared, &script_runtime, &hup)?;
+    }
+}
+
+fn serve_tls_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    local: SocketAddr,
+    shared: &Arc<SharedState>,
+    script_runtime: &Rc<ScriptRuntime>,
+    hup: &Arc<HupWatcher>,
+) -> Result<()> {
+    if stream.set_nodelay(true).is_err() {
+        return Ok(());
+    }
+    let mut conn_hup = hup.wait(stream.as_raw_fd())?;
+    let state = shared.clone();
+    let script_runtime = script_runtime.clone();
+    monoio::spawn(async move {
+        let mut stream = stream;
+        let reported_peer = if state.config.enable_https_proxy_protocol {
+            match read_proxy_protocol_peer(&mut stream, peer, &state.config).await {
+                Ok(addr) => addr,
+                Err(err) => {
+                    eprintln!("dropping TLS connection {peer} due to invalid PROXY header: {err}");
                     return;
                 }
-            };
-            // BoringSSL terminates ECH natively (inner-ClientHello decryption,
-            // ServerHello acceptance signal, retry_configs on rejection), so the
-            // listener just does a normal accept and reads the negotiated state.
-            // In the `--caddy` flow the handshake pauses at the ClientHello so
-            // the site's eBPF TLS section can select the certificate by path;
-            // the runtime resolves it through its in-memory certificate cache.
-            let accepted = if tls_state.script_certificates {
-                let selector_runtime = script_runtime.clone();
-                let site = state.site.load_full();
-                let tls_runtime = tls_state.clone();
-                tls_state
-                    .acceptor
-                    .accept_with_cert_selector(stream, move |sni| async move {
-                        selector_runtime
-                            .select_tls_certificate(site, tls_runtime, sni, reported_peer, local)
-                            .await
-                    })
-                    .await
-            } else {
-                tls_state.acceptor.accept(stream).await
-            };
-            match accepted {
-                Ok(AcceptOutcome::Relay {
-                    target,
-                    prelude,
-                    io,
-                }) => {
-                    // ECH "don't stick out" fallback: a client reached one of our
-                    // ECH public names without a decryptable inner ClientHello,
-                    // and we hold no certificate for that name. Transparently
-                    // relay the raw TLS connection to the real public-name server.
-                    if let Err(err) = relay_tls_connection(io, &target, prelude).await {
-                        async_log(
+            }
+        } else {
+            peer
+        };
+        let tls_state = match state.tls.load_full() {
+            Some(runtime) => runtime,
+            None => {
+                eprintln!("dropping TLS connection {reported_peer} due to missing TLS config");
+                return;
+            }
+        };
+        // BoringSSL terminates ECH natively (inner-ClientHello decryption,
+        // ServerHello acceptance signal, retry_configs on rejection), so the
+        // listener just does a normal accept and reads the negotiated state.
+        // In the `--caddy` flow the handshake pauses at the ClientHello so
+        // the site's eBPF TLS section can select the certificate by path;
+        // the runtime resolves it through its in-memory certificate cache.
+        let accepted = if tls_state.script_certificates {
+            let selector_runtime = script_runtime.clone();
+            let site = state.site.load_full();
+            let tls_runtime = tls_state.clone();
+            tls_state
+                .acceptor
+                .accept_with_cert_selector(stream, move |sni| async move {
+                    selector_runtime
+                        .select_tls_certificate(site, tls_runtime, sni, reported_peer, local)
+                        .await
+                })
+                .await
+        } else {
+            tls_state.acceptor.accept(stream).await
+        };
+        match accepted {
+            Ok(AcceptOutcome::Relay {
+                target,
+                prelude,
+                io,
+            }) => {
+                // ECH "don't stick out" fallback: a client reached one of our
+                // ECH public names without a decryptable inner ClientHello,
+                // and we hold no certificate for that name. Transparently
+                // relay the raw TLS connection to the real public-name server.
+                if let Err(err) = relay_tls_connection(io, &target, prelude).await {
+                    async_log(
                             format!(
                                 "[listener] ECH relay of {reported_peer} to {target:?} failed: {err:?}\n"
                             )
                             .into_bytes(),
                         )
                         .await;
-                    }
                 }
-                Ok(AcceptOutcome::Stream(tls_stream)) => {
-                    let alpn = tls_stream
-                        .alpn_protocol()
-                        .and_then(|p| String::from_utf8(p).ok());
-                    let is_h2 = matches!(alpn.as_deref(), Some("h2"));
-                    let ech_ok = tls_stream.ech_accepted();
-                    let ech_accepted = if tls_state.ech_enabled {
-                        Some(ech_ok)
-                    } else {
-                        None
-                    };
-                    // Prefer the actual outer SNI the client sent (recovered
-                    // from the wire ClientHello); fall back to the configured
-                    // public name only when it is unambiguous and parsing failed.
-                    let outer_sni = if ech_ok {
-                        tls_stream
-                            .outer_server_name()
-                            .or_else(|| tls_state.ech_public_name.clone())
-                    } else {
-                        None
-                    };
-                    let conn =
-                        caddy::tls_connection_info(&tls_stream, alpn, outer_sni, ech_accepted);
-                    if is_h2 {
-                        let io = StreamWrapper::new(tls_stream);
-                        if let Err(err) = handle_h2_connection(
-                            conn_hup,
-                            io,
-                            reported_peer,
-                            local,
-                            state,
-                            script_runtime,
-                            Scheme::Https,
-                            conn,
-                        )
-                        .await
-                        {
-                            async_log(
-                                format!(
-                                    "[listener] connection {} over h2/tls closed with error: {err:?}",
-                                    reported_peer
-                                )
-                                .into_bytes(),
-                            )
-                            .await;
-                        }
-                    } else if let Err(err) = handle_h1_connection_unsplit_fast(
-                        &mut conn_hup,
-                        tls_stream,
+            }
+            Ok(AcceptOutcome::Stream(tls_stream)) => {
+                let alpn = tls_stream
+                    .alpn_protocol()
+                    .and_then(|p| String::from_utf8(p).ok());
+                let is_h2 = matches!(alpn.as_deref(), Some("h2"));
+                let ech_ok = tls_stream.ech_accepted();
+                let ech_accepted = if tls_state.ech_enabled {
+                    Some(ech_ok)
+                } else {
+                    None
+                };
+                // Prefer the actual outer SNI the client sent (recovered
+                // from the wire ClientHello); fall back to the configured
+                // public name only when it is unambiguous and parsing failed.
+                let outer_sni = if ech_ok {
+                    tls_stream
+                        .outer_server_name()
+                        .or_else(|| tls_state.ech_public_name.clone())
+                } else {
+                    None
+                };
+                let conn = caddy::tls_connection_info(&tls_stream, alpn, outer_sni, ech_accepted);
+                if is_h2 {
+                    let io = StreamWrapper::new(tls_stream);
+                    if let Err(err) = handle_h2_connection(
+                        conn_hup,
+                        io,
                         reported_peer,
                         local,
                         state,
-                        Scheme::Https,
                         script_runtime,
+                        Scheme::Https,
                         conn,
                     )
                     .await
                     {
                         async_log(
                             format!(
-                                "[listener] connection {} over tls closed with error: {err:?}",
+                                "[listener] connection {} over h2/tls closed with error: {err:?}",
                                 reported_peer
                             )
                             .into_bytes(),
                         )
                         .await;
                     }
+                } else if let Err(err) = handle_h1_connection_unsplit_fast(
+                    &mut conn_hup,
+                    tls_stream,
+                    reported_peer,
+                    local,
+                    state,
+                    Scheme::Https,
+                    script_runtime,
+                    conn,
+                )
+                .await
+                {
+                    async_log(
+                        format!(
+                            "[listener] connection {} over tls closed with error: {err:?}",
+                            reported_peer
+                        )
+                        .into_bytes(),
+                    )
+                    .await;
                 }
-                Err(err) => log_tls_error(reported_peer, &err),
             }
-        });
-    }
+            Err(err) => log_tls_error(reported_peer, &err),
+        }
+    });
+    Ok(())
 }
 
 fn log_tls_error(peer: std::net::SocketAddr, error: &anyhow::Error) {

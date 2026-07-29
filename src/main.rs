@@ -9,6 +9,7 @@ mod cli;
 mod config;
 mod ech;
 mod file_io;
+mod handoff;
 mod helpers;
 mod http;
 mod hupwatch;
@@ -49,6 +50,7 @@ use crate::reload::SighupBlocked;
 use crate::{
     cli::Cli,
     config::StaticConfig,
+    handoff::HandoffGroup,
     hupwatch::HupWatcher,
     logging::spawn_file_logger,
     pack::USER_MANUAL,
@@ -184,16 +186,17 @@ fn main() -> Result<()> {
     // One listener per worker. This must happen before namespace isolation and
     // capability dropping so sockets bind in the caller's network namespace and
     // privileged ports remain possible.
-    let http_listeners = create_worker_listeners(&config.http_addr, threads)
+    let (http_listeners, http_shared_accept) = create_worker_listeners(&config.http_addr, threads)
         .with_context(|| format!("failed to create HTTP listeners for {}", config.http_addr))?;
-    let tls_listeners: Vec<Option<TcpListener>> = match &config.tls_addr {
-        Some(addr) => create_worker_listeners(addr, threads)
-            .with_context(|| format!("failed to create TLS listeners for {}", addr))?
-            .into_iter()
-            .map(Some)
-            .collect(),
-        None => (0..threads).map(|_| None).collect(),
-    };
+    let (tls_listeners, tls_shared_accept): (Vec<Option<TcpListener>>, bool) =
+        match &config.tls_addr {
+            Some(addr) => {
+                let (listeners, shared_accept) = create_worker_listeners(addr, threads)
+                    .with_context(|| format!("failed to create TLS listeners for {}", addr))?;
+                (listeners.into_iter().map(Some).collect(), shared_accept)
+            }
+            None => ((0..threads).map(|_| None).collect(), false),
+        };
 
     // Build the reverse-proxy TLS client now, before namespace isolation turns
     // /etc into an empty tmpfs — the CA bundle must be read while it's still on
@@ -341,13 +344,34 @@ fn main() -> Result<()> {
         eprintln!("listening on https://{}", tls_local);
     }
 
+    // When workers accept from a shared socket (no kernel load balancing),
+    // rebalance accepted connections round-robin across workers; otherwise a
+    // single worker can drain a whole connect burst and keep those (keep-alive)
+    // connections for their lifetime, turning worker imbalance into tail
+    // latency.
+    let handoff_groups = |shared_accept: bool| -> Vec<Option<HandoffGroup>> {
+        if shared_accept {
+            handoff::handoff_groups(threads)
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else {
+            (0..threads).map(|_| None).collect()
+        }
+    };
+    let http_handoffs = handoff_groups(http_shared_accept);
+    let tls_handoffs = handoff_groups(tls_shared_accept);
+
     let mut handles = Vec::with_capacity(threads);
     let (startup_tx, startup_rx) = std_mpsc::channel();
-    for (i, ((http_listener, tls_listener), reload_rx)) in http_listeners
-        .into_iter()
-        .zip(tls_listeners)
-        .zip(reload_rxs)
-        .enumerate()
+    for (i, ((((http_listener, tls_listener), reload_rx), http_handoff), tls_handoff)) in
+        http_listeners
+            .into_iter()
+            .zip(tls_listeners)
+            .zip(reload_rxs)
+            .zip(http_handoffs)
+            .zip(tls_handoffs)
+            .enumerate()
     {
         let shared = shared.clone();
         let config = config.clone();
@@ -361,6 +385,8 @@ fn main() -> Result<()> {
                     shared,
                     http_listener,
                     tls_listener,
+                    http_handoff,
+                    tls_handoff,
                     reload_rx,
                     startup_tx,
                 ) {
@@ -391,12 +417,15 @@ fn main() -> Result<()> {
 /// own eBPF `ScriptRuntime`, compile its scripts, and serve its listeners. Each
 /// worker is fully isolated — programs are pinned to this thread and never
 /// shared.
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     worker_id: usize,
     config: Arc<StaticConfig>,
     shared: Arc<SharedState>,
     http_listener: TcpListener,
     tls_listener: Option<TcpListener>,
+    http_handoff: Option<HandoffGroup>,
+    tls_handoff: Option<HandoffGroup>,
     reload_rx: mpsc::UnboundedReceiver<ReloadRequest>,
     startup_tx: std_mpsc::Sender<(usize, Result<(), String>)>,
 ) -> Result<()> {
@@ -469,7 +498,16 @@ fn run_worker(
 
             monoio::spawn(worker_reload_loop(script_runtime.clone(), reload_rx));
 
-            amain(shared, script_runtime, hup, http_listener, tls_listener).await
+            amain(
+                shared,
+                script_runtime,
+                hup,
+                http_listener,
+                tls_listener,
+                http_handoff,
+                tls_handoff,
+            )
+            .await
         })
 }
 
@@ -541,15 +579,28 @@ fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
 /// inherited FDs such as socket activation, which cannot be re-bound) we bind
 /// once and `dup` the descriptor to each worker; the kernel still hands each
 /// accepted connection to exactly one acceptor.
-fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<Vec<TcpListener>> {
+///
+/// The returned flag reports whether the listeners share a single accept queue
+/// on a kernel that does not load-balance it. Sharing an accept queue skews
+/// connection placement (one worker can drain a whole connect burst), so
+/// callers must rebalance accepted connections across workers themselves — see
+/// `crate::handoff`.
+fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<(Vec<TcpListener>, bool)> {
     // clap enforces `--threads >= 1`; a zero count would yield no acceptors.
     let count = count.max(1);
     match addr {
         ListenAddr::Socket(socket_addr) => create_bound_worker_listeners(socket_addr, count),
         ListenAddr::Fd(fd) => {
             // Socket activation: the inherited fd cannot be re-bound, so each
-            // worker gets its own dup of the same listening socket.
-            dup_listener_n(*fd, count)
+            // worker gets its own dup of the same listening socket. Hand-off
+            // is only enabled on kernels without REUSEPORT load balancing;
+            // elsewhere accept behavior stays as it always was.
+            let shared_accept = !cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd"
+            )) && count > 1;
+            Ok((dup_listener_n(*fd, count)?, shared_accept))
         }
     }
 }
@@ -559,7 +610,7 @@ fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<Vec<TcpLis
 fn create_bound_worker_listeners(
     socket_addr: &std::net::SocketAddr,
     count: usize,
-) -> Result<Vec<TcpListener>> {
+) -> Result<(Vec<TcpListener>, bool)> {
     let mut listeners = Vec::with_capacity(count);
     for _ in 0..count {
         let socket = Socket::new(
@@ -578,7 +629,7 @@ fn create_bound_worker_listeners(
         socket.listen(1024)?;
         listeners.push(socket.into());
     }
-    Ok(listeners)
+    Ok((listeners, false))
 }
 
 /// OpenBSD and other kernels without Linux-style REUSEPORT load balancing:
@@ -587,7 +638,7 @@ fn create_bound_worker_listeners(
 fn create_bound_worker_listeners(
     socket_addr: &std::net::SocketAddr,
     count: usize,
-) -> Result<Vec<TcpListener>> {
+) -> Result<(Vec<TcpListener>, bool)> {
     let socket = Socket::new(
         Domain::for_address(*socket_addr),
         Type::STREAM,
@@ -600,7 +651,7 @@ fn create_bound_worker_listeners(
     let primary: TcpListener = socket.into();
     let mut listeners = dup_listener_n(primary.as_raw_fd(), count - 1)?;
     listeners.insert(0, primary);
-    Ok(listeners)
+    Ok((listeners, count > 1))
 }
 
 /// Return `n` independent `TcpListener`s, each a `dup` of `fd`.

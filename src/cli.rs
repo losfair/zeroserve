@@ -216,7 +216,8 @@ pub struct Cli {
     /// Number of worker threads, each running its own isolated event loop.
     /// Defaults to the number of available CPU cores.
     /// (independently compiled eBPF programs; listeners via SO_REUSEPORT /
-    /// SO_REUSEPORT_LB where the kernel load-balances, else a shared socket).
+    /// SO_REUSEPORT_LB where the kernel load-balances, else a shared socket
+    /// with accepted connections handed off round-robin across workers).
     #[arg(long, default_value_t = default_worker_threads(), value_parser = must_be_positive)]
     pub threads: usize,
 
