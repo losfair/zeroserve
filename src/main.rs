@@ -32,7 +32,9 @@ mod tls;
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::os::fd::FromRawFd;
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc as std_mpsc};
 
@@ -529,48 +531,95 @@ fn setup_ns_isolation(config: &StaticConfig) -> anyhow::Result<()> {
 
 /// Create one listener per worker thread for the given address.
 ///
-/// For a bound socket address, each worker gets its own `SO_REUSEPORT` socket so
-/// the kernel hash-balances incoming connections across the workers. For an
-/// inherited file descriptor (e.g. systemd socket activation) the single socket
-/// cannot be re-bound, so each worker receives its own `dup`'d descriptor and
-/// the kernel hands each accepted connection to exactly one worker.
+/// On kernels that load-balance accepts across distinct bound sockets (Linux
+/// `SO_REUSEPORT`, FreeBSD `SO_REUSEPORT_LB`), each worker gets its own listening
+/// socket so the kernel hash-balances incoming connections.
+///
+/// OpenBSD's `SO_REUSEPORT` only permits multiple binds — it does **not**
+/// distribute new connections the way Linux does, so multi-socket listen groups
+/// can leave every accept on a single worker. On those platforms (and for
+/// inherited FDs such as socket activation, which cannot be re-bound) we bind
+/// once and `dup` the descriptor to each worker; the kernel still hands each
+/// accepted connection to exactly one acceptor.
 fn create_worker_listeners(addr: &ListenAddr, count: usize) -> Result<Vec<TcpListener>> {
+    // clap enforces `--threads >= 1`; a zero count would yield no acceptors.
+    let count = count.max(1);
     match addr {
-        ListenAddr::Socket(socket_addr) => {
-            let mut listeners = Vec::with_capacity(count);
-            for _ in 0..count {
-                let socket = Socket::new(
-                    Domain::for_address(*socket_addr),
-                    Type::STREAM,
-                    Some(Protocol::TCP),
-                )?;
-                socket.set_reuse_address(true)?;
-                socket.set_reuse_port(true)?;
-                socket.set_nonblocking(true)?;
-                socket.bind(&(*socket_addr).into())?;
-                socket.listen(1024)?;
-                listeners.push(socket.into());
-            }
-            Ok(listeners)
-        }
+        ListenAddr::Socket(socket_addr) => create_bound_worker_listeners(socket_addr, count),
         ListenAddr::Fd(fd) => {
-            let mut listeners = Vec::with_capacity(count);
-            for _ in 0..count {
-                // SAFETY: the caller guarantees `fd` is a valid listening socket
-                // (socket activation). dup gives each worker an independent
-                // descriptor referencing the same underlying socket.
-                let duped = unsafe { libc::dup(*fd) };
-                if duped < 0 {
-                    return Err(std::io::Error::last_os_error())
-                        .with_context(|| format!("failed to dup inherited fd {fd}"));
-                }
-                let listener = unsafe { TcpListener::from_raw_fd(duped) };
-                listener.set_nonblocking(true)?;
-                listeners.push(listener);
-            }
-            Ok(listeners)
+            // Socket activation: the inherited fd cannot be re-bound, so each
+            // worker gets its own dup of the same listening socket.
+            dup_listener_n(*fd, count)
         }
     }
+}
+
+/// Linux / FreeBSD: one independently-bound socket per worker with kernel LB.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn create_bound_worker_listeners(
+    socket_addr: &std::net::SocketAddr,
+    count: usize,
+) -> Result<Vec<TcpListener>> {
+    let mut listeners = Vec::with_capacity(count);
+    for _ in 0..count {
+        let socket = Socket::new(
+            Domain::for_address(*socket_addr),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )?;
+        socket.set_reuse_address(true)?;
+        // FreeBSD's plain SO_REUSEPORT does not load-balance; SO_REUSEPORT_LB does.
+        #[cfg(target_os = "freebsd")]
+        socket.set_reuse_port_lb(true)?;
+        #[cfg(not(target_os = "freebsd"))]
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&(*socket_addr).into())?;
+        socket.listen(1024)?;
+        listeners.push(socket.into());
+    }
+    Ok(listeners)
+}
+
+/// OpenBSD and other kernels without Linux-style REUSEPORT load balancing:
+/// bind once and share the listening socket across workers via `dup`.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+fn create_bound_worker_listeners(
+    socket_addr: &std::net::SocketAddr,
+    count: usize,
+) -> Result<Vec<TcpListener>> {
+    let socket = Socket::new(
+        Domain::for_address(*socket_addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&(*socket_addr).into())?;
+    socket.listen(1024)?;
+    let primary: TcpListener = socket.into();
+    let mut listeners = dup_listener_n(primary.as_raw_fd(), count - 1)?;
+    listeners.insert(0, primary);
+    Ok(listeners)
+}
+
+/// Return `n` independent `TcpListener`s, each a `dup` of `fd`.
+fn dup_listener_n(fd: RawFd, n: usize) -> Result<Vec<TcpListener>> {
+    let mut listeners = Vec::with_capacity(n);
+    for _ in 0..n {
+        // SAFETY: `fd` is a valid listening socket owned by the caller for the
+        // duration of this function; F_DUPFD_CLOEXEC yields an independent
+        // descriptor that is not inherited by spawned children (clang/llc).
+        let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duped < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to dup listening fd {fd}"));
+        }
+        let listener = unsafe { TcpListener::from_raw_fd(duped) };
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
+    Ok(listeners)
 }
 
 #[cfg(target_os = "linux")]
