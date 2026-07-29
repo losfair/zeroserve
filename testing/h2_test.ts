@@ -20,7 +20,7 @@ function h2cRequest(
     return new Promise((resolve, reject) => {
         const client = http2.connect(`http://${hostname}:${port}`);
 
-        client.on("error", (err) => {
+        client.on("error", (err: Error) => {
             client.close();
             reject(err);
         });
@@ -31,7 +31,7 @@ function h2cRequest(
         let headers: Record<string, string> = {};
         const chunks: Buffer[] = [];
 
-        req.on("response", (hdrs) => {
+        req.on("response", (hdrs: http2.IncomingHttpHeaders & http2.IncomingHttpStatusHeader) => {
             status = hdrs[":status"] as number;
             for (const [key, value] of Object.entries(hdrs)) {
                 if (!key.startsWith(":")) {
@@ -50,7 +50,7 @@ function h2cRequest(
             resolve({ status, headers, body });
         });
 
-        req.on("error", (err) => {
+        req.on("error", (err: Error) => {
             client.close();
             reject(err);
         });
@@ -67,7 +67,7 @@ function h2cMultipleRequests(
     return new Promise((resolve, reject) => {
         const client = http2.connect(`http://${hostname}:${port}`);
 
-        client.on("error", (err) => {
+        client.on("error", (err: Error) => {
             client.close();
             reject(err);
         });
@@ -82,7 +82,7 @@ function h2cMultipleRequests(
             let status = 0;
             const chunks: Buffer[] = [];
 
-            req.on("response", (hdrs) => {
+            req.on("response", (hdrs: http2.IncomingHttpHeaders & http2.IncomingHttpStatusHeader) => {
                 status = hdrs[":status"] as number;
             });
 
@@ -100,7 +100,7 @@ function h2cMultipleRequests(
                 }
             });
 
-            req.on("error", (err) => {
+            req.on("error", (err: Error) => {
                 client.close();
                 reject(err);
             });

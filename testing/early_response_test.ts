@@ -138,7 +138,7 @@ function h2cUploadUntilResponse(
             client.close();
             reject(new Error("h2c upload timed out waiting for early response"));
         }, timeoutMs);
-        client.on("error", (err) => {
+        client.on("error", (err: Error) => {
             clearTimeout(timer);
             client.close();
             reject(err);
@@ -172,7 +172,7 @@ function h2cUploadUntilResponse(
             });
         };
 
-        req.on("response", (hdrs) => {
+        req.on("response", (hdrs: http2.IncomingHttpHeaders & http2.IncomingHttpStatusHeader) => {
             responded = true;
             status = hdrs[":status"] as number;
         });
@@ -457,7 +457,7 @@ function h2cFullUpload(
             client.close();
             reject(new Error("h2c bidirectional upload timed out"));
         }, timeoutMs);
-        client.on("error", (err) => {
+        client.on("error", (err: Error) => {
             clearTimeout(timer);
             client.close();
             reject(err);
@@ -469,7 +469,7 @@ function h2cFullUpload(
         });
         let status = 0;
         const responseChunks: Buffer[] = [];
-        req.on("response", (hdrs) => {
+        req.on("response", (hdrs: http2.IncomingHttpHeaders & http2.IncomingHttpStatusHeader) => {
             status = hdrs[":status"] as number;
         });
         req.on("data", (chunk: Buffer) => {
@@ -483,7 +483,7 @@ function h2cFullUpload(
                 body: Buffer.concat(responseChunks).toString("utf-8"),
             });
         });
-        req.on("error", (err) => {
+        req.on("error", (err: Error) => {
             clearTimeout(timer);
             client.close();
             reject(err);
