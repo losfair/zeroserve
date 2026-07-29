@@ -32,9 +32,9 @@ mod tls;
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::os::fd::{FromRawFd, RawFd};
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
 use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc as std_mpsc};
 
