@@ -12,7 +12,8 @@ Linux namespaces and capability dropping.
 
 - **`io_uring` end to end.** All network and disk I/O runs on the
   [`monoio`](https://github.com/bytedance/monoio) runtime, with a per-core
-  worker thread and `SO_REUSEPORT` listeners.
+  worker thread and per-worker listeners (`SO_REUSEPORT` / `SO_REUSEPORT_LB`
+  where the kernel load-balances accepts; a shared listening socket elsewhere).
 - **Single-file sites.** A site is just a tarball. It is indexed at load time
   (path → byte range) and served directly via byte-range reads — no extraction,
   no temp files.
