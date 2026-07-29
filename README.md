@@ -45,7 +45,8 @@ docker run --rm -p 8080:8080 -v "$PWD/site.tar:/srv/site.tar:ro" \
 ```
 
 Images are published to `ghcr.io/losfair/zeroserve` (multi-arch: `amd64`,
-`arm64`).
+`arm64`). Published images are signed by digest with keyless Sigstore
+certificates.
 
 Prebuilt binary from [GitHub releases](https://github.com/losfair/zeroserve/releases):
 
@@ -54,14 +55,41 @@ curl -fsSL "https://github.com/losfair/zeroserve/releases/download/v0.2.11/zeros
   -o zeroserve && chmod +x zeroserve
 ```
 
-From source (requires a recent stable Rust toolchain; Linux only):
+Every release also includes `SHA256SUMS` and a keyless Sigstore bundle for each
+binary. Verify a downloaded release with
+[Cosign](https://docs.sigstore.dev/quickstart/quickstart-cosign/) and, optionally,
+the GitHub CLI:
 
 ```bash
-cargo build --release --locked
-# binary at target/release/zeroserve
+VERSION=v0.2.11
+ASSET="zeroserve-$(uname -m)-linux"
+
+curl -fsSLO "https://github.com/losfair/zeroserve/releases/download/$VERSION/$ASSET"
+curl -fsSLO "https://github.com/losfair/zeroserve/releases/download/$VERSION/$ASSET.sigstore.json"
+curl -fsSLO "https://github.com/losfair/zeroserve/releases/download/$VERSION/SHA256SUMS"
+
+grep " $ASSET$" SHA256SUMS | sha256sum --check -
+cosign verify-blob \
+  --bundle "$ASSET.sigstore.json" \
+  --certificate-identity "https://github.com/losfair/zeroserve/.github/workflows/ci.yml@refs/tags/$VERSION" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  "$ASSET"
+gh attestation verify "$ASSET" --repo losfair/zeroserve
 ```
 
-> zeroserve is Linux-only because it relies on `io_uring`.
+From source (requires the pinned Rust toolchain, Zig 0.14.0, and
+`cargo-zigbuild` 0.22.3; Linux only):
+
+```bash
+cargo install cargo-zigbuild --version 0.22.3 --locked
+./tools/reproducible-build.sh x86_64-unknown-linux-gnu.2.31 \
+  target/zeroserve-x86_64-linux
+```
+
+The release workflow builds each Linux target twice from independent source and
+target directories and requires byte-for-byte identical results before signing
+or publishing. `cargo build --release --locked` remains the normal development
+build command.
 
 ## Quick start
 

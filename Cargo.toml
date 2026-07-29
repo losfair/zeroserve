@@ -9,6 +9,7 @@ panic = "abort"
 [build-dependencies]
 cc = "1"
 lalrpop = "0.23"
+sha2 = "0.10"
 
 [dependencies]
 lalrpop-util = "0.23"
