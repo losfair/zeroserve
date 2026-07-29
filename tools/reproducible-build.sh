@@ -54,7 +54,12 @@ export SOURCE_DATE_EPOCH
 export TZ=UTC
 export ZERO_AR_DATE=1
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }${joined_rustflags:1}"
-export CFLAGS="${CFLAGS:+$CFLAGS }-ffile-prefix-map=$cargo_target_dir=./target -ffile-prefix-map=$repo_root=."
+# CXXFLAGS matters too: BoringSSL (via boring-sys) is C++, and its
+# OPENSSL_PUT_ERROR macro embeds __FILE__ paths from the cargo target dir
+# into .rodata. Without the C++ remap the two builds differ.
+prefix_map_flags="-ffile-prefix-map=$cargo_target_dir=./target -ffile-prefix-map=$repo_root=."
+export CFLAGS="${CFLAGS:+$CFLAGS }$prefix_map_flags"
+export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$prefix_map_flags"
 
 umask 022
 cargo zigbuild --release --locked --target "$zig_target"

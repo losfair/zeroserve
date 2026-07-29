@@ -488,11 +488,23 @@ function h2cFullUpload(
             client.close();
             reject(err);
         });
+        // Write chunks one at a time, waiting for each flush. Letting them
+        // pile up in the stream buffer makes Writable flush them via _writev,
+        // which some runtimes' node:http2 shims (e.g. the Deno packaged for
+        // OpenBSD) leave unimplemented.
         const chunk = Buffer.alloc(chunkSize, 0x61);
-        for (let i = 0; i < chunkCount; i++) {
-            req.write(chunk);
-        }
-        req.end();
+        (async () => {
+            for (let i = 0; i < chunkCount; i++) {
+                await new Promise<void>((res, rej) =>
+                    req.write(chunk, (err: Error | null | undefined) => err ? rej(err) : res())
+                );
+            }
+            req.end();
+        })().catch((err) => {
+            clearTimeout(timer);
+            client.close();
+            reject(err);
+        });
     });
 }
 

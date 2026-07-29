@@ -491,26 +491,85 @@ Deno.test("e2e: h2c advertises enlarged flow-control windows", async () => {
     // The h2 crate's default 64 KiB windows cap upload throughput at
     // 64 KiB per round trip, which throttles large reverse-proxied uploads
     // (e.g. git pushes). The server must advertise the configured settings.
-    function fetchRemoteSettings(
+    // Reads the server's SETTINGS frame off a raw h2c connection. node:http2's
+    // remoteSettings event would be simpler, but some runtimes' node compat
+    // shims (e.g. the Deno packaged for OpenBSD) never emit it.
+    async function fetchRemoteSettings(
         hostname: string,
         port: number,
-    ): Promise<http2.Settings> {
-        return new Promise((resolve, reject) => {
-            const client = http2.connect(`http://${hostname}:${port}`);
-            const finish = (fn: () => void) => {
-                clearTimeout(timer);
-                fn();
-                // Closing from inside the event handler crashes some runtimes;
-                // defer it to the next tick.
-                setTimeout(() => client.close(), 0);
-            };
-            const timer = setTimeout(
-                () => finish(() => reject(new Error("timed out waiting for SETTINGS"))),
-                10000,
-            );
-            client.on("error", (err) => finish(() => reject(err)));
-            client.on("remoteSettings", (s) => finish(() => resolve(s)));
-        });
+    ): Promise<{ initialWindowSize?: number; maxFrameSize?: number }> {
+        const conn = await Deno.connect({ hostname, port });
+        let timedOut = false;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            try {
+                conn.close();
+            } catch {
+                // already closed
+            }
+        }, 10000);
+        try {
+            // Client preface plus an empty SETTINGS frame.
+            const preface = new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            const emptySettings = new Uint8Array([0, 0, 0, 0x4, 0, 0, 0, 0, 0]);
+            const out = new Uint8Array(preface.length + emptySettings.length);
+            out.set(preface);
+            out.set(emptySettings, preface.length);
+            for (let written = 0; written < out.length;) {
+                written += await conn.write(out.subarray(written));
+            }
+
+            let buf = new Uint8Array(0);
+            const chunk = new Uint8Array(16 * 1024);
+            for (;;) {
+                // Parse complete frames: 3-byte length, type, flags, stream id.
+                while (buf.length >= 9) {
+                    const len = (buf[0] << 16) | (buf[1] << 8) | buf[2];
+                    if (buf.length < 9 + len) {
+                        break;
+                    }
+                    const type = buf[3];
+                    const flags = buf[4];
+                    const payload = buf.subarray(9, 9 + len);
+                    if (type === 0x4 && (flags & 0x1) === 0) {
+                        const settings: { initialWindowSize?: number; maxFrameSize?: number } = {};
+                        for (let off = 0; off + 6 <= payload.length; off += 6) {
+                            const id = (payload[off] << 8) | payload[off + 1];
+                            const value = (payload[off + 2] << 24 >>> 0) |
+                                (payload[off + 3] << 16) |
+                                (payload[off + 4] << 8) |
+                                payload[off + 5];
+                            if (id === 0x4) {
+                                settings.initialWindowSize = value >>> 0;
+                            } else if (id === 0x5) {
+                                settings.maxFrameSize = value >>> 0;
+                            }
+                        }
+                        return settings;
+                    }
+                    buf = buf.subarray(9 + len);
+                }
+                const n = await conn.read(chunk).catch(() => null);
+                if (n === null) {
+                    throw new Error(
+                        timedOut ? "timed out waiting for SETTINGS" : "connection closed before SETTINGS",
+                    );
+                }
+                const next = new Uint8Array(buf.length + n);
+                next.set(buf);
+                next.set(chunk.subarray(0, n), buf.length);
+                buf = next;
+            }
+        } finally {
+            clearTimeout(timer);
+            if (!timedOut) {
+                try {
+                    conn.close();
+                } catch {
+                    // already closed
+                }
+            }
+        }
     }
 
     const siteDir = await Deno.makeTempDir();
