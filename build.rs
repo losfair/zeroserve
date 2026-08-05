@@ -42,8 +42,7 @@ const TINYCC_SOURCES: &[&str] = &[
 const TINYCC_COMMIT: &str = "afcb3aa1a59568fec8b4bb604e43686723e34c94";
 const TINYCC_ZIP_URL: &str =
     "https://github.com/losfair/tinycc/archive/afcb3aa1a59568fec8b4bb604e43686723e34c94.zip";
-const TINYCC_ZIP_SHA256: &str =
-    "51ea4a8e34ca18a1f4eebe32d2c7da3e16ca2a93d7ce40bcda360c2bd8e5c230";
+const TINYCC_ZIP_SHA256: &str = "51ea4a8e34ca18a1f4eebe32d2c7da3e16ca2a93d7ce40bcda360c2bd8e5c230";
 const TINYCC_BUILD_CACHE_VERSION: &str = "1";
 
 fn main() {
