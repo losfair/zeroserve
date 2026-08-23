@@ -7,6 +7,7 @@ import {
   hasBpfToolchain,
   packSite,
   repoRoot,
+  spawnZeroserve,
   stopProcess,
   waitForServer,
   withZeroserve,
@@ -7891,6 +7892,87 @@ http://bar.localhost:${caddyPort} {
     }
   },
 });
+
+for (const compiler of ["tcc", "clang"]) {
+  Deno.test({
+    name:
+      `e2e: Caddyfile static region analysis matches stock Caddy (${compiler})`,
+    ignore: !canRunScripts || !canRunCaddy,
+    async fn() {
+      const siteDir = await Deno.makeTempDir();
+      let caddy: { origin: string; stop: () => Promise<void> } | null = null;
+      try {
+        const caddyPort = await getFreePort();
+        const caddyfilePath = join(siteDir, "Caddyfile");
+        await Deno.writeTextFile(
+          caddyfilePath,
+          `{
+  admin off
+  auto_https off
+}
+
+:${caddyPort} {
+  header /analysis X-Static-Region required
+  respond /analysis "static analysis ok" 202
+  respond "not found" 404
+}
+`,
+        );
+
+        caddy = await withCaddy(siteDir, caddyfilePath, caddyPort);
+        const probes: Probe[] = [
+          {
+            path: "/analysis",
+            compareHeaders: ["x-static-region"],
+            expectedStatus: 202,
+            expectedBody: "static analysis ok",
+            expectedHeaders: { "x-static-region": "required" },
+          },
+          {
+            path: "/missing",
+            expectedStatus: 404,
+            expectedBody: "not found",
+          },
+        ];
+
+        const zeroserve = await spawnZeroserve([
+          "--ebpf-compiler",
+          compiler,
+          "--ebpf-require-static-region-analysis",
+          "--caddy",
+          caddyfilePath,
+        ]);
+        try {
+          const zeroserveOrigin = `http://127.0.0.1:${zeroserve.httpPort}`;
+          for (const probe of probes) {
+            const caddyObserved = await fetchObserved(caddy, probe);
+            const zeroserveObserved = await fetchObserved(
+              zeroserveOrigin,
+              probe,
+            );
+            assertEquals(
+              zeroserveObserved,
+              caddyObserved,
+              `${compiler}: ${probeLabel("static region analysis", probe)}`,
+            );
+            assertExpectedResponse(
+              caddyObserved,
+              probe,
+              `${compiler} static region analysis`,
+            );
+          }
+        } finally {
+          await zeroserve.stop();
+        }
+      } finally {
+        if (caddy !== null) {
+          await caddy.stop();
+        }
+        await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+      }
+    },
+  });
+}
 
 Deno.test({
   name: "e2e: Caddyfile explicit TLS certificates match stock Caddy",

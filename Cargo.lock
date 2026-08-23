@@ -136,13 +136,11 @@ dependencies = [
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.6"
+version = "0.4.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2401236ad45a2040a7fa4b6db0ec91e9d90d47e78553e9c40416ef6bbd563c2a"
+checksum = "fda0b0042fa1c5d8401387e5f80b21c932c323848ccbde1801ba2a57d32ffa76"
 dependencies = [
- "bindgen",
  "cfg-if",
- "cmake",
  "elf",
  "futures",
  "libc",
@@ -223,8 +221,6 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
- "log",
- "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1791,16 +1787,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
-name = "prettyplease"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
-dependencies = [
- "proc-macro2",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2969,7 +2955,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zeroserve"
-version = "0.2.12-alpha.12"
+version = "0.2.12-alpha.13"
 dependencies = [
  "anyhow",
  "arc-swap",

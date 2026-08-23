@@ -1,6 +1,6 @@
 [package]
 name = "zeroserve"
-version = "0.2.12-alpha.12"
+version = "0.2.12-alpha.13"
 edition = "2024"
 
 [profile.release]
@@ -15,8 +15,7 @@ sha2 = "0.10"
 lalrpop-util = "0.23"
 arc-swap = "1"
 chrono = "0.4"
-# OpenBSD-capable async-ebpf (coroutine JIT + libclang discovery).
-async-ebpf = "0.4.0-alpha.6"
+async-ebpf = "0.4.0-alpha.8"
 base64ct = { version = "1", features = ["alloc"] }
 dashmap = "6"
 blake3 = "1"
