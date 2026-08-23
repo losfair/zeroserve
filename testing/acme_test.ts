@@ -58,6 +58,23 @@ async function hasOpenssl(): Promise<boolean> {
   }
 }
 
+async function commandSupportsFlag(
+  command: string,
+  flag: string,
+): Promise<boolean> {
+  try {
+    const out = await new Deno.Command(command, {
+      args: ["-h"],
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const help = decoder.decode(out.stdout) + decoder.decode(out.stderr);
+    return new RegExp(`^\\s*-${flag}(?:\\s|$)`, "m").test(help);
+  } catch {
+    return false;
+  }
+}
+
 async function openssl(args: string[]): Promise<void> {
   const out = await new Deno.Command("openssl", {
     args,
@@ -78,6 +95,8 @@ const challtestsrvBin = await resolveBin(
 );
 const available = pebbleBin !== null && challtestsrvBin !== null &&
   await hasOpenssl();
+const challtestsrvSupportsDoh = challtestsrvBin !== null &&
+  await commandSupportsFlag(challtestsrvBin, "doh");
 
 const DOMAIN = "zs.test";
 
@@ -200,26 +219,26 @@ async function withPebble(
 
     // challtestsrv: DNS only, every A query -> 127.0.0.1, no AAAA (Pebble must
     // reach zeroserve's IPv4 listener).
+    const challtestsrvArgs = [
+      "-dns01",
+      `:${dnsPort}`,
+      "-defaultIPv4",
+      "127.0.0.1",
+      "-defaultIPv6",
+      "",
+      "-http01",
+      "",
+      "-https01",
+      "",
+      "-tlsalpn01",
+      "",
+      "-management",
+      `:${await getFreePort()}`,
+    ];
+    if (challtestsrvSupportsDoh) challtestsrvArgs.push("-doh", "");
     spawn(
       new Deno.Command(challtestsrvBin!, {
-        args: [
-          "-dnsserver",
-          `:${dnsPort}`,
-          "-defaultIPv4",
-          "127.0.0.1",
-          "-defaultIPv6",
-          "",
-          "-http01",
-          "",
-          "-https01",
-          "",
-          "-tlsalpn01",
-          "",
-          "-doh",
-          "",
-          "-management",
-          `:${await getFreePort()}`,
-        ],
+        args: challtestsrvArgs,
         stdout: "null",
         stderr: "piped",
       }),
