@@ -136,9 +136,9 @@ dependencies = [
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.8"
+version = "0.4.0-alpha.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fda0b0042fa1c5d8401387e5f80b21c932c323848ccbde1801ba2a57d32ffa76"
+checksum = "268c46a6d4fd0d5ad47f7127472f61a09193301ea4de3fed34eaa05b44a11372"
 dependencies = [
  "cfg-if",
  "elf",

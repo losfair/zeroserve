@@ -1438,6 +1438,7 @@ impl ScriptRuntime {
                 Arc::new(EventListener),
                 HELPER_TABLES,
             )
+            .with_stack_frame_size(8 * 1024)
             .with_code_size_limit(self.code_size_limit)
             .require_static_region_analysis(self.require_static_region_analysis),
         );

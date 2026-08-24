@@ -93,7 +93,7 @@ fn compile_file_with_clang(source: &Path, include_dir: &Path, output: &Path) -> 
         let llc_status = Command::new("llc")
             .args([
                 "-march=bpf",
-                "-bpf-stack-size=4096",
+                "-bpf-stack-size=8192",
                 "-mcpu=v3",
                 "-filetype=obj",
             ])
