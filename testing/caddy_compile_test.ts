@@ -622,6 +622,194 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 }
 
 Deno.test({
+  name: "compiled Caddy routes reuse scratch and support deep local calls",
+  ignore: !canRunScripts,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const siteDir = await Deno.makeTempDir();
+    let tarPath: string | null = null;
+    try {
+      await Deno.mkdir(join(siteDir, ".zeroserve", "scripts"), {
+        recursive: true,
+      });
+      await Deno.writeTextFile(join(siteDir, "index.html"), "fallback");
+
+      const requestHeaders: Record<string, string[]> = {};
+      const query = new URLSearchParams();
+      for (let id = 0; id < 24; id++) {
+        requestHeaders[`X-{http.request.uri.query.name${id}}`] = [
+          `{http.request.uri.query.value${id}}`,
+        ];
+        query.set(`name${id}`, `Scratch-${id}`);
+        query.set(`value${id}`, `value-${id}`);
+      }
+
+      // Keep enough operations in one route to overflow a 4 KiB frame if the
+      // generator gives every expansion its own raw/len scalar locals.
+      const scalarStressHeaders: Record<string, string[]> = {};
+      for (let id = 0; id < 320; id++) {
+        scalarStressHeaders[`X-Stress-${id}`] = [
+          `{http.request.uri.query.stress${id}}`,
+        ];
+      }
+
+      // Response entrypoints are not split into request-route helpers, so a
+      // wide matcher list must share one fixed response-hook scratch area.
+      const responseRoutes = Array.from({ length: 24 }, (_, id) => ({
+        match: [{ method: [`METHOD${id}`] }],
+        handle: [{ handler: "vars", matched: String(id) }],
+      }));
+
+      let deepHandler: Record<string, unknown> = {
+        handler: "static_response",
+        status_code: 209,
+        body: "deep route",
+      };
+      for (let depth = 0; depth < 20; depth++) {
+        deepHandler = {
+          handler: "subroute",
+          routes: [{ handle: [deepHandler] }],
+        };
+      }
+
+      const caddyConfig = {
+        apps: {
+          http: {
+            servers: {
+              srv0: {
+                routes: [
+                  {
+                    match: [{ path: ["/wide"] }],
+                    handle: [
+                      {
+                        handler: "headers",
+                        request: { set: requestHeaders },
+                      },
+                      {
+                        handler: "static_response",
+                        status_code: 208,
+                        body: "wide route",
+                      },
+                    ],
+                  },
+                  {
+                    match: [{ path: ["/deep"] }],
+                    handle: [deepHandler],
+                  },
+                  {
+                    match: [{
+                      path: ["/not-short"],
+                      not: [
+                        { method: ["GET"] },
+                        {
+                          path_regexp: {
+                            name: "late",
+                            pattern: "^/(.*)$",
+                          },
+                        },
+                      ],
+                    }],
+                    handle: [{
+                      handler: "static_response",
+                      status_code: 500,
+                      body: "not should not match",
+                    }],
+                  },
+                  {
+                    match: [{ path: ["/not-short"] }],
+                    handle: [{
+                      handler: "static_response",
+                      status_code: 211,
+                      body: "capture={http.regexp.late.1}",
+                    }],
+                  },
+                  {
+                    match: [{ path: ["/scalar-stress"] }],
+                    handle: [
+                      {
+                        handler: "headers",
+                        request: { set: scalarStressHeaders },
+                      },
+                      {
+                        handler: "static_response",
+                        status_code: 210,
+                        body: "scalar stress",
+                      },
+                    ],
+                  },
+                  {
+                    match: [{ path: ["/response-wide"] }],
+                    handle: [
+                      {
+                        handler: "intercept",
+                        handle_response: [{
+                          match: { status_code: [2] },
+                          routes: responseRoutes,
+                        }],
+                      },
+                      {
+                        handler: "static_response",
+                        status_code: 207,
+                        body: "response wide",
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      };
+      const caddyConfigPath = join(siteDir, "caddy.json");
+      await Deno.writeTextFile(caddyConfigPath, JSON.stringify(caddyConfig));
+
+      const zeroservePath = await getZeroservePath();
+      const compiled = await new Deno.Command(zeroservePath, {
+        args: ["--caddy-compile", caddyConfigPath],
+        cwd: repoRoot,
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!compiled.success) {
+        throw new Error(new TextDecoder().decode(compiled.stderr));
+      }
+      await Deno.writeFile(
+        join(siteDir, ".zeroserve", "scripts", "caddy.c"),
+        compiled.stdout,
+      );
+
+      tarPath = await packSite(siteDir);
+      await withZeroserve(tarPath, async (baseUrl) => {
+        const wide = await fetch(`${baseUrl}/wide?${query}`);
+        assertEquals(wide.status, 208);
+        assertEquals(await wide.text(), "wide route");
+
+        const deep = await fetch(`${baseUrl}/deep`);
+        assertEquals(deep.status, 209);
+        assertEquals(await deep.text(), "deep route");
+
+        const notShort = await fetch(`${baseUrl}/not-short`);
+        assertEquals(notShort.status, 211);
+        assertEquals(
+          await notShort.text(),
+          "capture={http.regexp.late.1}",
+        );
+
+        const responseWide = await fetch(`${baseUrl}/response-wide`);
+        assertEquals(responseWide.status, 207);
+        assertEquals(await responseWide.text(), "response wide");
+      });
+    } finally {
+      await Deno.remove(siteDir, { recursive: true }).catch(() => {});
+      if (tarPath) {
+        await Deno.remove(tarPath).catch(() => {});
+      }
+    }
+  },
+});
+
+Deno.test({
   name: "compile Caddy JSON to eBPF middleware and serve it",
   ignore: !canRunScripts,
   sanitizeResources: false,
@@ -10366,8 +10554,7 @@ Deno.test({
 });
 
 Deno.test({
-  name:
-    "Caddy reverse_proxy response-only handle_response routes are rejected",
+  name: "Caddy reverse_proxy response-only handle_response routes are rejected",
   ignore: !canRunScripts,
   sanitizeResources: false,
   sanitizeOps: false,

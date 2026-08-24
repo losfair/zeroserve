@@ -50,6 +50,10 @@ pub(crate) const SCRIPT_CALL_SECTION_PREFIX: &str = "zeroserve.call.";
 /// back a JSON configuration handle (e.g. `zeroserve.init.acme_config`).
 pub(crate) const SCRIPT_INIT_SECTION_PREFIX: &str = "zeroserve.init.";
 const MAX_EXTERNAL_OBJECTS: usize = 32;
+/// Total stack available to one eBPF invocation. Caddy-compatible routing uses
+/// one 4 KiB frame per generated route helper, so retain the compiler's frame
+/// size while allowing substantially deeper local call graphs.
+const SCRIPT_GUEST_STACK_SIZE: usize = 64 * 4096 + 512;
 /// Maximum depth of nested `zs_call` invocations. Bounds runaway recursion
 /// (script A calling B calling A …) and the total memory a single request can
 /// fan out across script contexts.
@@ -1438,7 +1442,7 @@ impl ScriptRuntime {
                 Arc::new(EventListener),
                 HELPER_TABLES,
             )
-            .with_stack_frame_size(8 * 1024)
+            .with_guest_stack_size(SCRIPT_GUEST_STACK_SIZE)
             .with_code_size_limit(self.code_size_limit)
             .require_static_region_analysis(self.require_static_region_analysis),
         );

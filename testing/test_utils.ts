@@ -45,7 +45,7 @@ export async function compileScriptObject(
     ]);
     await runCommand("llc", [
       "-march=bpf",
-      "-bpf-stack-size=8192",
+      "-bpf-stack-size=4096",
       "-mcpu=v3",
       "-filetype=obj",
       bcPath,

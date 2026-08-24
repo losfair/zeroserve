@@ -318,6 +318,7 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
     )?;
     generator.emit_preamble();
     generator.line(HOST_TABLE_MARKER);
+    generator.line(REQUEST_ROUTE_FUNCTIONS_MARKER);
     generator.blank();
 
     let mut groups = BTreeMap::<String, usize>::new();
@@ -361,11 +362,10 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
                 warnings.push(warning);
             }
         }
-        let out = resolve_host_hoist_markers(
-            &generator.out,
-            generator.host_hoist_used,
-            &generator.host_table,
-        );
+        let out =
+            resolve_request_route_functions(&generator.out, &generator.request_route_functions);
+        let out =
+            resolve_host_hoist_markers(&out, generator.host_hoist_used, &generator.host_table);
         return Ok((out, warnings));
     }
     let mut pending_cleanup_needed = false;
@@ -374,67 +374,62 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
         generator.named_routes = compiled.named_routes.clone();
         generator.error_routes = compiled.error_routes.clone();
         generator.blank();
-        generator.line(&format!(
+        let label = format!(
             "/* server {}, route {} */",
             c_comment(&compiled.server_name),
             compiled.route_index
-        ));
-        if !generator.error_routes.is_empty() {
-            generator.line("zs_meta_set(ZS_STR(\"zs.caddy.has_error_routes\"), ZS_STR(\"1\"));");
-            generator.emit_pending_matcher_error()?;
-        }
-        // Brace-scope each route so its matcher scratch buffers get tight
-        // lifetimes: LLVM stack coloring then overlays buffers from different
-        // routes into the same stack slots, keeping entry() within the BPF
-        // stack limit regardless of route count.
-        generator.line("{");
-        generator.indent += 1;
-        let matched = generator.emit_route_match(&compiled.route)?;
-        if match_is_statically_false(&matched) {
-            generator.indent -= 1;
-            generator.line("}");
-            continue;
-        }
-        let match_can_set_error = route_match_can_set_error(&compiled.route);
-        if match_can_set_error {
-            let match_id = generator.next_id();
-            generator.line(&format!("int route_match_{match_id} = ({matched});"));
-            generator.emit_pending_matcher_error()?;
-            generator.line(&format!("if (route_match_{match_id}) {{"));
-        } else {
-            generator.line(&format!("if ({matched}) {{"));
-        }
-        generator.indent += 1;
-        generator.line("if (zs_response_pending() != 0) return 0;");
-
-        let grouped = generator.emit_route_group_guard(&compiled.route, "route")?;
-
-        let terminal = compiled.route.terminal;
-        let stopped = generator.emit_handlers(&compiled.route.handlers)?;
-        if terminal && !stopped {
-            generator.emit_terminal_empty_handler("route");
-        }
-
-        if grouped {
-            generator.indent -= 1;
-            generator.line("}");
-        }
-
-        generator.indent -= 1;
-        generator.line("}");
-        let clear_unmatched_response = match_can_set_error || pending_cleanup_needed;
-        if clear_unmatched_response {
-            generator.line("else if (zs_response_pending() != 0) {");
+        );
+        generator.line(&label);
+        let (route_fn, stopped) = generator.capture_request_route(&label, |generator| {
+            if !generator.error_routes.is_empty() {
+                generator
+                    .line("zs_meta_set(ZS_STR(\"zs.caddy.has_error_routes\"), ZS_STR(\"1\"));");
+                generator.emit_pending_matcher_error()?;
+            }
+            let matched = generator.emit_route_match(&compiled.route)?;
+            if match_is_statically_false(&matched) {
+                return Ok(true);
+            }
+            let match_can_set_error = route_match_can_set_error(&compiled.route);
+            if match_can_set_error {
+                let match_id = generator.next_id();
+                generator.line(&format!("int route_match_{match_id} = ({matched});"));
+                generator.emit_pending_matcher_error()?;
+                generator.line(&format!("if (route_match_{match_id}) {{"));
+            } else {
+                generator.line(&format!("if ({matched}) {{"));
+            }
             generator.indent += 1;
-            generator.line("zs_response_clear();");
+            generator.line("if (zs_response_pending() != 0) return 0;");
+
+            let grouped = generator.emit_route_group_guard(&compiled.route, "route")?;
+            let stopped = generator.emit_handlers(&compiled.route.handlers)?;
+            if compiled.route.terminal && !stopped {
+                generator.emit_terminal_empty_handler("route");
+            }
+            if grouped {
+                generator.indent -= 1;
+                generator.line("}");
+            }
             generator.indent -= 1;
             generator.line("}");
-        }
+            let clear_unmatched_response = match_can_set_error || pending_cleanup_needed;
+            if clear_unmatched_response {
+                generator.line("else if (zs_response_pending() != 0) {");
+                generator.indent += 1;
+                generator.line("zs_response_clear();");
+                generator.indent -= 1;
+                generator.line("}");
+            }
+            Ok(stopped)
+        })?;
+        generator.line(&format!(
+            "if ({}) return 0;",
+            generator.request_route_call(&route_fn)
+        ));
         if !compiled.route.terminal && !stopped {
             pending_cleanup_needed = true;
         }
-        generator.indent -= 1;
-        generator.line("}");
     }
 
     generator.blank();
@@ -450,11 +445,8 @@ pub fn compile_caddy_json_collecting(source: &str) -> Result<(String, Vec<String
             warnings.push(warning);
         }
     }
-    let out = resolve_host_hoist_markers(
-        &generator.out,
-        generator.host_hoist_used,
-        &generator.host_table,
-    );
+    let out = resolve_request_route_functions(&generator.out, &generator.request_route_functions);
+    let out = resolve_host_hoist_markers(&out, generator.host_hoist_used, &generator.host_table);
     Ok((out, warnings))
 }
 
@@ -469,6 +461,10 @@ const HOST_REFRESH_MARKER: &str = "/*ZS_HOST_REFRESH*/";
 /// Marker emitted at file scope before `entry()`; replaced by the sorted
 /// exact-host dispatch table when any host matcher interned a pattern into it.
 const HOST_TABLE_MARKER: &str = "/*ZS_HOST_TABLE*/";
+
+/// Marker emitted at file scope before the request entrypoint; replaced by
+/// request-route helper definitions after all nested routes have been emitted.
+const REQUEST_ROUTE_FUNCTIONS_MARKER: &str = "/*ZS_REQUEST_ROUTE_FUNCTIONS*/";
 
 /// Statements that (re)load and normalize the request host into the shared
 /// hoisted buffer (and re-resolve its dispatch-table id when a table exists).
@@ -586,6 +582,74 @@ fn resolve_host_hoist_markers(source: &str, used: bool, table: &BTreeMap<String,
     out
 }
 
+fn resolve_request_route_functions(source: &str, functions: &[String]) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut replaced = false;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == REQUEST_ROUTE_FUNCTIONS_MARKER && !replaced {
+            out.push_str(&functions.join("\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    debug_assert!(replaced, "request route functions marker is missing");
+    out
+}
+
+fn request_route_returns(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let statement = line.trim();
+        let is_stop = statement == "return 0;"
+            || (statement.starts_with("if (") && statement.ends_with(" return 0;"));
+        if is_stop {
+            let offset = line
+                .rfind("return 0;")
+                .expect("route stop statement contains return");
+            out.push_str(&line[..offset]);
+            out.push_str("return 1;");
+            out.push_str(&line[offset + "return 0;".len()..]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn without_marker_lines(source: &str, markers: &[&str]) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        if !markers.contains(&line.trim()) {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn caddy_scratch_declaration(caps: [usize; 3]) -> String {
+    let mut fields = String::new();
+    for (slot, cap) in caps.into_iter().enumerate() {
+        if cap == 0 {
+            continue;
+        }
+        fields.push_str("    struct { union {");
+        for size in [2, 4, 32, 256, 512, 1024] {
+            if size <= cap {
+                fields.push_str(&format!(" char b{size}[{size}];"));
+            }
+        }
+        fields.push_str(&format!(
+            " }} bytes; zs_s64 raw; zs_u64 len; }} slot{slot};\n"
+        ));
+    }
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!("  struct {{\n{fields}  }} caddy_scratch;\n")
+    }
+}
+
 struct CompiledRoute {
     server_name: String,
     route_index: usize,
@@ -606,6 +670,11 @@ struct Generator {
     /// the caller, not embedded in the generated script.
     ignored_warnings: Vec<String>,
     response_hooks: Vec<Vec<String>>,
+    response_scratch_caps: Vec<[usize; 3]>,
+    request_route_functions: Vec<String>,
+    request_scratch_active: bool,
+    request_scratch_caps: [usize; 3],
+    host_hoist_scope_used: bool,
     current_response_hook: Option<usize>,
     access_log_config: AccessLogConfig,
     tls_connection_policies: Vec<TlsConnectionPolicy>,
@@ -1083,10 +1152,22 @@ impl Generator {
                 c_comment(&compiled.server_name),
                 compiled.route_index
             ));
-            let stopped = self.emit_handlers(&compiled.route.handlers)?;
-            if !stopped {
-                self.emit_terminal_empty_handler("route");
-            }
+            let label = format!(
+                "/* exact-host server {}, route {} */",
+                c_comment(&compiled.server_name),
+                compiled.route_index
+            );
+            let (route_fn, _) = self.capture_request_route(&label, |generator| {
+                let stopped = generator.emit_handlers(&compiled.route.handlers)?;
+                if !stopped {
+                    generator.emit_terminal_empty_handler("route");
+                }
+                Ok(())
+            })?;
+            self.line(&format!(
+                "if ({}) return 0;",
+                self.request_route_call(&route_fn)
+            ));
             self.line("break;");
             self.indent -= 1;
         }
@@ -1129,6 +1210,22 @@ impl Generator {
         if route.matcher_sets.is_empty() {
             return Ok("1".to_string());
         }
+        if self.using_generated_scratch() {
+            let id = self.next_id();
+            let result = format!("route_match_result_{id}");
+            self.code_line(&format!("int {result} = 0;"));
+            let mut all_false = true;
+            for set in &route.matcher_sets {
+                self.code_line(&format!("if (!{result}) {{"));
+                self.indent += 1;
+                let set_expr = self.emit_matcher_set(set)?;
+                all_false &= match_is_statically_false(&set_expr);
+                self.code_line(&format!("{result} = ({set_expr});"));
+                self.indent -= 1;
+                self.code_line("}");
+            }
+            return Ok(if all_false { "0".to_string() } else { result });
+        }
         let mut set_exprs = Vec::new();
         for set in &route.matcher_sets {
             set_exprs.push(self.emit_matcher_set(set)?);
@@ -1139,6 +1236,34 @@ impl Generator {
     fn emit_matcher_set(&mut self, set: &MatcherSet) -> Result<String> {
         if set.is_empty() {
             return Ok("1".to_string());
+        }
+        if self.using_generated_scratch() {
+            let id = self.next_id();
+            let result = format!("matcher_set_result_{id}");
+            self.code_line(&format!("int {result} = 1;"));
+            let mut statically_false = false;
+            for phase in [
+                MatcherEvalPhase::Captures,
+                MatcherEvalPhase::Plain,
+                MatcherEvalPhase::SetsError,
+            ] {
+                for (name, value) in set {
+                    if matcher_eval_phase(name, value) == phase {
+                        self.code_line(&format!("if ({result}) {{"));
+                        self.indent += 1;
+                        let matcher = self.emit_matcher(name, value)?;
+                        statically_false |= match_is_statically_false(&matcher);
+                        self.code_line(&format!("{result} = ({matcher});"));
+                        self.indent -= 1;
+                        self.code_line("}");
+                    }
+                }
+            }
+            return Ok(if statically_false {
+                "0".to_string()
+            } else {
+                result
+            });
         }
         let mut exprs = Vec::new();
         for phase in [
@@ -1187,6 +1312,23 @@ impl Generator {
                 if sets.is_empty() {
                     return Ok("1".to_string());
                 }
+                if self.using_generated_scratch() {
+                    let id = self.next_id();
+                    let result = format!("not_match_result_{id}");
+                    self.code_line(&format!("int {result} = 0;"));
+                    for set in sets {
+                        let obj = set.as_object().ok_or_else(|| {
+                            anyhow!("http.matchers.not entries must be matcher sets")
+                        })?;
+                        self.code_line(&format!("if (!{result}) {{"));
+                        self.indent += 1;
+                        let set = self.emit_matcher_set(obj)?;
+                        self.code_line(&format!("{result} = ({set});"));
+                        self.indent -= 1;
+                        self.code_line("}");
+                    }
+                    return Ok(format!("!{result}"));
+                }
                 let mut exprs = Vec::new();
                 for set in sets {
                     let obj = set
@@ -1214,24 +1356,28 @@ impl Generator {
             return Ok("(0)".to_string());
         }
         let id = self.next_id();
-        self.code_line(&format!("char {label}_{id}[512];"));
-        self.code_line(&format!(
-            "zs_s64 {label}_{id}_raw = {helper}({label}_{id}, sizeof({label}_{id}));"
-        ));
-        self.code_line(&format!(
-            "zs_u64 {label}_{id}_len = zs_caddy_clamp_len({label}_{id}_raw, sizeof({label}_{id}));"
-        ));
+        let buffer_name = format!("{label}_{id}");
+        let buffer = self.generated_buffer(&buffer_name, 512, 0);
+        self.code_line(&buffer.assign_raw(&format!("{helper}({}, {})", buffer.ptr, buffer.cap)));
+        self.code_line(&buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            buffer.raw, buffer.cap
+        )));
         let mut checks = Vec::new();
         for v in values {
             checks.push(if glob && v.contains('*') {
                 format!(
-                    "zs_caddy_glob({label}_{id}, {label}_{id}_len, {}, {})",
+                    "zs_caddy_glob({}, {}, {}, {})",
+                    buffer.ptr,
+                    buffer.len,
                     c_str(&v),
                     v.len()
                 )
             } else {
                 format!(
-                    "zs_caddy_eq({label}_{id}, {label}_{id}_len, {}, {})",
+                    "zs_caddy_eq({}, {}, {}, {})",
+                    buffer.ptr,
+                    buffer.len,
                     c_str(&v),
                     v.len()
                 )
@@ -1239,7 +1385,7 @@ impl Generator {
         }
         Ok(format!(
             "({} && ({}))",
-            c_buffer_fits(&format!("{label}_{id}_raw"), &format!("{label}_{id}")),
+            c_buffer_fits_cap(&buffer.raw, &buffer.cap),
             checks.join(" || ")
         ))
     }
@@ -1280,6 +1426,9 @@ impl Generator {
         // re-normalizing the header per matcher.
         let (host_var, host_len, host_raw) = if self.current_response_hook.is_none() {
             self.host_hoist_used = true;
+            if self.using_generated_scratch() {
+                self.host_hoist_scope_used = true;
+            }
             (
                 "caddy_req_host".to_string(),
                 "caddy_req_host_len".to_string(),
@@ -1287,21 +1436,20 @@ impl Generator {
             )
         } else {
             let id = self.next_id();
-            self.code_line(&format!("char host_{id}[256];"));
+            let buffer = self.generated_buffer(&format!("host_{id}"), 256, 0);
+            self.code_line(&buffer.assign_raw(&format!(
+                "zs_req_header(ZS_STR(\"host\"), {}, {})",
+                buffer.ptr, buffer.cap
+            )));
+            self.code_line(&buffer.assign_len(&format!(
+                "zs_caddy_clamp_len({}, {})",
+                buffer.raw, buffer.cap
+            )));
             self.code_line(&format!(
-                "zs_s64 host_{id}_raw = zs_req_header(ZS_STR(\"host\"), host_{id}, sizeof(host_{id}));"
+                "{} = zs_caddy_host_normalize({}, {});",
+                buffer.len, buffer.ptr, buffer.len
             ));
-            self.code_line(&format!(
-                "zs_u64 host_{id}_len = zs_caddy_clamp_len(host_{id}_raw, sizeof(host_{id}));"
-            ));
-            self.code_line(&format!(
-                "host_{id}_len = zs_caddy_host_normalize(host_{id}, host_{id}_len);"
-            ));
-            (
-                format!("host_{id}"),
-                format!("host_{id}_len"),
-                format!("host_{id}_raw"),
-            )
+            (buffer.ptr, buffer.len, buffer.raw)
         };
         let mut checks = Vec::new();
         let mut seen_hosts = BTreeSet::new();
@@ -1312,22 +1460,33 @@ impl Generator {
                     bail!("duplicate host matcher entry {value:?}");
                 }
                 let pat_id = self.next_id();
-                self.code_line(&format!("char host_pat_{pat_id}[256];"));
-                self.code_line(&format!(
-                    "zs_s64 host_pat_{pat_id}_raw = zs_caddy_expand({}, {}, host_pat_{pat_id}, sizeof(host_pat_{pat_id}));",
+                let buffer_name = format!("host_pat_{pat_id}");
+                let slot = usize::from(self.current_response_hook.is_some());
+                let buffer = self.generated_buffer(&buffer_name, 256, slot);
+                self.code_line(&buffer.assign_raw(&format!(
+                    "zs_caddy_expand({}, {}, {}, {})",
                     c_str(&value),
-                    value.len()
-                ));
-                self.code_line(&format!(
-                    "zs_u64 host_pat_{pat_id}_len = zs_caddy_clamp_len(host_pat_{pat_id}_raw, sizeof(host_pat_{pat_id}));"
-                ));
-                checks.push(format!(
-                    "({} && zs_caddy_host_match({host_var}, {host_len}, host_pat_{pat_id}, host_pat_{pat_id}_len))",
-                    c_buffer_fits(
-                        &format!("host_pat_{pat_id}_raw"),
-                        &format!("host_pat_{pat_id}")
-                    )
-                ));
+                    value.len(),
+                    buffer.ptr,
+                    buffer.cap
+                )));
+                self.code_line(&buffer.assign_len(&format!(
+                    "zs_caddy_clamp_len({}, {})",
+                    buffer.raw, buffer.cap
+                )));
+                let check = format!(
+                    "({} && zs_caddy_host_match({host_var}, {host_len}, {}, {}))",
+                    c_buffer_fits_cap(&buffer.raw, &buffer.cap),
+                    buffer.ptr,
+                    buffer.len
+                );
+                if self.using_generated_scratch() {
+                    let result = format!("host_pat_{pat_id}_matched");
+                    self.code_line(&format!("int {result} = {check};"));
+                    checks.push(result);
+                } else {
+                    checks.push(check);
+                }
             } else {
                 let normalized = caddy_normalize_host_pattern(&value)?;
                 if !seen_hosts.insert(normalized.to_ascii_lowercase()) {
@@ -1369,16 +1528,21 @@ impl Generator {
         let config = regex_match_config(value, "path_regexp")?;
         let config_json = serde_json::to_string(&config)?;
         let id = self.next_id();
-        self.code_line(&format!("char path_re_{id}[512];"));
-        self.code_line(&format!(
-            "zs_s64 path_re_{id}_raw = zs_caddy_path_regexp_subject(path_re_{id}, sizeof(path_re_{id}));"
-        ));
-        self.code_line(&format!(
-            "zs_u64 path_re_{id}_len = zs_caddy_clamp_len(path_re_{id}_raw, sizeof(path_re_{id}));"
-        ));
+        let buffer_name = format!("path_re_{id}");
+        let buffer = self.generated_buffer(&buffer_name, 512, 0);
+        self.code_line(&buffer.assign_raw(&format!(
+            "zs_caddy_path_regexp_subject({}, {})",
+            buffer.ptr, buffer.cap
+        )));
+        self.code_line(&buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            buffer.raw, buffer.cap
+        )));
         Ok(format!(
-            "({} && zs_caddy_regex_match(path_re_{id}, path_re_{id}_len, {}, {}) != 0)",
-            c_buffer_fits(&format!("path_re_{id}_raw"), &format!("path_re_{id}")),
+            "({} && zs_caddy_regex_match({}, {}, {}, {}) != 0)",
+            c_buffer_fits_cap(&buffer.raw, &buffer.cap),
+            buffer.ptr,
+            buffer.len,
             c_str(&config_json),
             config_json.len()
         ))
@@ -1399,24 +1563,37 @@ impl Generator {
         for value in values {
             let matcher = if fold_value && !contains_placeholder(&value) {
                 let id = self.next_id();
-                self.code_line(&format!("char header_{id}[1024];"));
-                self.code_line(&format!(
-                    "zs_s64 header_{id}_raw = zs_req_header({}, {}, header_{id}, sizeof(header_{id}));",
+                let buffer_name = format!("header_{id}");
+                let buffer = self.generated_buffer(&buffer_name, 1024, 0);
+                self.code_line(&buffer.assign_raw(&format!(
+                    "zs_req_header({}, {}, {}, {})",
                     c_str(header),
-                    header.len()
-                ));
-                self.code_line(&format!(
-                    "zs_u64 header_{id}_len = zs_caddy_clamp_len(header_{id}_raw, sizeof(header_{id}));"
-                ));
-                if value == "*" {
-                    c_buffer_fits(&format!("header_{id}_raw"), &format!("header_{id}"))
+                    header.len(),
+                    buffer.ptr,
+                    buffer.cap
+                )));
+                self.code_line(&buffer.assign_len(&format!(
+                    "zs_caddy_clamp_len({}, {})",
+                    buffer.raw, buffer.cap
+                )));
+                let matcher = if value == "*" {
+                    c_buffer_fits_cap(&buffer.raw, &buffer.cap)
                 } else {
                     format!(
-                        "({} && zs_caddy_eq_fold(header_{id}, header_{id}_len, {}, {}))",
-                        c_buffer_fits(&format!("header_{id}_raw"), &format!("header_{id}")),
+                        "({} && zs_caddy_eq_fold({}, {}, {}, {}))",
+                        c_buffer_fits_cap(&buffer.raw, &buffer.cap),
+                        buffer.ptr,
+                        buffer.len,
                         c_str(&value),
                         value.len()
                     )
+                };
+                if self.using_generated_scratch() {
+                    let result = format!("header_{id}_matched");
+                    self.code_line(&format!("int {result} = {matcher};"));
+                    result
+                } else {
+                    matcher
                 }
             } else {
                 format!(
@@ -1501,11 +1678,37 @@ impl Generator {
             } else {
                 "0".to_string()
             }),
+            ExpressionAst::And(left, right) if self.using_generated_scratch() => {
+                let id = self.next_id();
+                let result = format!("expr_and_result_{id}");
+                let left = self.emit_expression_ast(left, default_regex_name)?;
+                self.code_line(&format!("int {result} = ({left});"));
+                self.code_line(&format!("if ({result}) {{"));
+                self.indent += 1;
+                let right = self.emit_expression_ast(right, default_regex_name)?;
+                self.code_line(&format!("{result} = ({right});"));
+                self.indent -= 1;
+                self.code_line("}");
+                Ok(result)
+            }
             ExpressionAst::And(left, right) => Ok(format!(
                 "({} && {})",
                 self.emit_expression_ast(left, default_regex_name)?,
                 self.emit_expression_ast(right, default_regex_name)?
             )),
+            ExpressionAst::Or(left, right) if self.using_generated_scratch() => {
+                let id = self.next_id();
+                let result = format!("expr_or_result_{id}");
+                let left = self.emit_expression_ast(left, default_regex_name)?;
+                self.code_line(&format!("int {result} = ({left});"));
+                self.code_line(&format!("if (!{result}) {{"));
+                self.indent += 1;
+                let right = self.emit_expression_ast(right, default_regex_name)?;
+                self.code_line(&format!("{result} = ({right});"));
+                self.indent -= 1;
+                self.code_line("}");
+                Ok(result)
+            }
             ExpressionAst::Or(left, right) => Ok(format!(
                 "({} || {})",
                 self.emit_expression_ast(left, default_regex_name)?,
@@ -1557,31 +1760,45 @@ impl Generator {
         right: &str,
     ) -> Result<String> {
         let id = self.next_id();
-        self.code_line(&format!("char expr_num_left_{id}[32];"));
-        self.code_line(&format!("char expr_num_right_{id}[32];"));
-        self.code_line(&format!(
-            "zs_s64 expr_num_left_{id}_raw = zs_caddy_expand({}, {}, expr_num_left_{id}, sizeof(expr_num_left_{id}));",
+        let left_name = format!("expr_num_left_{id}");
+        let right_name = format!("expr_num_right_{id}");
+        let left_buffer = self.generated_buffer(&left_name, 32, 0);
+        let right_buffer = self.generated_buffer(&right_name, 32, 1);
+        self.code_line(&left_buffer.assign_raw(&format!(
+            "zs_caddy_expand({}, {}, {}, {})",
             c_str(left),
-            left.len()
-        ));
+            left.len(),
+            left_buffer.ptr,
+            left_buffer.cap
+        )));
+        self.code_line(&left_buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            left_buffer.raw, left_buffer.cap
+        )));
         self.code_line(&format!(
-            "zs_s64 expr_num_right_{id}_raw = zs_caddy_expand({}, {}, expr_num_right_{id}, sizeof(expr_num_right_{id}));",
+            "{} = {} ? zs_caddy_parse_u16({}, {}) : -1;",
+            left_buffer.raw,
+            c_buffer_fits_cap(&left_buffer.raw, &left_buffer.cap),
+            left_buffer.ptr,
+            left_buffer.len
+        ));
+        self.code_line(&right_buffer.assign_raw(&format!(
+            "zs_caddy_expand({}, {}, {}, {})",
             c_str(right),
-            right.len()
-        ));
+            right.len(),
+            right_buffer.ptr,
+            right_buffer.cap
+        )));
+        self.code_line(&right_buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            right_buffer.raw, right_buffer.cap
+        )));
         self.code_line(&format!(
-            "zs_u64 expr_num_left_{id}_len = zs_caddy_clamp_len(expr_num_left_{id}_raw, sizeof(expr_num_left_{id}));"
-        ));
-        self.code_line(&format!(
-            "zs_u64 expr_num_right_{id}_len = zs_caddy_clamp_len(expr_num_right_{id}_raw, sizeof(expr_num_right_{id}));"
-        ));
-        self.code_line(&format!(
-            "zs_s64 expr_num_left_{id}_value = {} ? zs_caddy_parse_u16(expr_num_left_{id}, expr_num_left_{id}_len) : -1;",
-            c_buffer_fits(&format!("expr_num_left_{id}_raw"), &format!("expr_num_left_{id}"))
-        ));
-        self.code_line(&format!(
-            "zs_s64 expr_num_right_{id}_value = {} ? zs_caddy_parse_u16(expr_num_right_{id}, expr_num_right_{id}_len) : -1;",
-            c_buffer_fits(&format!("expr_num_right_{id}_raw"), &format!("expr_num_right_{id}"))
+            "{} = {} ? zs_caddy_parse_u16({}, {}) : -1;",
+            right_buffer.raw,
+            c_buffer_fits_cap(&right_buffer.raw, &right_buffer.cap),
+            right_buffer.ptr,
+            right_buffer.len
         ));
         let cmp = match op {
             NumericCompareOp::Gt => ">",
@@ -1590,7 +1807,8 @@ impl Generator {
             NumericCompareOp::Le => "<=",
         };
         Ok(format!(
-            "(expr_num_left_{id}_value >= 0 && expr_num_right_{id}_value >= 0 && expr_num_left_{id}_value {cmp} expr_num_right_{id}_value)"
+            "({} >= 0 && {} >= 0 && {} {cmp} {})",
+            left_buffer.raw, right_buffer.raw, left_buffer.raw, right_buffer.raw
         ))
     }
 
@@ -1614,21 +1832,24 @@ impl Generator {
         let config = regex_match_config(&Value::Object(config), "expression.matches")?;
         let config_json = serde_json::to_string(&config)?;
         let id = self.next_id();
-        self.code_line(&format!("char expr_match_left_{id}[512];"));
-        self.code_line(&format!(
-            "zs_s64 expr_match_left_{id}_raw = zs_caddy_expand({}, {}, expr_match_left_{id}, sizeof(expr_match_left_{id}));",
+        let buffer_name = format!("expr_match_left_{id}");
+        let buffer = self.generated_buffer(&buffer_name, 512, 0);
+        self.code_line(&buffer.assign_raw(&format!(
+            "zs_caddy_expand({}, {}, {}, {})",
             c_str(left),
-            left.len()
-        ));
-        self.code_line(&format!(
-            "zs_u64 expr_match_left_{id}_len = zs_caddy_clamp_len(expr_match_left_{id}_raw, sizeof(expr_match_left_{id}));"
-        ));
+            left.len(),
+            buffer.ptr,
+            buffer.cap
+        )));
+        self.code_line(&buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            buffer.raw, buffer.cap
+        )));
         Ok(format!(
-            "({} && zs_caddy_regex_match(expr_match_left_{id}, expr_match_left_{id}_len, {}, {}) != 0)",
-            c_buffer_fits(
-                &format!("expr_match_left_{id}_raw"),
-                &format!("expr_match_left_{id}")
-            ),
+            "({} && zs_caddy_regex_match({}, {}, {}, {}) != 0)",
+            c_buffer_fits_cap(&buffer.raw, &buffer.cap),
+            buffer.ptr,
+            buffer.len,
             c_str(&config_json),
             config_json.len()
         ))
@@ -2094,9 +2315,23 @@ impl Generator {
     }
 
     fn emit_subroute_route(&mut self, route: &Route, pending_possible: bool) -> Result<bool> {
+        let (route_fn, can_leave_pending) = self
+            .capture_request_route("/* Caddy subroute route. */", |generator| {
+                generator.emit_subroute_route_inline(route, pending_possible)
+            })?;
+        self.line(&format!(
+            "if ({}) return 0;",
+            self.request_route_call(&route_fn)
+        ));
+        Ok(can_leave_pending)
+    }
+
+    fn emit_subroute_route_inline(
+        &mut self,
+        route: &Route,
+        pending_possible: bool,
+    ) -> Result<bool> {
         validate_route_fields(route, "subroute route")?;
-        // Brace-scoped like top-level routes so matcher buffers can share
-        // stack slots across sibling routes.
         self.line("{");
         self.indent += 1;
         let matched = self.emit_route_match(route)?;
@@ -2262,6 +2497,22 @@ impl Generator {
     }
 
     fn emit_invoke(&mut self, handler: &Handler) -> Result<bool> {
+        let name = handler
+            .config
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let label = format!("/* invoke named route {} */", c_comment(name));
+        let (route_fn, _) =
+            self.capture_request_route(&label, |generator| generator.emit_invoke_inline(handler))?;
+        self.line(&format!(
+            "if ({}) return 0;",
+            self.request_route_call(&route_fn)
+        ));
+        Ok(false)
+    }
+
+    fn emit_invoke_inline(&mut self, handler: &Handler) -> Result<bool> {
         validate_object_fields(&handler.config, &["name"], "invoke")?;
         let name = handler
             .config
@@ -2561,6 +2812,9 @@ impl Generator {
     /// return its insertion id (the `ZS_HOST_ID_<id>` define).
     fn host_table_id(&mut self, host: &str) -> usize {
         self.host_hoist_used = true;
+        if self.using_generated_scratch() {
+            self.host_hoist_scope_used = true;
+        }
         let next = self.host_table.len();
         *self.host_table.entry(host.to_string()).or_insert(next)
     }
@@ -2573,66 +2827,82 @@ impl Generator {
         }
         self.in_error_route = true;
         for (idx, route) in routes.iter().enumerate() {
-            self.line(&format!("/* server error route {idx} */"));
-            let matched = self.emit_route_match(route)?;
-            if match_is_statically_false(&matched) {
-                continue;
-            }
-            self.line(&format!("if ({matched}) {{"));
-            self.indent += 1;
-            self.line("if (zs_response_pending() != 0) return 0;");
-            let grouped = self.emit_route_group_guard(route, "server error route")?;
-            let terminal = route.terminal;
-            let stopped = self.emit_handlers(&route.handlers)?;
-            if terminal && !stopped {
-                self.line("if (zs_response_pending() == 0) {");
-                self.indent += 1;
-                self.line("zs_caddy_respond(\"{http.error.status_code}\", 24, \"\", 0);");
-                self.indent -= 1;
-                self.line("}");
-                self.line("return 0;");
-            }
-            if grouped {
-                self.indent -= 1;
-                self.line("}");
-            }
-            self.indent -= 1;
-            self.line("}");
-            self.line("else if (zs_response_pending() != 0) {");
-            self.indent += 1;
-            self.line("zs_response_clear();");
-            self.indent -= 1;
-            self.line("}");
+            let label = format!("/* server error route {idx} */");
+            let (route_fn, _) = self.capture_request_route(&label, |generator| {
+                generator.emit_error_route_inline(route)
+            })?;
+            self.line(&label);
+            self.line(&format!(
+                "if ({}) return 0;",
+                self.request_route_call(&route_fn)
+            ));
         }
         self.in_error_route = previous;
         Ok(())
     }
 
+    fn emit_error_route_inline(&mut self, route: &Route) -> Result<()> {
+        let matched = self.emit_route_match(route)?;
+        if match_is_statically_false(&matched) {
+            return Ok(());
+        }
+        self.line(&format!("if ({matched}) {{"));
+        self.indent += 1;
+        self.line("if (zs_response_pending() != 0) return 0;");
+        let grouped = self.emit_route_group_guard(route, "server error route")?;
+        let stopped = self.emit_handlers(&route.handlers)?;
+        if route.terminal && !stopped {
+            self.line("if (zs_response_pending() == 0) {");
+            self.indent += 1;
+            self.line("zs_caddy_respond(\"{http.error.status_code}\", 24, \"\", 0);");
+            self.indent -= 1;
+            self.line("}");
+            self.line("return 0;");
+        }
+        if grouped {
+            self.indent -= 1;
+            self.line("}");
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("else if (zs_response_pending() != 0) {");
+        self.indent += 1;
+        self.line("zs_response_clear();");
+        self.indent -= 1;
+        self.line("}");
+        Ok(())
+    }
+
     fn emit_pending_matcher_error(&mut self) -> Result<()> {
         let id = self.next_id();
-        self.line(&format!("char matcher_error_status_{id}[4];"));
+        let buffer = self.generated_buffer(&format!("matcher_error_status_{id}"), 4, 0);
+        self.line(&buffer.assign_raw(&format!(
+            "zs_meta_get(ZS_STR(\"http.error.status_code\"), {}, {})",
+            buffer.ptr, buffer.cap
+        )));
         self.line(&format!(
-            "zs_s64 matcher_error_status_{id}_raw = zs_meta_get(ZS_STR(\"http.error.status_code\"), matcher_error_status_{id}, sizeof(matcher_error_status_{id}));"
-        ));
-        self.line(&format!(
-            "if (matcher_error_status_{id}_raw > 0 && (zs_u64)matcher_error_status_{id}_raw < sizeof(matcher_error_status_{id})) {{"
+            "if ({} > 0 && (zs_u64){} < {}) {{",
+            buffer.raw, buffer.raw, buffer.cap
         ));
         self.indent += 1;
-        self.line(&format!(
-            "zs_u64 matcher_error_status_{id}_len = zs_caddy_clamp_len(matcher_error_status_{id}_raw, sizeof(matcher_error_status_{id}));"
-        ));
+        self.line(&buffer.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            buffer.raw, buffer.cap
+        )));
         if !self.error_routes.is_empty() && !self.in_error_route {
             self.emit_error_routes()?;
             self.line("if (zs_response_pending() == 0) {");
             self.indent += 1;
             self.line(&format!(
-                "zs_caddy_respond(matcher_error_status_{id}, matcher_error_status_{id}_len, \"\", 0);"
+                "zs_caddy_respond({}, {}, \"\", 0);",
+                buffer.ptr, buffer.len
             ));
             self.indent -= 1;
             self.line("}");
         } else {
             self.line(&format!(
-                "zs_caddy_respond(matcher_error_status_{id}, matcher_error_status_{id}_len, \"\", 0);"
+                "zs_caddy_respond({}, {}, \"\", 0);",
+                buffer.ptr, buffer.len
             ));
         }
         self.line("return 0;");
@@ -3075,34 +3345,36 @@ impl Generator {
         }
         let id = self.next_id();
         let buffer = format!("{label}_{id}");
-        let raw = format!("{label}_{id}_raw");
-        let len = format!("{label}_{id}_len");
-        let emit = format!("char {buffer}[512];");
+        let slot = if label == "header_value" { 2 } else { 1 };
+        let generated = self.generated_buffer(&buffer, 512, slot);
         let helper = match expansion {
             PlaceholderExpansion::Known => "zs_caddy_expand_known",
         };
-        let call = format!(
-            "zs_s64 {raw} = {helper}({}, {}, {buffer}, sizeof({buffer}));",
+        let call = generated.assign_raw(&format!(
+            "{helper}({}, {}, {}, {})",
             c_str(value),
-            value.len()
-        );
-        let clamp = format!("zs_u64 {len} = zs_caddy_clamp_len({raw}, sizeof({buffer}));");
+            value.len(),
+            generated.ptr,
+            generated.cap
+        ));
+        let clamp = generated.assign_len(&format!(
+            "zs_caddy_clamp_len({}, {})",
+            generated.raw, generated.cap
+        ));
         match target {
             HeaderTarget::Request => {
-                self.request_header_line(&emit);
                 self.request_header_line(&call);
                 self.request_header_line(&clamp);
             }
             HeaderTarget::Response => {
-                self.response_line(&emit);
                 self.response_line(&call);
                 self.response_line(&clamp);
             }
         }
         Ok(CArg {
-            ptr: buffer.clone(),
-            len,
-            ok: Some(c_buffer_fits(&raw, &buffer)),
+            ptr: generated.ptr,
+            len: generated.len,
+            ok: Some(c_buffer_fits_cap(&generated.raw, &generated.cap)),
         })
     }
 
@@ -3340,14 +3612,17 @@ impl Generator {
         self.line("{");
         self.indent += 1;
         if handle_response.is_some() {
-            self.line(&format!("char reverse_proxy_skip_{proxy_id}[2];"));
-            self.line(&format!(
-                "zs_s64 reverse_proxy_skip_{proxy_id}_raw = zs_meta_get({}, {}, reverse_proxy_skip_{proxy_id}, sizeof(reverse_proxy_skip_{proxy_id}));",
+            let buffer = self.generated_buffer(&format!("reverse_proxy_skip_{proxy_id}"), 2, 0);
+            self.line(&buffer.assign_raw(&format!(
+                "zs_meta_get({}, {}, {}, {})",
                 c_str(&skip_key),
-                skip_key.len()
-            ));
+                skip_key.len(),
+                buffer.ptr,
+                buffer.cap
+            )));
             self.line(&format!(
-                "if (reverse_proxy_skip_{proxy_id}_raw > 0 && (zs_u64)reverse_proxy_skip_{proxy_id}_raw < sizeof(reverse_proxy_skip_{proxy_id}) && zs_caddy_eq(reverse_proxy_skip_{proxy_id}, zs_caddy_clamp_len(reverse_proxy_skip_{proxy_id}_raw, sizeof(reverse_proxy_skip_{proxy_id})), \"1\", 1)) {{"
+                "if ({} > 0 && (zs_u64){} < {} && zs_caddy_eq({}, zs_caddy_clamp_len({}, {}), \"1\", 1)) {{",
+                buffer.raw, buffer.raw, buffer.cap, buffer.ptr, buffer.raw, buffer.cap
             ));
             self.indent += 1;
             self.line(&format!(
@@ -3395,27 +3670,28 @@ impl Generator {
             let id = self.next_id();
             self.line("{");
             self.indent += 1;
-            self.line(&format!("char reverse_proxy_url_{id}[512];"));
-            self.line(&format!(
-                "zs_s64 reverse_proxy_url_{id}_raw = zs_caddy_reverse_proxy_url({}, {}, reverse_proxy_url_{id}, sizeof(reverse_proxy_url_{id}));",
+            let buffer = self.generated_buffer(&format!("reverse_proxy_url_{id}"), 512, 0);
+            self.line(&buffer.assign_raw(&format!(
+                "zs_caddy_reverse_proxy_url({}, {}, {}, {})",
                 c_str(&url),
-                url.len()
-            ));
+                url.len(),
+                buffer.ptr,
+                buffer.cap
+            )));
+            self.line(&buffer.assign_len(&format!(
+                "zs_caddy_clamp_len({}, {})",
+                buffer.raw, buffer.cap
+            )));
             self.line(&format!(
-                "zs_u64 reverse_proxy_url_{id}_len = zs_caddy_clamp_len(reverse_proxy_url_{id}_raw, sizeof(reverse_proxy_url_{id}));"
-            ));
-            self.line(&format!(
-                "if (reverse_proxy_url_{id}_raw <= 0 || (zs_u64)reverse_proxy_url_{id}_raw >= sizeof(reverse_proxy_url_{id})) {{"
+                "if ({} <= 0 || (zs_u64){} >= {}) {{",
+                buffer.raw, buffer.raw, buffer.cap
             ));
             self.indent += 1;
             self.line("zs_respond(502, ZS_STR(\"Bad Gateway\"));");
             self.line("return 0;");
             self.indent -= 1;
             self.line("}");
-            Some((
-                format!("reverse_proxy_url_{id}"),
-                format!("reverse_proxy_url_{id}_len"),
-            ))
+            Some((buffer.ptr, buffer.len))
         } else {
             None
         };
@@ -3888,13 +4164,15 @@ impl Generator {
         };
         let key = caddy_route_group_meta_key(group_id);
         let id = self.next_id();
-        self.response_line(&format!("char response_route_group_{id}[2];"));
-        self.response_line(&format!(
-            "zs_s64 response_route_group_{id}_raw = zs_meta_get({}, {}, response_route_group_{id}, sizeof(response_route_group_{id}));",
+        let buffer = self.generated_buffer(&format!("response_route_group_{id}"), 2, 0);
+        self.response_line(&buffer.assign_raw(&format!(
+            "zs_meta_get({}, {}, {}, {})",
             c_str(&key),
-            key.len()
-        ));
-        self.response_line(&format!("if (response_route_group_{id}_raw > 0) {{"));
+            key.len(),
+            buffer.ptr,
+            buffer.cap
+        )));
+        self.response_line(&format!("if ({} > 0) {{", buffer.raw));
         self.response_line(&format!(
             "  /* Caddy {label}.handle_response group already satisfied; skip this route. */"
         ));
@@ -4397,6 +4675,104 @@ impl Generator {
         id
     }
 
+    /// Emit a request route into its own C helper. TinyCC does not inline
+    /// these helpers, so each route receives a distinct eBPF stack frame
+    /// instead of relying on stack-slot coloring across sibling C scopes.
+    /// Clang honors `ZS_INLINE` and can still fold the route into `entry()`.
+    fn capture_request_route<T>(
+        &mut self,
+        label: &str,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(String, T)> {
+        debug_assert!(self.current_response_hook.is_none());
+        let id = self.next_id();
+        let name = format!("caddy_request_route_{id}");
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        let saved_scratch_active = self.request_scratch_active;
+        let saved_scratch_caps = self.request_scratch_caps;
+        let saved_host_scope = self.host_hoist_scope_used;
+        self.indent = 1;
+        self.request_scratch_active = true;
+        self.request_scratch_caps = [0; 3];
+        self.host_hoist_scope_used = false;
+        self.line(HOST_HOIST_MARKER);
+        self.line(label);
+        let result = emit(self);
+        let mut body = std::mem::take(&mut self.out);
+        let scratch_caps = self.request_scratch_caps;
+        let host_scope_used = self.host_hoist_scope_used;
+        self.out = saved_out;
+        self.indent = saved_indent;
+        self.request_scratch_active = saved_scratch_active;
+        self.request_scratch_caps = saved_scratch_caps;
+        self.host_hoist_scope_used = saved_host_scope;
+        let result = result?;
+
+        if !host_scope_used {
+            body = without_marker_lines(&body, &[HOST_HOIST_MARKER, HOST_REFRESH_MARKER]);
+        }
+        body = format!("{}{body}", caddy_scratch_declaration(scratch_caps));
+
+        // A request-route helper returns 1 when the original generated code
+        // would have returned from entry(), and 0 when routing should continue.
+        let body = request_route_returns(&body);
+        let args = if self.route_groups.is_empty() {
+            "void"
+        } else {
+            "int *route_groups"
+        };
+        let function = format!("static ZS_INLINE int {name}({args}) {{\n{body}  return 0;\n}}\n");
+        self.request_route_functions.push(function);
+        Ok((name, result))
+    }
+
+    fn generated_buffer(&mut self, label: &str, size: usize, slot: usize) -> GeneratedBuffer {
+        debug_assert!(matches!(size, 2 | 4 | 32 | 256 | 512 | 1024));
+        debug_assert!(slot < self.request_scratch_caps.len());
+        let shared = if let Some(hook) = self.current_response_hook {
+            self.response_scratch_caps[hook][slot] =
+                self.response_scratch_caps[hook][slot].max(size);
+            true
+        } else if self.request_scratch_active {
+            self.request_scratch_caps[slot] = self.request_scratch_caps[slot].max(size);
+            true
+        } else {
+            false
+        };
+        if shared {
+            let ptr = format!("caddy_scratch.slot{slot}.bytes.b{size}");
+            GeneratedBuffer {
+                cap: format!("sizeof({ptr})"),
+                ptr,
+                raw: format!("caddy_scratch.slot{slot}.raw"),
+                len: format!("caddy_scratch.slot{slot}.len"),
+                shared: true,
+            }
+        } else {
+            self.code_line(&format!("char {label}[{size}];"));
+            GeneratedBuffer {
+                ptr: label.to_string(),
+                cap: format!("sizeof({label})"),
+                raw: format!("{label}_raw"),
+                len: format!("{label}_len"),
+                shared: false,
+            }
+        }
+    }
+
+    fn using_generated_scratch(&self) -> bool {
+        self.request_scratch_active || self.current_response_hook.is_some()
+    }
+
+    fn request_route_call(&self, name: &str) -> String {
+        if self.route_groups.is_empty() {
+            format!("{name}()")
+        } else {
+            format!("{name}(route_groups)")
+        }
+    }
+
     fn warn(&mut self, warning: String) {
         if self.warnings.iter().all(|w| w != &warning) {
             self.line(&format!("/* warning: {} */", c_comment(&warning)));
@@ -4454,6 +4830,10 @@ impl Generator {
             ));
             self.indent += 1;
             self.line("(void)input;");
+            let scratch = caddy_scratch_declaration(self.response_scratch_caps[hook_id]);
+            for line in scratch.lines() {
+                self.line(line.trim_start());
+            }
             let lines = std::mem::take(&mut self.response_hooks[hook_id]);
             for line in lines {
                 self.line(&line);
@@ -4467,6 +4847,7 @@ impl Generator {
     fn begin_response_hook(&mut self) -> Option<usize> {
         let hook_id = self.response_hooks.len();
         self.response_hooks.push(Vec::new());
+        self.response_scratch_caps.push([0; 3]);
         self.line(&format!(
             "zs_s64 zs_caddy_response_hook_input_{hook_id} = zs_json_new_object();"
         ));
@@ -4501,8 +4882,38 @@ struct CArg {
     ok: Option<String>,
 }
 
+struct GeneratedBuffer {
+    ptr: String,
+    cap: String,
+    raw: String,
+    len: String,
+    shared: bool,
+}
+
+impl GeneratedBuffer {
+    fn assign_raw(&self, expression: &str) -> String {
+        if self.shared {
+            format!("{} = {expression};", self.raw)
+        } else {
+            format!("zs_s64 {} = {expression};", self.raw)
+        }
+    }
+
+    fn assign_len(&self, expression: &str) -> String {
+        if self.shared {
+            format!("{} = {expression};", self.len)
+        } else {
+            format!("zs_u64 {} = {expression};", self.len)
+        }
+    }
+}
+
 fn c_buffer_fits(raw: &str, buffer: &str) -> String {
     format!("({raw} >= 0 && (zs_u64){raw} < sizeof({buffer}))")
+}
+
+fn c_buffer_fits_cap(raw: &str, cap: &str) -> String {
+    format!("({raw} >= 0 && (zs_u64){raw} < {cap})")
 }
 
 fn regex_match_config(value: &Value, label: &str) -> Result<Value> {
@@ -8597,7 +9008,7 @@ site.example.com {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_eq(method_"));
+        assert!(c.contains("zs_caddy_eq(caddy_scratch.slot0.bytes.b512"));
         assert!(!c.contains("zs_caddy_eq_fold(method_"), "{c}");
     }
 
@@ -9229,13 +9640,20 @@ site.example.com {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("(zs_u64)method_"), "{c}");
-        assert!(c.contains("(zs_u64)host_pat_"), "{c}");
-        assert!(c.contains("(zs_u64)path_re_"), "{c}");
-        assert!(c.contains("(zs_u64)expr_num_left_"), "{c}");
-        assert!(c.contains("(zs_u64)expr_match_left_"), "{c}");
-        assert!(c.contains("if ((header_value_"), "{c}");
-        assert!(c.contains(">= sizeof(reverse_proxy_url_"), "{c}");
+        assert!(
+            c.matches("(zs_u64)caddy_scratch.slot0.raw").count() >= 5,
+            "{c}"
+        );
+        assert!(!c.contains("zs_s64 method_"), "{c}");
+        assert!(!c.contains("zs_s64 host_pat_"), "{c}");
+        assert!(!c.contains("zs_s64 path_re_"), "{c}");
+        assert!(!c.contains("zs_s64 expr_num_left_"), "{c}");
+        assert!(!c.contains("zs_s64 expr_match_left_"), "{c}");
+        assert!(c.contains("if ((caddy_scratch.slot2.raw"), "{c}");
+        assert!(
+            c.contains(">= sizeof(caddy_scratch.slot0.bytes.b512)"),
+            "{c}"
+        );
     }
 
     #[test]
@@ -9314,7 +9732,7 @@ site.example.com {
             );
 
             let c = compile_caddy_json(&source).unwrap();
-            assert!(c.contains("if (((1))) {"), "{matcher}: {c}");
+            assert!(c.contains(" = (1);"), "{matcher}: {c}");
             assert!(!c.contains("if ((())) {"), "{matcher}: {c}");
         }
     }
@@ -9344,7 +9762,7 @@ site.example.com {
         assert!(c.contains("zs_caddy_expr_in("), "{c}");
         assert!(c.contains("{http.request.uri.query.code}"), "{c}");
         assert!(c.contains("{http.request.uri.query.mode}"), "{c}");
-        assert!(c.contains("expr_match_left_"), "{c}");
+        assert!(c.contains("caddy_scratch.slot0.bytes.b512"), "{c}");
         assert!(c.contains("{http.request.header.X-Request-Id}"), "{c}");
         assert!(c.contains("blocked"), "{c}");
         assert!(c.contains("(caddy_req_host_id == ZS_HOST_ID_0)"), "{c}");
@@ -9397,12 +9815,15 @@ site.example.com {
         }"#;
 
         let c = compile_caddy_json(source).unwrap();
-        assert!(c.contains("zs_caddy_parse_u16(expr_num_left_"), "{c}");
-        assert!(c.contains("expr_num_left_"), "{c}");
-        assert!(c.contains(" >= expr_num_right_"), "{c}");
-        assert!(c.contains(" <= expr_num_right_"), "{c}");
-        assert!(c.contains(" > expr_num_right_"), "{c}");
-        assert!(c.contains(" < expr_num_right_"), "{c}");
+        assert!(
+            c.contains("zs_caddy_parse_u16(caddy_scratch.slot0.bytes.b32"),
+            "{c}"
+        );
+        assert!(!c.contains("expr_num_left_"), "{c}");
+        assert!(c.contains("slot0.raw >= caddy_scratch.slot1.raw"), "{c}");
+        assert!(c.contains("slot0.raw <= caddy_scratch.slot1.raw"), "{c}");
+        assert!(c.contains("slot0.raw > caddy_scratch.slot1.raw"), "{c}");
+        assert!(c.contains("slot0.raw < caddy_scratch.slot1.raw"), "{c}");
         assert!(c.contains("[\\\"404\\\",\\\"410\\\"]"), "{c}");
     }
 
@@ -10345,9 +10766,141 @@ site.example.com {
         let c = compile_caddy_json(source).unwrap();
         let outer_hook = c.find("zs_res_hook(").unwrap();
         let clear = outer_hook + c[outer_hook..].find("zs_res_hooks_clear();").unwrap();
-        let error_response = clear + c[clear..].find("handled").unwrap();
+        let error_route_call = clear + c[clear..].find("if (caddy_request_route_").unwrap();
         assert!(outer_hook < clear, "{c}");
-        assert!(clear < error_response, "{c}");
+        assert!(clear < error_route_call, "{c}");
+    }
+
+    #[test]
+    fn emits_request_routes_as_inline_helpers() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [
+            {"match": [{"header": {"X-One": ["one"]}}], "handle": [{"handler": "static_response", "body": "return 0;"}]},
+            {"handle": [{"handler": "subroute", "routes": [
+              {"match": [{"header": {"X-Two": ["two"]}}], "handle": [{"handler": "static_response", "body": "two"}]}
+            ]}]}
+          ]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        assert!(
+            c.matches("static ZS_INLINE int caddy_request_route_")
+                .count()
+                >= 3,
+            "{c}"
+        );
+        let entry = c.find("zs_u64 entry(void)").unwrap();
+        assert!(c[entry..].contains("if (caddy_request_route_"), "{c}");
+        assert!(c.contains(r#"{\"body\":\"return 0;\"}"#), "{c}");
+        assert!(!c.contains(REQUEST_ROUTE_FUNCTIONS_MARKER), "{c}");
+    }
+
+    #[test]
+    fn request_routes_reuse_fixed_scratch_slots() {
+        let mut headers = Map::new();
+        for id in 0..24 {
+            headers.insert(
+                format!("X-{{http.request.uri.query.name{id}}}"),
+                serde_json::json!([format!("{{http.request.uri.query.value{id}}}")]),
+            );
+        }
+        let source = serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {"routes": [{
+                "handle": [
+                    {"handler": "headers", "request": {"set": headers}},
+                    {"handler": "static_response", "body": "ok"}
+                ]
+            }]}}}}
+        });
+
+        let c = compile_caddy_json(&source.to_string()).unwrap();
+        assert_eq!(c.matches("char b512[512]").count(), 2, "{c}");
+        assert!(!c.contains("char header_name_"), "{c}");
+        assert!(!c.contains("char header_value_"), "{c}");
+        assert!(c.contains("caddy_scratch.slot1.bytes.b512"), "{c}");
+        assert!(c.contains("caddy_scratch.slot2.bytes.b512"), "{c}");
+    }
+
+    #[test]
+    fn response_routes_reuse_fixed_scratch_slots() {
+        let routes = (0..24)
+            .map(|id| {
+                serde_json::json!({
+                    "match": [{"method": [format!("METHOD{id}")]}],
+                    "handle": [{"handler": "vars", "matched": id.to_string()}]
+                })
+            })
+            .collect::<Vec<_>>();
+        let source = serde_json::json!({
+            "apps": {"http": {"servers": {"srv0": {"routes": [{
+                "handle": [
+                    {"handler": "intercept", "handle_response": [{
+                        "match": {"status_code": [2]},
+                        "routes": routes
+                    }]},
+                    {"handler": "static_response", "status_code": 207, "body": "ok"}
+                ]
+            }]}}}}
+        });
+
+        let c = compile_caddy_json(&source.to_string()).unwrap();
+        let hook = &c[c.find("ZS_CALL_ENTRY(caddy_response_").unwrap()..];
+        assert_eq!(hook.matches("char b512[512]").count(), 1, "{hook}");
+        assert!(!hook.contains("char method_"), "{hook}");
+        assert!(!hook.contains("zs_s64 method_"), "{hook}");
+        assert!(
+            hook.matches("caddy_scratch.slot0.raw = zs_req_method")
+                .count()
+                >= 24,
+            "{hook}"
+        );
+    }
+
+    #[test]
+    fn nested_not_matcher_sets_short_circuit_in_generated_code() {
+        let source = r#"{
+          "apps": {"http": {"servers": {"srv0": {"routes": [{
+            "match": [{"not": [
+              {"header": {"X-Stop": ["yes"]}},
+              {"path_regexp": {"name": "late", "pattern": "^/(.*)$"}}
+            ]}],
+            "handle": [{"handler": "static_response", "status_code": 204}]
+          }]}}}}
+        }"#;
+
+        let c = compile_caddy_json(source).unwrap();
+        let result = c.find("int not_match_result_").unwrap();
+        let route = &c[result..c[result..].find("return 0;").unwrap() + result];
+        assert_eq!(
+            route.matches("if (!not_match_result_").count(),
+            2,
+            "{route}"
+        );
+        let first_assignment = route.find("not_match_result_").unwrap();
+        let regex = route.find("zs_caddy_regex_match(").unwrap();
+        let second_guard = route[..regex].rfind("if (!not_match_result_").unwrap();
+        assert!(
+            first_assignment < second_guard && second_guard < regex,
+            "{route}"
+        );
+    }
+
+    #[test]
+    fn request_route_marker_in_user_content_is_not_replaced() {
+        let source = format!(
+            r#"{{
+              "apps": {{"http": {{"servers": {{"srv0": {{"routes": [{{
+                "handle": [{{"handler": "static_response", "body": "{REQUEST_ROUTE_FUNCTIONS_MARKER}"}}]
+              }}]}}}}}}}}
+            }}"#
+        );
+
+        let c = compile_caddy_json(&source).unwrap();
+        assert_eq!(c.matches(REQUEST_ROUTE_FUNCTIONS_MARKER).count(), 1, "{c}");
+        assert!(
+            c.contains("static ZS_INLINE int caddy_request_route_"),
+            "{c}"
+        );
     }
 
     #[test]
@@ -10625,7 +11178,7 @@ site.example.com {
             "handle": [{
               "handler": "reverse_proxy",
               "upstreams": [{"dial": "127.0.0.1:8081"}],
-              "handle_response": [{"match": {"status_code": [2]}, "routes": [{"handle": [
+              "handle_response": [{"match": {"status_code": [2]}, "routes": [{"match": [{"vars": {"copy": ["yes"]}}], "handle": [
                 {"handler": "headers", "request": {"delete": ["Remote-User"]}},
                 {"handler": "headers", "request": {"set": {"Remote-User": ["{http.reverse_proxy.header.Remote-User}"]}}}
               ]}]}]
@@ -10635,7 +11188,9 @@ site.example.com {
 
         let c = compile_caddy_json(source).unwrap();
         let hook_pos = c.find("ZS_CALL_ENTRY(caddy_response_0").unwrap();
+        let route_match_pos = c.find("zs_caddy_vars_match").unwrap();
         let hook = &c[hook_pos..];
+        assert!(hook_pos < route_match_pos, "{c}");
         assert!(hook.contains("zs_req_delete_header(\"Remote-User\""), "{c}");
         assert!(hook.contains("zs_req_set_header(\"Remote-User\""), "{c}");
         assert!(hook.contains("zs_res_continue_request();"), "{c}");
@@ -10945,7 +11500,7 @@ site.example.com {
         assert!(c.contains("zs_caddy_set_path_preserve_query(\"/upstream\""));
         assert!(c.contains("zs.caddy.reverse_proxy.forwarded"));
         assert!(c.contains("zs_caddy_reverse_proxy_url(\"http://127.0.0.1:9000\""));
-        assert!(c.contains("zs_reverse_proxy(reverse_proxy_url_"));
+        assert!(c.contains("zs_reverse_proxy(caddy_scratch.slot0.bytes.b512"));
     }
 
     #[test]
@@ -11113,7 +11668,7 @@ site.example.com {
         assert!(c.contains("{http.reverse_proxy.header.X-Origin-Match}"));
         assert!(c.contains("ok*"));
         assert!(c.contains("zs_caddy_set_response_status(\"{http.vars.proxy_status}\""));
-        assert!(c.contains("zs_reverse_proxy(reverse_proxy_url_"));
+        assert!(c.contains("zs_reverse_proxy(caddy_scratch.slot0.bytes.b512"));
     }
 
     #[test]
@@ -11182,7 +11737,7 @@ site.example.com {
         let c = compile_caddy_json(source).unwrap();
         assert!(c.contains("zs_caddy_reverse_proxy_url(\"http://127.0.0.1:9000\""));
         assert!(c.contains("zs_caddy_response_headers("));
-        assert!(c.contains("zs_reverse_proxy(reverse_proxy_url_"));
+        assert!(c.contains("zs_reverse_proxy(caddy_scratch.slot0.bytes.b512"));
     }
 
     #[test]
@@ -13016,7 +13571,10 @@ site.example.com {
             c.contains("zs_caddy_reverse_proxy_url(\"https://example.test\""),
             "{c}"
         );
-        assert!(c.contains("zs_reverse_proxy(reverse_proxy_url_"), "{c}");
+        assert!(
+            c.contains("zs_reverse_proxy(caddy_scratch.slot0.bytes.b512"),
+            "{c}"
+        );
         assert!(
             c.contains("\\\"Host\\\":[\\\"{http.reverse_proxy.upstream.hostport}\\\"]"),
             "{c}"

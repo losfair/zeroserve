@@ -549,7 +549,7 @@ Option B: compile manually.
 ```bash
 bpf-tcc -Wall -mcpu=v3 -fno-builtin -I path/to/zeroserve-sdk -c input.c -o out.o
 clang -O2 -Wall -target bpf -fno-builtin -emit-llvm -c -I path/to/zeroserve-sdk input.c -o out.bc
-llc -march=bpf -bpf-stack-size=8192 -mcpu=v3 -filetype=obj out.bc -o out.o
+llc -march=bpf -bpf-stack-size=4096 -mcpu=v3 -filetype=obj out.bc -o out.o
 ```
 
 Put the `.o` files at `.zeroserve/scripts/` in the tarball, or pass a single
