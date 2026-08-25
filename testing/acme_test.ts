@@ -97,6 +97,12 @@ const available = pebbleBin !== null && challtestsrvBin !== null &&
   await hasOpenssl();
 const challtestsrvSupportsDoh = challtestsrvBin !== null &&
   await commandSupportsFlag(challtestsrvBin, "doh");
+// The DNS bind flag was named `-dns01` in old challtestsrv builds and
+// `-dnsserver` in current ones; passing the wrong one makes it exit at startup.
+const challtestsrvDnsFlag = challtestsrvBin !== null &&
+    await commandSupportsFlag(challtestsrvBin, "dns01")
+  ? "-dns01"
+  : "-dnsserver";
 
 const DOMAIN = "zs.test";
 
@@ -220,7 +226,7 @@ async function withPebble(
     // challtestsrv: DNS only, every A query -> 127.0.0.1, no AAAA (Pebble must
     // reach zeroserve's IPv4 listener).
     const challtestsrvArgs = [
-      "-dns01",
+      challtestsrvDnsFlag,
       `:${dnsPort}`,
       "-defaultIPv4",
       "127.0.0.1",
@@ -243,6 +249,21 @@ async function withPebble(
         stderr: "piped",
       }),
       "challtestsrv",
+    );
+    // challtestsrv exits at startup if a flag is unknown; surface that here (with
+    // its stderr) instead of letting it show up as an issuance timeout later.
+    await waitFor(
+      async () => {
+        try {
+          (await Deno.connect({ hostname: "127.0.0.1", port: dnsPort }))
+            .close();
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      10_000,
+      "challtestsrv DNS listener",
     );
     spawn(
       new Deno.Command(pebbleBin!, {
