@@ -102,6 +102,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
+dependencies = [
+ "triomphe",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -136,9 +145,9 @@ dependencies = [
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.11"
+version = "0.4.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "268c46a6d4fd0d5ad47f7127472f61a09193301ea4de3fed34eaa05b44a11372"
+checksum = "a3d91a6a83d8d36bdd84bd914763528f69446e04f198d7dd48aa2f2969ca4844"
 dependencies = [
  "cfg-if",
  "elf",
@@ -147,6 +156,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rand 0.8.7",
+ "rpds",
  "scopeguard",
  "thiserror",
  "tracing",
@@ -1981,6 +1991,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpds"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e025feb26210bc196b908e72deb063b1b4000754304341cbc168a1e72c857ebc"
+dependencies = [
+ "archery",
+ "smallvec",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2955,7 +2975,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zeroserve"
-version = "0.2.12-alpha.13"
+version = "0.2.12-alpha.14"
 dependencies = [
  "anyhow",
  "arc-swap",
