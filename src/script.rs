@@ -2312,6 +2312,24 @@ impl Timeslicer for MonoioTimeslicer {
             }
         })
     }
+
+    fn run_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        let (tx, rx) = oneshot::channel();
+        CPU_TP.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send(result);
+        });
+        async move {
+            match rx.await {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => std::panic::resume_unwind(err),
+                Err(err) => panic!("blocking task failed: {err}"),
+            }
+        }
+    }
 }
 
 struct EventListener;
